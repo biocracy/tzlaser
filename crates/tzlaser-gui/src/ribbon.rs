@@ -161,12 +161,10 @@ pub fn render_ribbon(
 fn ribbon_group(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
     ui.group(|ui| {
         ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                content(ui);
-            });
+            content(ui);
             ui.add_space(2.0);
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(title).size(9.5).color(Color32::from_rgb(130, 135, 150)).strong());
+                ui.label(RichText::new(title).size(9.0).color(Color32::from_rgb(130, 135, 150)).strong());
             });
         });
     });
@@ -310,43 +308,51 @@ fn render_profiles_tab(
     status_message: &mut String,
 ) {
     ui.horizontal(|ui| {
-        // 1. Cut Toolpath Overlays (Cut Index & Cut Direction Toggles)
-        ribbon_group(ui, "Cut Overlays", |ui| {
-            let order_label = if canvas_state.show_cut_order {
-                RichText::new("🔢 Cut Index: ON").size(12.5).color(Color32::from_rgb(0, 230, 255)).strong()
-            } else {
-                RichText::new("🔢 Cut Index: OFF").size(12.5).color(Color32::from_rgb(170, 175, 185))
-            };
-            let order_bg = if canvas_state.show_cut_order {
-                Color32::from_rgb(20, 65, 95)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            if ui.add(Button::new(order_label).fill(order_bg)).on_hover_text("Toggle visibility of cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
-                canvas_state.show_cut_order = !canvas_state.show_cut_order;
-            }
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
 
-            let dir_label = if canvas_state.show_cut_direction {
-                RichText::new("🧭 Direction: ON").size(12.5).color(Color32::from_rgb(0, 255, 120)).strong()
-            } else {
-                RichText::new("🧭 Direction: OFF").size(12.5).color(Color32::from_rgb(170, 175, 185))
-            };
-            let dir_bg = if canvas_state.show_cut_direction {
-                Color32::from_rgb(20, 65, 45)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            if ui.add(Button::new(dir_label).fill(dir_bg)).on_hover_text("Toggle visibility of cut direction arrowheads along profile toolpaths").clicked() {
-                canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
-            }
+        // 1. Cut Overlays Group (Two compact stacked rows)
+        ribbon_group(ui, "Cut Overlays", |ui| {
+            ui.vertical(|ui| {
+                let order_active = canvas_state.show_cut_order;
+                let (order_text, order_color, order_bg) = if order_active {
+                    ("🔢 Index: ON", Color32::from_rgb(0, 230, 255), Color32::from_rgb(20, 65, 95))
+                } else {
+                    ("🔢 Index: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                let btn_order = Button::new(RichText::new(order_text).size(11.0).color(order_color).strong())
+                    .fill(order_bg)
+                    .min_size(Vec2::new(105.0, 19.0));
+                if ui.add(btn_order).on_hover_text("Toggle cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
+                    canvas_state.show_cut_order = !canvas_state.show_cut_order;
+                }
+
+                let dir_active = canvas_state.show_cut_direction;
+                let (dir_text, dir_color, dir_bg) = if dir_active {
+                    ("🧭 Direction: ON", Color32::from_rgb(0, 255, 120), Color32::from_rgb(20, 65, 45))
+                } else {
+                    ("🧭 Direction: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                let btn_dir = Button::new(RichText::new(dir_text).size(11.0).color(dir_color).strong())
+                    .fill(dir_bg)
+                    .min_size(Vec2::new(105.0, 19.0));
+                if ui.add(btn_dir).on_hover_text("Toggle cut direction arrowheads along profile toolpaths").clicked() {
+                    canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
+                }
+            });
         });
 
-        ui.add_space(4.0);
+        ui.add_space(2.0);
 
-        // 2. Layer Auto-Classification
+        // 2. Layer Auto-Classification (Large prominent button)
         ribbon_group(ui, "Classification", |ui| {
-            let classify_btn = Button::new(RichText::new("⚡ Auto-Classify").size(12.5).color(Color32::from_rgb(100, 220, 255)).strong())
-                .fill(Color32::from_rgb(25, 48, 70));
+            let classify_btn = Button::new(
+                RichText::new("⚡ Auto-Classify\nOuter / Inner / Bend")
+                    .size(11.5)
+                    .color(Color32::from_rgb(100, 220, 255))
+                    .strong(),
+            )
+            .fill(Color32::from_rgb(25, 48, 70))
+            .min_size(Vec2::new(115.0, 41.0));
             if ui.add(classify_btn).on_hover_text("Auto-segregate Outer Profiles, Interior Holes, and Bend Lines into dedicated cutting layers").clicked() {
                 history.record(doc, selection, "Auto-Classify");
                 doc.auto_classify_profiles();
@@ -355,138 +361,151 @@ fn render_profiles_tab(
             }
         });
 
-        ui.add_space(4.0);
+        ui.add_space(2.0);
 
         // 3. Toolpath Sorting (Multiple Sorting Methods)
         ribbon_group(ui, "Toolpath Sorting", |ui| {
-            let mut current_mode = doc.sort_mode;
-            egui::ComboBox::from_id_salt("cut_sort_mode_combo")
-                .selected_text(RichText::new(current_mode.label()).size(12.0).strong().color(Color32::from_rgb(255, 220, 100)))
-                .width(175.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
-                    ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
-                    ui.selectable_value(&mut current_mode, SortMode::ShortestPath, "🚀 Shortest Travel (TSP)");
-                    ui.selectable_value(&mut current_mode, SortMode::LeftToRight, "➡️ Left to Right (X)");
-                    ui.selectable_value(&mut current_mode, SortMode::TopToBottom, "⬇️ Top to Bottom (Y)");
-                    ui.selectable_value(&mut current_mode, SortMode::Manual, "📝 Manual / Document Order");
-                });
+            ui.vertical(|ui| {
+                let mut current_mode = doc.sort_mode;
+                egui::ComboBox::from_id_salt("cut_sort_mode_combo")
+                    .selected_text(RichText::new(current_mode.label()).size(11.0).strong().color(Color32::from_rgb(255, 220, 100)))
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
+                        ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
+                        ui.selectable_value(&mut current_mode, SortMode::ShortestPath, "🚀 Shortest Travel (TSP)");
+                        ui.selectable_value(&mut current_mode, SortMode::LeftToRight, "➡️ Left to Right (X)");
+                        ui.selectable_value(&mut current_mode, SortMode::TopToBottom, "⬇️ Top to Bottom (Y)");
+                        ui.selectable_value(&mut current_mode, SortMode::Manual, "📝 Manual / Document Order");
+                    });
 
-            if current_mode != doc.sort_mode {
-                doc.sort_mode = current_mode;
-                *status_message = format!("Sort method set to: {}", current_mode.label());
-            }
+                if current_mode != doc.sort_mode {
+                    doc.sort_mode = current_mode;
+                    *status_message = format!("Sort method set to: {}", current_mode.label());
+                }
 
-            let sort_btn = Button::new(RichText::new("⚡ Sort").size(12.0).color(Color32::from_rgb(255, 215, 0)).strong())
-                .fill(Color32::from_rgb(45, 40, 22));
-            if ui.add(sort_btn).on_hover_text(format!("Apply '{}' sequence to document toolpaths: {}", doc.sort_mode.label(), doc.sort_mode.description())).clicked() {
-                history.record(doc, selection, format!("Sort ({})", doc.sort_mode.label()));
-                doc.apply_sort_order(doc.sort_mode);
-                let seq = doc.compute_cut_sequence();
-                *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), doc.sort_mode.label());
-            }
-
-            // In Manual mode or when selection exists, provide fine-grained manual order adjustments
-            if doc.sort_mode == SortMode::Manual && !selection.is_empty() {
                 ui.horizontal(|ui| {
-                    if ui.add(Button::new(RichText::new("▲ Earlier").size(11.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile earlier in cutting sequence").clicked() {
-                        history.record(doc, selection, "Move Earlier");
-                        if doc.move_selection_earlier(selection) {
-                            *status_message = "Moved selected profile earlier in cut order.".to_string();
+                    let sort_btn = Button::new(RichText::new("⚡ Sort").size(11.0).color(Color32::from_rgb(255, 215, 0)).strong())
+                        .fill(Color32::from_rgb(45, 40, 22))
+                        .min_size(Vec2::new(55.0, 19.0));
+                    if ui.add(sort_btn).on_hover_text(format!("Apply '{}' sequence to document toolpaths: {}", doc.sort_mode.label(), doc.sort_mode.description())).clicked() {
+                        history.record(doc, selection, format!("Sort ({})", doc.sort_mode.label()));
+                        doc.apply_sort_order(doc.sort_mode);
+                        let seq = doc.compute_cut_sequence();
+                        *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), doc.sort_mode.label());
+                    }
+
+                    if doc.sort_mode == SortMode::Manual && !selection.is_empty() {
+                        if ui.add(Button::new(RichText::new("▲").size(10.5)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile earlier in sequence").clicked() {
+                            history.record(doc, selection, "Move Earlier");
+                            if doc.move_selection_earlier(selection) {
+                                *status_message = "Moved cut earlier in sequence.".to_string();
+                            }
                         }
-                    }
-                    if ui.add(Button::new(RichText::new("▼ Later").size(11.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile later in cutting sequence").clicked() {
-                        history.record(doc, selection, "Move Later");
-                        if doc.move_selection_later(selection) {
-                            *status_message = "Moved selected profile later in cut order.".to_string();
+                        if ui.add(Button::new(RichText::new("▼").size(10.5)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile later in sequence").clicked() {
+                            history.record(doc, selection, "Move Later");
+                            if doc.move_selection_later(selection) {
+                                *status_message = "Moved cut later in sequence.".to_string();
+                            }
                         }
+                    } else {
+                        ui.label(RichText::new(doc.sort_mode.label()).size(9.5).weak());
                     }
-                });
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // 3. Selection Group
-        ribbon_group(ui, "Select", |ui| {
-            if ui.add(Button::new(RichText::new("⬚ All").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Select all profiles on visible layers").clicked() {
-                selection.clear();
-                for (l_idx, layer) in doc.layers.iter().enumerate() {
-                    if !layer.visible { continue; }
-                    for e_idx in 0..layer.entities.len() {
-                        selection.push((l_idx, e_idx));
-                    }
-                }
-            }
-
-            if ui.add(Button::new(RichText::new("🔄 Invert").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Invert selection").clicked() {
-                let mut new_sel = Vec::new();
-                for (l_idx, layer) in doc.layers.iter().enumerate() {
-                    if !layer.visible { continue; }
-                    for e_idx in 0..layer.entities.len() {
-                        if !selection.contains(&(l_idx, e_idx)) {
-                            new_sel.push((l_idx, e_idx));
-                        }
-                    }
-                }
-                *selection = new_sel;
-            }
-
-            if !selection.is_empty() {
-                if ui.add(Button::new(RichText::new("✕ Clear").size(12.0)).fill(Color32::from_rgb(45, 40, 42))).clicked() {
-                    selection.clear();
-                }
-                if ui.add(Button::new(RichText::new("🗑 Del").size(12.0).color(Color32::from_rgb(255, 90, 90))).fill(Color32::from_rgb(52, 30, 32))).clicked() {
-                    history.record(doc, selection, "Delete Selection");
-                    doc.delete_selection(selection);
-                    selection.clear();
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // 4. Lead Lines Group
-        ribbon_group(ui, "Lead Lines", |ui| {
-            let lead_btn = Button::new(RichText::new("📍 Add Leads").size(12.0).color(Color32::from_rgb(255, 215, 0)))
-                .fill(Color32::from_rgb(45, 40, 25));
-            if ui.add(lead_btn).on_hover_text(format!("Attach pierce lead-in lines ({:.1} mm at {:.0}°) to contours (interior holes pierce inside, outer pierce outside)", state.lead_config.length_mm, state.lead_config.angle_deg)).clicked() {
-                history.record(doc, selection, "Add Lead Lines");
-                let count = apply_lead_lines(doc, selection, &state.lead_config);
-                *status_message = format!("Added lead-in lines to {} contours.", count);
-            }
-
-            ui.menu_button(format!("⚙ {:.1}mm", state.lead_config.length_mm), |ui| {
-                ui.label(RichText::new("Lead-In Parameters").strong());
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Length:");
-                    ui.add(egui::DragValue::new(&mut state.lead_config.length_mm).speed(0.2).range(0.5..=20.0).suffix(" mm"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Angle:");
-                    ui.add(egui::DragValue::new(&mut state.lead_config.angle_deg).speed(5.0).range(15.0..=90.0).suffix("°"));
-                });
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut state.lead_config.lead_type, LeadType::Line, "Straight");
-                    ui.radio_value(&mut state.lead_config.lead_type, LeadType::Arc, "Arc");
                 });
             });
         });
 
-        ui.add_space(4.0);
+        ui.add_space(2.0);
 
-        // 5. Transforms
+        // 4. Selection Group (Compact 2x2 grid)
+        ribbon_group(ui, "Select", |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.add(Button::new(RichText::new("⬚ All").size(11.0)).fill(Color32::from_rgb(40, 45, 55)).min_size(Vec2::new(48.0, 19.0))).on_hover_text("Select all profiles on visible layers").clicked() {
+                        selection.clear();
+                        for (l_idx, layer) in doc.layers.iter().enumerate() {
+                            if !layer.visible { continue; }
+                            for e_idx in 0..layer.entities.len() {
+                                selection.push((l_idx, e_idx));
+                            }
+                        }
+                    }
+
+                    if ui.add(Button::new(RichText::new("🔄 Inv").size(11.0)).fill(Color32::from_rgb(40, 45, 55)).min_size(Vec2::new(48.0, 19.0))).on_hover_text("Invert selection").clicked() {
+                        let mut new_sel = Vec::new();
+                        for (l_idx, layer) in doc.layers.iter().enumerate() {
+                            if !layer.visible { continue; }
+                            for e_idx in 0..layer.entities.len() {
+                                if !selection.contains(&(l_idx, e_idx)) {
+                                    new_sel.push((l_idx, e_idx));
+                                }
+                            }
+                        }
+                        *selection = new_sel;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    let has_sel = !selection.is_empty();
+                    if ui.add_enabled(has_sel, Button::new(RichText::new("✕ Clear").size(11.0)).fill(Color32::from_rgb(45, 40, 42)).min_size(Vec2::new(48.0, 19.0))).clicked() {
+                        selection.clear();
+                    }
+                    if ui.add_enabled(has_sel, Button::new(RichText::new("🗑 Del").size(11.0).color(if has_sel { Color32::from_rgb(255, 90, 90) } else { Color32::GRAY })).fill(Color32::from_rgb(52, 30, 32)).min_size(Vec2::new(48.0, 19.0))).clicked() {
+                        history.record(doc, selection, "Delete Selection");
+                        doc.delete_selection(selection);
+                        selection.clear();
+                    }
+                });
+            });
+        });
+
+        ui.add_space(2.0);
+
+        // 5. Lead Lines Group (2 stacked rows)
+        ribbon_group(ui, "Lead Lines", |ui| {
+            ui.vertical(|ui| {
+                let lead_btn = Button::new(RichText::new("📍 Add Leads").size(11.0).color(Color32::from_rgb(255, 215, 0)))
+                    .fill(Color32::from_rgb(45, 40, 25))
+                    .min_size(Vec2::new(95.0, 19.0));
+                if ui.add(lead_btn).on_hover_text(format!("Attach pierce lead-in lines ({:.1} mm at {:.0}°) to contours", state.lead_config.length_mm, state.lead_config.angle_deg)).clicked() {
+                    history.record(doc, selection, "Add Lead Lines");
+                    let count = apply_lead_lines(doc, selection, &state.lead_config);
+                    *status_message = format!("Added lead-in lines to {} contours.", count);
+                }
+
+                ui.menu_button(RichText::new(format!("⚙ {:.1}mm / {:.0}°", state.lead_config.length_mm, state.lead_config.angle_deg)).size(10.0), |ui| {
+                    ui.label(RichText::new("Lead-In Parameters").strong());
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Length:");
+                        ui.add(egui::DragValue::new(&mut state.lead_config.length_mm).speed(0.2).range(0.5..=20.0).suffix(" mm"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Angle:");
+                        ui.add(egui::DragValue::new(&mut state.lead_config.angle_deg).speed(5.0).range(15.0..=90.0).suffix("°"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut state.lead_config.lead_type, LeadType::Line, "Straight");
+                        ui.radio_value(&mut state.lead_config.lead_type, LeadType::Arc, "Arc");
+                    });
+                });
+            });
+        });
+
+        // 6. Transforms (Mirror)
         if !selection.is_empty() {
+            ui.add_space(2.0);
             ribbon_group(ui, "Transforms", |ui| {
-                if ui.add(Button::new(RichText::new("🪞 Flip X").size(12.0)).fill(Color32::from_rgb(38, 42, 50))).on_hover_text("Mirror selection horizontally").clicked() {
-                    history.record(doc, selection, "Mirror X");
-                    doc.mirror_selection_horizontal(selection);
-                }
-                if ui.add(Button::new(RichText::new("🪞 Flip Y").size(12.0)).fill(Color32::from_rgb(38, 42, 50))).on_hover_text("Mirror selection vertically").clicked() {
-                    history.record(doc, selection, "Mirror Y");
-                    doc.mirror_selection_vertical(selection);
-                }
+                ui.vertical(|ui| {
+                    if ui.add(Button::new(RichText::new("🪞 Flip X").size(11.0)).fill(Color32::from_rgb(38, 42, 50)).min_size(Vec2::new(70.0, 19.0))).on_hover_text("Mirror selection horizontally").clicked() {
+                        history.record(doc, selection, "Mirror X");
+                        doc.mirror_selection_horizontal(selection);
+                    }
+                    if ui.add(Button::new(RichText::new("🪞 Flip Y").size(11.0)).fill(Color32::from_rgb(38, 42, 50)).min_size(Vec2::new(70.0, 19.0))).on_hover_text("Mirror selection vertically").clicked() {
+                        history.record(doc, selection, "Mirror Y");
+                        doc.mirror_selection_vertical(selection);
+                    }
+                });
             });
         }
     });
