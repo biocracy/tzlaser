@@ -161,11 +161,11 @@ pub fn render_ribbon(
 fn ribbon_group(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
     ui.group(|ui| {
         ui.vertical(|ui| {
-            content(ui);
-            ui.add_space(2.0);
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(title).size(9.0).color(Color32::from_rgb(130, 135, 150)).strong());
+            ui.horizontal(|ui| {
+                content(ui);
             });
+            ui.add_space(2.0);
+            ui.label(RichText::new(title).size(9.0).color(Color32::from_rgb(130, 135, 150)).strong());
         });
     });
 }
