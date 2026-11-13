@@ -258,7 +258,7 @@ impl Entity {
         }
     }
 
-    /// Calculate distance from point to entity (0.0 if clicking inside a closed shape).
+    /// Calculate distance from point to the entity's path/perimeter itself.
     pub fn distance_to_point(&self, p: Point) -> f64 {
         match self {
             Entity::Line { start, end } => dist_point_to_segment(p, *start, *end),
@@ -268,9 +268,6 @@ impl Entity {
                 }
                 if points.len() == 1 {
                     return (p.x - points[0].x).hypot(p.y - points[0].y);
-                }
-                if *closed && points.len() >= 3 && point_in_polygon(p, points) {
-                    return 0.0;
                 }
                 let mut min_d = f64::MAX;
                 for i in 0..points.len() - 1 {
@@ -283,11 +280,7 @@ impl Entity {
             }
             Entity::Circle { center, radius } => {
                 let d_center = (p.x - center.x).hypot(p.y - center.y);
-                if d_center <= *radius {
-                    0.0
-                } else {
-                    d_center - *radius
-                }
+                (d_center - *radius).abs()
             }
             Entity::Arc {
                 center,
