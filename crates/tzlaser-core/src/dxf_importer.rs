@@ -265,7 +265,10 @@ impl DxfImporter {
             );
         }
 
-        let mut doc = Document::default();
+        let mut doc = Document {
+            layers: Vec::new(),
+            ..Default::default()
+        };
         if layers_map.is_empty() {
             doc.layers.push(Layer::new("Default", Color::RED));
         } else {
@@ -274,8 +277,15 @@ impl DxfImporter {
             }
         }
 
+        // Always chain contiguous lines, arcs, and open polylines within each layer
+        // so closed and open polypaths are treated as single continuous toolpaths.
+        for layer in &mut doc.layers {
+            let raw = std::mem::take(&mut layer.entities);
+            layer.entities = crate::document::chain_connected_entities(raw, 0.1);
+        }
+
         // If the imported document only has a single generic layer (e.g. "Visible", "0", "Default"),
-        // automatically auto-classify profiles into Outer Profiles, Interior Profiles, and Bend lines!
+        // automatically classify profiles into Outer Profiles, Interior Profiles, and Bend lines.
         if doc.layers.len() <= 1 {
             doc.auto_classify_profiles();
         }
@@ -578,7 +588,7 @@ mod tests {
     fn test_cutie_danutz_panouri_import() {
         let path = Path::new("/Users/dinu/Projects/various geometries/cutieDanutz_panouri.dxf");
         if path.exists() {
-            let mut doc = DxfImporter::load_file(path).expect("Should load cutieDanutz_panouri.dxf cleanly");
+            let doc = DxfImporter::load_file(path).expect("Should load cutieDanutz_panouri.dxf cleanly");
             let bbox = doc.bounding_box().expect("Should have valid bounding box");
             
             // Expected bounds: X in [58.32, 1112.59], Y in [198.48, 937.35]
@@ -587,12 +597,7 @@ mod tests {
             assert!((bbox.min_y() - 198.48).abs() < 1.0, "Expected min_y ~198.48, got {}", bbox.min_y());
             assert!((bbox.max_y() - 937.35).abs() < 1.0, "Expected max_y ~937.35, got {}", bbox.max_y());
             
-            // Raw DXF contains 230 individual entities on layer 'Visible'
-            assert_eq!(doc.entity_count(), 230);
-
-            // When auto-classified, the perimeter lines chain into 10 closed outer loops,
-            // segregating 10 outer panels and 174 interior hole circles (184 total profiles).
-            doc.auto_classify_profiles();
+            // Single-layer DXF is automatically chained and classified into 10 outer panels + 174 interior holes
             assert_eq!(doc.entity_count(), 184);
             assert_eq!(doc.layers.len(), 2);
             assert_eq!(doc.layers[0].name, "Outer Profiles");
