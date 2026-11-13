@@ -1,0 +1,12 @@
+[package]
+name = "tzlaser-core"
+version = "0.1.0"
+edition = "2021"
+description = "CAD/CAM document models, DXF importer, and geometry math for laser cutting"
+
+[dependencies]
+dxf = "0.6"
+kurbo = { version = "0.13", features = ["serde"] }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+

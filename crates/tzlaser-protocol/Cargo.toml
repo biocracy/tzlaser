@@ -1,0 +1,13 @@
+[package]
+name = "tzlaser-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Low-level network protocol and driver for TZLASER CNC laser controller"
+
+[dependencies]
+byteorder = "1.5"
+thiserror = "2.0"
+log = "0.4"
+
+[dev-dependencies]
+hex = "0.4"

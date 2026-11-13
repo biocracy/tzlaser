@@ -1,0 +1,18 @@
+[package]
+name = "tzlaser-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop UI and 2D CAD canvas for Ţlaser cutting system"
+
+[dependencies]
+tzlaser-protocol = { path = "../tzlaser-protocol" }
+tzlaser-core = { path = "../tzlaser-core" }
+
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+kurbo = "0.13"
+log = "0.4"
+env_logger = "0.11"
+serde_json = "1.0"
+

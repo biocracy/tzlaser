@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/tzlaser-protocol",
+    "crates/tzlaser-core",
+    "crates/tzlaser-gui",
+]
+resolver = "2"
+
