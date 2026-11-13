@@ -415,6 +415,40 @@ impl SortMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PastedOrigin {
+    pub instance_id: usize,
+    pub parent_layer: usize,
+    pub parent_entity: usize,
+}
+
+mod tuple_map_serde {
+    use super::PastedOrigin;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S>(
+        map: &HashMap<(usize, usize), PastedOrigin>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<((usize, usize), PastedOrigin)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<(usize, usize), PastedOrigin>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries: Vec<((usize, usize), PastedOrigin)> = Vec::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub layers: Vec<Layer>,
@@ -422,6 +456,10 @@ pub struct Document {
     pub sort_mode: SortMode,
     #[serde(default)]
     pub manual_sequence: Vec<(usize, usize)>,
+    #[serde(default, with = "tuple_map_serde")]
+    pub pasted_origins: HashMap<(usize, usize), PastedOrigin>,
+    #[serde(default)]
+    pub next_instance_id: usize,
 }
 
 impl Default for Document {
@@ -439,6 +477,8 @@ impl Document {
             ],
             sort_mode: SortMode::default(),
             manual_sequence: Vec::new(),
+            pasted_origins: HashMap::new(),
+            next_instance_id: 0,
         }
     }
 
@@ -541,11 +581,33 @@ impl Document {
     pub fn duplicate_selection(&mut self, selection: &[(usize, usize)], dx: f64, dy: f64) -> Vec<(usize, usize)> {
         let mut new_selection = Vec::new();
         let mut seen = std::collections::HashSet::new();
-
+        let mut unique_sel = Vec::new();
         for &(l_idx, e_idx) in selection {
-            if !seen.insert((l_idx, e_idx)) {
-                continue;
+            if seen.insert((l_idx, e_idx)) {
+                unique_sel.push((l_idx, e_idx));
             }
+        }
+        if unique_sel.is_empty() {
+            return new_selection;
+        }
+
+        let current_seq = self.compute_cut_sequence();
+        let mut seq_rank: HashMap<(usize, usize), usize> = HashMap::new();
+        for (idx, info) in current_seq.iter().enumerate() {
+            seq_rank.entry((info.layer_idx, info.entity_idx)).or_insert(idx);
+        }
+        unique_sel.sort_by_key(|pair| seq_rank.get(pair).copied().unwrap_or(usize::MAX));
+
+        self.next_instance_id += 1;
+        let instance_id = self.next_instance_id;
+
+        for &(l_idx, e_idx) in &unique_sel {
+            let root_parent = self
+                .pasted_origins
+                .get(&(l_idx, e_idx))
+                .map(|o| (o.parent_layer, o.parent_entity))
+                .unwrap_or((l_idx, e_idx));
+
             if let Some(layer) = self.layers.get(l_idx) {
                 if let Some(entity) = layer.entities.get(e_idx) {
                     let mut cloned = entity.clone();
@@ -553,6 +615,17 @@ impl Document {
                     let target_layer = &mut self.layers[l_idx];
                     let new_idx = target_layer.entities.len();
                     target_layer.entities.push(cloned);
+                    self.pasted_origins.insert(
+                        (l_idx, new_idx),
+                        PastedOrigin {
+                            instance_id,
+                            parent_layer: root_parent.0,
+                            parent_entity: root_parent.1,
+                        },
+                    );
+                    if !self.manual_sequence.is_empty() {
+                        self.manual_sequence.push((l_idx, new_idx));
+                    }
                     new_selection.push((l_idx, new_idx));
                 }
             }
@@ -590,6 +663,7 @@ impl Document {
     /// Delete selected entities from the document.
     pub fn delete_selection(&mut self, selection: &[(usize, usize)]) {
         self.manual_sequence.clear();
+        self.pasted_origins.clear();
         let mut to_remove: HashMap<usize, Vec<usize>> = HashMap::new();
         for &(l, e) in selection {
             to_remove.entry(l).or_default().push(e);
@@ -597,6 +671,7 @@ impl Document {
         for (l_idx, mut e_indices) in to_remove {
             if let Some(layer) = self.layers.get_mut(l_idx) {
                 e_indices.sort_unstable_by(|a, b| b.cmp(a)); // remove in reverse order
+                e_indices.dedup();
                 for e in e_indices {
                     if e < layer.entities.len() {
                         layer.entities.remove(e);
@@ -607,7 +682,7 @@ impl Document {
     }
 
     /// Group selected entities into a single compound object.
-    /// All relative positions of the profiles stay strictly fixed.
+    /// All relative positions and cut sequence order of the profiles stay strictly fixed.
     /// Updates selection to point to the new single grouped entity.
     pub fn group_selection(&mut self, selection: &mut Vec<(usize, usize)>) -> Option<(usize, usize)> {
         if selection.len() <= 1 {
@@ -615,24 +690,59 @@ impl Document {
         }
 
         let target_layer_idx = selection[0].0;
-
-        let mut to_remove: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut seen_sel = std::collections::HashSet::new();
+        let mut selected_list = Vec::new();
         for &(l, e) in selection.iter() {
-            to_remove.entry(l).or_default().push(e);
+            if seen_sel.insert((l, e)) {
+                selected_list.push((l, e));
+            }
         }
 
+        let current_seq = self.compute_cut_sequence();
         let mut grouped_children = Vec::new();
+        let mut consumed_subpaths = std::collections::HashSet::new();
+        let mut consumed_entities = std::collections::HashSet::new();
 
-        for (l_idx, mut e_indices) in to_remove {
-            e_indices.sort_unstable_by(|a, b| b.cmp(a));
-            if let Some(layer) = self.layers.get_mut(l_idx) {
-                for e_idx in e_indices {
-                    if e_idx < layer.entities.len() {
-                        let removed = layer.entities.remove(e_idx);
-                        if let Entity::Group { children } = removed {
-                            grouped_children.extend(children);
-                        } else {
-                            grouped_children.push(removed);
+        for info in &current_seq {
+            if seen_sel.contains(&(info.layer_idx, info.entity_idx)) {
+                if let Some(layer) = self.layers.get(info.layer_idx) {
+                    if let Some(entity) = layer.entities.get(info.entity_idx) {
+                        match (entity, info.child_idx) {
+                            (Entity::Group { children }, Some(c_idx)) => {
+                                if let Some(child) = children.get(c_idx) {
+                                    grouped_children.push(child.clone());
+                                    consumed_subpaths.insert((info.layer_idx, info.entity_idx, Some(c_idx)));
+                                    consumed_entities.insert((info.layer_idx, info.entity_idx));
+                                }
+                            }
+                            _ => {
+                                if consumed_entities.insert((info.layer_idx, info.entity_idx)) {
+                                    grouped_children.push(entity.clone());
+                                    consumed_subpaths.insert((info.layer_idx, info.entity_idx, None));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Append any selected entities or children absent from current_seq (e.g. hidden layers)
+        for &(l_idx, e_idx) in &selected_list {
+            if let Some(layer) = self.layers.get(l_idx) {
+                if let Some(entity) = layer.entities.get(e_idx) {
+                    match entity {
+                        Entity::Group { children } => {
+                            for (c_idx, child) in children.iter().enumerate() {
+                                if !consumed_subpaths.contains(&(l_idx, e_idx, Some(c_idx))) {
+                                    grouped_children.push(child.clone());
+                                }
+                            }
+                        }
+                        _ => {
+                            if !consumed_entities.contains(&(l_idx, e_idx)) {
+                                grouped_children.push(entity.clone());
+                            }
                         }
                     }
                 }
@@ -642,7 +752,25 @@ impl Document {
         if grouped_children.is_empty() {
             return None;
         }
-        grouped_children.reverse();
+
+        let mut to_remove: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &(l, e) in &selected_list {
+            to_remove.entry(l).or_default().push(e);
+        }
+        for (l_idx, mut e_indices) in to_remove {
+            e_indices.sort_unstable_by(|a, b| b.cmp(a));
+            e_indices.dedup();
+            if let Some(layer) = self.layers.get_mut(l_idx) {
+                for e_idx in e_indices {
+                    if e_idx < layer.entities.len() {
+                        layer.entities.remove(e_idx);
+                    }
+                }
+            }
+        }
+
+        self.pasted_origins.clear();
+        self.manual_sequence.clear();
 
         let new_group = Entity::Group { children: grouped_children };
         let new_idx = self.layers[target_layer_idx].entities.len();
@@ -654,6 +782,7 @@ impl Document {
 
     /// Ungroup any selected Group entities back into individual entities.
     pub fn ungroup_selection(&mut self, selection: &mut Vec<(usize, usize)>) {
+        self.pasted_origins.clear();
         let mut new_selection = Vec::new();
 
         let mut to_unpack: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -663,6 +792,7 @@ impl Document {
 
         for (l_idx, mut e_indices) in to_unpack {
             e_indices.sort_unstable_by(|a, b| b.cmp(a));
+            e_indices.dedup();
             if let Some(layer) = self.layers.get_mut(l_idx) {
                 for e_idx in e_indices {
                     if e_idx < layer.entities.len() {
@@ -702,6 +832,7 @@ impl Document {
     /// Auto-detects and classifies profiles into Outer Profiles, Interior Profiles, and Bend / Open Lines.
     pub fn auto_classify_profiles(&mut self) {
         self.manual_sequence.clear();
+        self.pasted_origins.clear();
         let mut all_entities = Vec::new();
         for layer in self.layers.drain(..) {
             all_entities.extend(layer.entities);
@@ -879,29 +1010,109 @@ impl Document {
             }
         }
 
-        match mode {
-            SortMode::Manual => {
-                if self.manual_sequence.is_empty() {
-                    raw_paths
-                } else {
-                    let mut result = Vec::with_capacity(raw_paths.len());
-                    let mut used = vec![false; raw_paths.len()];
-                    for &(l_idx, e_idx) in &self.manual_sequence {
-                        for (i, item) in raw_paths.iter().enumerate() {
-                            if !used[i] && item.layer_idx == l_idx && item.entity_idx == e_idx {
-                                result.push(*item);
-                                used[i] = true;
-                            }
-                        }
+        if mode == SortMode::Manual && !self.manual_sequence.is_empty() {
+            let mut result = Vec::with_capacity(raw_paths.len());
+            let mut used = vec![false; raw_paths.len()];
+            for &(l_idx, e_idx) in &self.manual_sequence {
+                for (i, item) in raw_paths.iter().enumerate() {
+                    if !used[i] && item.layer_idx == l_idx && item.entity_idx == e_idx {
+                        result.push(*item);
+                        used[i] = true;
                     }
-                    for (i, item) in raw_paths.into_iter().enumerate() {
-                        if !used[i] {
-                            result.push(item);
-                        }
-                    }
-                    result
                 }
             }
+            for (i, item) in raw_paths.into_iter().enumerate() {
+                if !used[i] {
+                    result.push(item);
+                }
+            }
+            return result;
+        }
+
+        if self.pasted_origins.is_empty() {
+            return self.sequence_base_paths(raw_paths, mode);
+        }
+
+        let mut base_paths = Vec::with_capacity(raw_paths.len());
+        let mut pasted_by_instance: std::collections::BTreeMap<usize, Vec<(PastedOrigin, CutPathInfo)>> =
+            std::collections::BTreeMap::new();
+
+        for item in raw_paths {
+            if let Some(&orig) = self.pasted_origins.get(&(item.layer_idx, item.entity_idx)) {
+                pasted_by_instance.entry(orig.instance_id).or_default().push((orig, item));
+            } else {
+                base_paths.push(item);
+            }
+        }
+
+        let total_len = base_paths.len() + pasted_by_instance.values().map(|v| v.len()).sum::<usize>();
+        let mut result = self.sequence_base_paths(base_paths, mode);
+        result.reserve(total_len.saturating_sub(result.len()));
+
+        let mut parent_rank: HashMap<(usize, usize, Option<usize>), usize> = HashMap::with_capacity(result.len());
+        for (rank, item) in result.iter().enumerate() {
+            parent_rank.insert((item.layer_idx, item.entity_idx, item.child_idx), rank);
+        }
+
+        for (_instance_id, mut items) in pasted_by_instance {
+            items.sort_by_key(|(orig, item)| {
+                let rank = parent_rank
+                    .get(&(orig.parent_layer, orig.parent_entity, item.child_idx))
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                (rank, item.child_idx.unwrap_or(0))
+            });
+            for (_orig, item) in items {
+                result.push(item);
+            }
+        }
+
+        result
+    }
+
+    fn order_group_children_for_mode(children: Vec<CutPathInfo>, mode: SortMode) -> Vec<CutPathInfo> {
+        match mode {
+            SortMode::OpenFirst => {
+                let mut open = Vec::new();
+                let mut interior = Vec::new();
+                let mut outer = Vec::new();
+                for item in children {
+                    if item.is_open {
+                        open.push(item);
+                    } else if item.is_interior {
+                        interior.push(item);
+                    } else {
+                        outer.push(item);
+                    }
+                }
+                open.extend(interior);
+                open.extend(outer);
+                open
+            }
+            SortMode::InnerFirst => {
+                let mut interior = Vec::new();
+                let mut outer = Vec::new();
+                let mut open = Vec::new();
+                for item in children {
+                    if item.is_open {
+                        open.push(item);
+                    } else if item.is_interior {
+                        interior.push(item);
+                    } else {
+                        outer.push(item);
+                    }
+                }
+                interior.extend(outer);
+                interior.extend(open);
+                interior
+            }
+            _ => children,
+        }
+    }
+
+    fn sequence_base_paths(&self, mut raw_paths: Vec<CutPathInfo>, mode: SortMode) -> Vec<CutPathInfo> {
+        match mode {
+            SortMode::Manual => raw_paths,
             SortMode::LeftToRight => {
                 raw_paths.sort_by(|a, b| a.start_point.x.partial_cmp(&b.start_point.x).unwrap_or(std::cmp::Ordering::Equal));
                 raw_paths
@@ -910,18 +1121,41 @@ impl Document {
                 raw_paths.sort_by(|a, b| b.start_point.y.partial_cmp(&a.start_point.y).unwrap_or(std::cmp::Ordering::Equal));
                 raw_paths
             }
-            SortMode::ShortestPath => {
-                let mut result = Vec::with_capacity(raw_paths.len());
+            SortMode::ShortestPath | SortMode::OpenFirst | SortMode::InnerFirst => {
+                let total_len = raw_paths.len();
+                let mut standalone = Vec::new();
+                let mut groups: std::collections::BTreeMap<(usize, usize), Vec<CutPathInfo>> =
+                    std::collections::BTreeMap::new();
+
+                for item in raw_paths {
+                    if item.child_idx.is_some() {
+                        groups.entry((item.layer_idx, item.entity_idx)).or_default().push(item);
+                    } else {
+                        standalone.push(item);
+                    }
+                }
+
+                let mut group_units: Vec<Vec<CutPathInfo>> = groups
+                    .into_values()
+                    .map(|g| Self::order_group_children_for_mode(g, mode))
+                    .filter(|u| !u.is_empty())
+                    .collect();
+
+                let mut result = Vec::with_capacity(total_len);
                 let mut current_pos = Point::ORIGIN;
-                Self::sequence_group_nearest_neighbor(&mut raw_paths, &mut current_pos, &mut result);
-                result
-            }
-            SortMode::OpenFirst => {
+
+                if mode == SortMode::ShortestPath {
+                    let mut units: Vec<Vec<CutPathInfo>> = standalone.into_iter().map(|s| vec![s]).collect();
+                    units.append(&mut group_units);
+                    Self::sequence_units_nearest_neighbor(&mut units, &mut current_pos, &mut result);
+                    return result;
+                }
+
                 let mut bend_paths = Vec::new();
                 let mut interior_paths = Vec::new();
                 let mut outer_paths = Vec::new();
 
-                for item in raw_paths {
+                for item in standalone {
                     if item.is_open {
                         bend_paths.push(item);
                     } else if item.is_interior {
@@ -931,35 +1165,50 @@ impl Document {
                     }
                 }
 
-                let mut result = Vec::with_capacity(bend_paths.len() + interior_paths.len() + outer_paths.len());
-                let mut current_pos = Point::ORIGIN;
-                Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
-                Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
-                Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
-                result
-            }
-            SortMode::InnerFirst => {
-                let mut bend_paths = Vec::new();
-                let mut interior_paths = Vec::new();
-                let mut outer_paths = Vec::new();
-
-                for item in raw_paths {
-                    if item.is_open {
-                        bend_paths.push(item);
-                    } else if item.is_interior {
-                        interior_paths.push(item);
-                    } else {
-                        outer_paths.push(item);
+                match mode {
+                    SortMode::OpenFirst => {
+                        Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
+                        Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
+                        Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
                     }
+                    SortMode::InnerFirst => {
+                        Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
+                        Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
+                        Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
+                    }
+                    _ => unreachable!(),
                 }
 
-                let mut result = Vec::with_capacity(bend_paths.len() + interior_paths.len() + outer_paths.len());
-                let mut current_pos = Point::ORIGIN;
-                Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
-                Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
-                Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
+                Self::sequence_units_nearest_neighbor(&mut group_units, &mut current_pos, &mut result);
                 result
             }
+        }
+    }
+
+    fn sequence_units_nearest_neighbor(
+        units: &mut Vec<Vec<CutPathInfo>>,
+        current_pos: &mut Point,
+        result: &mut Vec<CutPathInfo>,
+    ) {
+        while !units.is_empty() {
+            let mut best_idx = 0;
+            let mut best_dist = f64::MAX;
+
+            for (i, unit) in units.iter().enumerate() {
+                if let Some(first) = unit.first() {
+                    let d = (first.start_point.x - current_pos.x).hypot(first.start_point.y - current_pos.y);
+                    if d < best_dist {
+                        best_dist = d;
+                        best_idx = i;
+                    }
+                }
+            }
+
+            let next_unit = units.swap_remove(best_idx);
+            if let Some(last) = next_unit.last() {
+                *current_pos = last.end_point;
+            }
+            result.extend(next_unit);
         }
     }
 
@@ -969,24 +1218,44 @@ impl Document {
         let seq = self.compute_cut_sequence_with_mode(mode);
         self.manual_sequence.clear();
 
+        let mut old_to_new: HashMap<(usize, usize), usize> = HashMap::new();
+
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             let mut ordered_entities = Vec::with_capacity(layer.entities.len());
             let mut used = vec![false; layer.entities.len()];
 
             for info in &seq {
                 if info.layer_idx == l_idx && info.entity_idx < layer.entities.len() && !used[info.entity_idx] {
+                    let new_idx = ordered_entities.len();
                     ordered_entities.push(layer.entities[info.entity_idx].clone());
                     used[info.entity_idx] = true;
+                    old_to_new.insert((l_idx, info.entity_idx), new_idx);
                 }
             }
 
             // Append any unvisited entities (e.g. from hidden layers)
             for (i, ent) in layer.entities.drain(..).enumerate() {
                 if !used[i] {
+                    let new_idx = ordered_entities.len();
                     ordered_entities.push(ent);
+                    old_to_new.insert((l_idx, i), new_idx);
                 }
             }
             layer.entities = ordered_entities;
+        }
+
+        if !self.pasted_origins.is_empty() {
+            let mut remapped = HashMap::with_capacity(self.pasted_origins.len());
+            for ((old_l, old_e), mut origin) in self.pasted_origins.drain() {
+                let new_e = old_to_new.get(&(old_l, old_e)).copied().unwrap_or(old_e);
+                let new_parent_e = old_to_new
+                    .get(&(origin.parent_layer, origin.parent_entity))
+                    .copied()
+                    .unwrap_or(origin.parent_entity);
+                origin.parent_entity = new_parent_e;
+                remapped.insert((old_l, new_e), origin);
+            }
+            self.pasted_origins = remapped;
         }
     }
 
@@ -1396,10 +1665,11 @@ mod tests {
         let seq = doc.compute_cut_sequence();
         assert_eq!(seq.len(), 4);
 
-        // Both interior holes must be detected as interior and cut before the 2 outer contours
+        // Part 1 cuts its interior hole (index 0) before its outer contour (index 1),
+        // and Copy 2 follows the exact same relative order: interior hole (index 2) before outer contour (index 3).
         assert!(seq[0].is_interior);
-        assert!(seq[1].is_interior);
-        assert!(!seq[2].is_interior);
+        assert!(!seq[1].is_interior);
+        assert!(seq[2].is_interior);
         assert!(!seq[3].is_interior);
 
         // Every CutPathInfo must have a unique (layer_idx, entity_idx, child_idx) key
@@ -1408,5 +1678,94 @@ mod tests {
             .map(|i| (i.layer_idx, i.entity_idx, i.child_idx))
             .collect();
         assert_eq!(unique_keys.len(), 4);
+    }
+
+    #[test]
+    fn test_pasted_objects_preserve_parent_relative_index_order() {
+        // Build a part with 1 outer box, 3 asymmetric interior holes (at different Y/X so TSP
+        // would normally reverse/scramble when entering from another corner), and 1 open bend line.
+        let make_part_doc = || {
+            let mut doc = Document::default();
+            let mut outer = Layer::new("Outer Profiles", Color::GREEN);
+            outer.entities.push(Entity::Polyline {
+                points: vec![
+                    Point::new(0.0, 0.0),
+                    Point::new(100.0, 0.0),
+                    Point::new(100.0, 100.0),
+                    Point::new(0.0, 100.0),
+                ],
+                closed: true,
+            });
+            let mut inner = Layer::new("Interior Profiles", Color::YELLOW);
+            inner.entities.push(Entity::Circle {
+                center: Point::new(85.0, 80.0),
+                radius: 5.0,
+            });
+            inner.entities.push(Entity::Circle {
+                center: Point::new(15.0, 20.0),
+                radius: 5.0,
+            });
+            inner.entities.push(Entity::Circle {
+                center: Point::new(85.0, 20.0),
+                radius: 5.0,
+            });
+            let mut bend = Layer::new("Bend / Open Lines", Color::MAGENTA);
+            bend.entities.push(Entity::Line {
+                start: Point::new(10.0, 50.0),
+                end: Point::new(90.0, 50.0),
+            });
+            doc.layers = vec![outer, inner, bend];
+            doc
+        };
+
+        // 1. Ungrouped multi-path part: duplicate_selection and array_copy
+        {
+            let mut doc = make_part_doc();
+            let sel = vec![(0, 0), (1, 0), (1, 1), (1, 2), (2, 0)];
+            let all = doc.array_copy(&sel, 2, 2, 130.0, 130.0);
+            assert_eq!(all.len(), 20);
+
+            let seq = doc.compute_cut_sequence();
+            assert_eq!(seq.len(), 20);
+
+            // Verify every pasted copy instance (copies 1..4) has the exact same relative path order
+            // as parent copy 0, shifted by (dx, dy) = (c * 130, r * 130).
+            let offsets = [(130.0, 0.0), (0.0, 130.0), (130.0, 130.0)];
+            for (copy_i, &(dx, dy)) in offsets.iter().enumerate() {
+                let base_idx = (copy_i + 1) * 5;
+                for k in 0..5 {
+                    let parent = &seq[k];
+                    let copy = &seq[base_idx + k];
+                    assert!((copy.start_point.x - parent.start_point.x - dx).abs() < 1e-6);
+                    assert!((copy.start_point.y - parent.start_point.y - dy).abs() < 1e-6);
+                }
+            }
+        }
+
+        // 2. Grouped Entity::Group part: duplicate_selection and array_copy
+        {
+            let mut doc = make_part_doc();
+            let mut sel = vec![(0, 0), (1, 0), (1, 1), (1, 2), (2, 0)];
+            doc.group_selection(&mut sel);
+            assert_eq!(sel.len(), 1);
+
+            let _copy1 = doc.duplicate_selection(&sel, 130.0, 0.0);
+            let _all = doc.array_copy(&sel, 2, 1, 260.0, 0.0);
+
+            let seq = doc.compute_cut_sequence();
+            assert_eq!(seq.len(), 15);
+
+            // Parent group + 2 copies => 3 instances of 5 paths each
+            let dxs = [130.0, 260.0];
+            for (copy_i, &dx) in dxs.iter().enumerate() {
+                let base_idx = (copy_i + 1) * 5;
+                for k in 0..5 {
+                    let parent = &seq[k];
+                    let copy = &seq[base_idx + k];
+                    assert!((copy.start_point.x - parent.start_point.x - dx).abs() < 1e-6);
+                    assert!((copy.start_point.y - parent.start_point.y).abs() < 1e-6);
+                }
+            }
+        }
     }
 }
