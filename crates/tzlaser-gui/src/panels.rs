@@ -34,6 +34,7 @@ pub struct PanelState {
     pub is_paused: bool,
     pub sim_speed_multiplier: f64,
     pub trajectory: Vec<MotionSegment>,
+    pub full_trajectory: Vec<MotionSegment>,
     pub current_seg_idx: usize,
     pub seg_progress_mm: f64,
     pub total_length_mm: f64,
@@ -54,6 +55,7 @@ impl Default for PanelState {
             is_paused: false,
             sim_speed_multiplier: 1.0,
             trajectory: Vec::new(),
+            full_trajectory: Vec::new(),
             current_seg_idx: 0,
             seg_progress_mm: 0.0,
             total_length_mm: 0.0,
@@ -79,6 +81,7 @@ impl PanelState {
             return "No active toolpaths to run on visible layers.".to_string();
         }
         self.total_length_mm = traj.iter().map(|s| s.length_mm).sum();
+        self.full_trajectory = traj.clone();
         self.trajectory = traj;
         self.current_seg_idx = 0;
         self.seg_progress_mm = 0.0;
@@ -108,6 +111,7 @@ impl PanelState {
         self.is_paused = false;
         self.last_tick = None;
         self.last_hw_dispatched_seg = None;
+        self.full_trajectory.clear();
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
         status.laser_on = false;
@@ -137,6 +141,10 @@ impl PanelState {
             || self.current_seg_idx >= self.trajectory.len()
         {
             return None;
+        }
+
+        if self.full_trajectory.is_empty() {
+            self.full_trajectory = self.trajectory.clone();
         }
 
         let seg = self.trajectory[self.current_seg_idx];
@@ -174,6 +182,222 @@ impl PanelState {
             "Paused at X: {:.2}, Y: {:.2} mm (Path #{}). Head unlocked for manual jogging.",
             point_mm.x, point_mm.y, cp.path_index_1based
         ))
+    }
+
+    /// Step the head forward or backward along the cutting profile path while paused.
+    /// Clamps to the current profile's endpoint/start-point when remaining distance < `step_mm`,
+    /// and transitions to the next/previous profile when already at a start/endpoint.
+    pub fn step_along_path(
+        &mut self,
+        forward: bool,
+        step_mm: f64,
+        controller: &Option<LaserController>,
+        status: &mut MachineStatus,
+        pulses_cfg: &PulseConfig,
+    ) -> Option<String> {
+        if !self.is_paused || step_mm <= 0.0 {
+            return None;
+        }
+        let cp = self.paused_checkpoint?;
+
+        if self.full_trajectory.is_empty() {
+            self.full_trajectory = self.trajectory.clone();
+        }
+        if self.full_trajectory.is_empty() {
+            return None;
+        }
+
+        struct ProfileSpan {
+            path_index_1based: usize,
+            first_seg_idx: usize,
+            last_seg_idx: usize,
+            total_len_mm: f64,
+        }
+
+        let mut spans: Vec<ProfileSpan> = Vec::new();
+        for (idx, seg) in self.full_trajectory.iter().enumerate() {
+            if seg.is_rapid {
+                continue;
+            }
+            if let Some(last) = spans.last_mut() {
+                if last.path_index_1based == seg.path_index_1based && last.last_seg_idx + 1 == idx {
+                    last.last_seg_idx = idx;
+                    last.total_len_mm += seg.length_mm;
+                    continue;
+                }
+            }
+            spans.push(ProfileSpan {
+                path_index_1based: seg.path_index_1based,
+                first_seg_idx: idx,
+                last_seg_idx: idx,
+                total_len_mm: seg.length_mm,
+            });
+        }
+        if spans.is_empty() {
+            for (idx, seg) in self.full_trajectory.iter().enumerate() {
+                spans.push(ProfileSpan {
+                    path_index_1based: seg.path_index_1based,
+                    first_seg_idx: idx,
+                    last_seg_idx: idx,
+                    total_len_mm: seg.length_mm,
+                });
+            }
+        }
+        if spans.is_empty() {
+            return None;
+        }
+
+        let tail = self.trajectory.len().saturating_sub(cp.seg_idx);
+        let mapped_full_idx = self.full_trajectory.len().checked_sub(tail);
+
+        let (cur_profile_idx, cur_s) = if let Some(full_idx) = mapped_full_idx {
+            if let Some(p_idx) = spans
+                .iter()
+                .position(|sp| full_idx >= sp.first_seg_idx && full_idx <= sp.last_seg_idx)
+            {
+                let sp = &spans[p_idx];
+                let mut s = 0.0;
+                for i in sp.first_seg_idx..full_idx {
+                    s += self.full_trajectory[i].length_mm;
+                }
+                let local_prog = if let Some(cur_seg) = self.trajectory.get(cp.seg_idx) {
+                    let rem = (cur_seg.length_mm - cp.seg_progress_mm).max(0.0);
+                    (self.full_trajectory[full_idx].length_mm - rem)
+                        .clamp(0.0, self.full_trajectory[full_idx].length_mm)
+                } else {
+                    0.0
+                };
+                (p_idx, (s + local_prog).clamp(0.0, sp.total_len_mm))
+            } else if let Some(p_idx) = spans
+                .iter()
+                .position(|sp| sp.path_index_1based == cp.path_index_1based)
+            {
+                let sp = &spans[p_idx];
+                let s = if full_idx > sp.last_seg_idx {
+                    sp.total_len_mm
+                } else {
+                    0.0
+                };
+                (p_idx, s)
+            } else {
+                (0, 0.0)
+            }
+        } else if let Some(p_idx) = spans
+            .iter()
+            .position(|sp| sp.path_index_1based == cp.path_index_1based)
+        {
+            (p_idx, 0.0)
+        } else {
+            (0, 0.0)
+        };
+
+        let sp = &spans[cur_profile_idx];
+        let eps = 1e-4;
+        let delta = step_mm;
+        let (target_profile_idx, target_s, crossed) = if forward {
+            if cur_s < sp.total_len_mm - eps {
+                (cur_profile_idx, (cur_s + delta).min(sp.total_len_mm), false)
+            } else if cur_profile_idx + 1 < spans.len() {
+                let next_sp = &spans[cur_profile_idx + 1];
+                (cur_profile_idx + 1, delta.min(next_sp.total_len_mm), true)
+            } else {
+                return Some(format!(
+                    "Already at endpoint of final profile (Path #{}).",
+                    sp.path_index_1based
+                ));
+            }
+        } else if cur_s > eps {
+            (cur_profile_idx, (cur_s - delta).max(0.0), false)
+        } else if cur_profile_idx > 0 {
+            let prev_sp = &spans[cur_profile_idx - 1];
+            (cur_profile_idx - 1, (prev_sp.total_len_mm - delta).max(0.0), true)
+        } else {
+            return Some(format!(
+                "Already at start-point of first profile (Path #{}).",
+                sp.path_index_1based
+            ));
+        };
+
+        let target_sp = &spans[target_profile_idx];
+        let mut accum = 0.0;
+        let mut target_seg_idx = target_sp.last_seg_idx;
+        let mut local_prog = self.full_trajectory[target_seg_idx].length_mm;
+        for i in target_sp.first_seg_idx..=target_sp.last_seg_idx {
+            let seg = self.full_trajectory[i];
+            if target_s <= accum + seg.length_mm + 1e-9 || i == target_sp.last_seg_idx {
+                target_seg_idx = i;
+                local_prog = (target_s - accum).clamp(0.0, seg.length_mm);
+                break;
+            }
+            accum += seg.length_mm;
+        }
+
+        let t_seg = self.full_trajectory[target_seg_idx];
+        let frac = (local_prog / t_seg.length_mm.max(1e-9)).clamp(0.0, 1.0);
+        let point_mm = kurbo::Point::new(
+            t_seg.start.x + (t_seg.end.x - t_seg.start.x) * frac,
+            t_seg.start.y + (t_seg.end.y - t_seg.start.y) * frac,
+        );
+
+        let new_px = pulses_cfg.mm_to_pulses_x(point_mm.x);
+        let new_py = pulses_cfg.mm_to_pulses_y(point_mm.y);
+        if let Some(ref c) = controller {
+            if c.is_connected() {
+                let dx_p = new_px - status.pos_x;
+                let dy_p = new_py - status.pos_y;
+                if dx_p != 0 {
+                    c.jog(Axis::X, dx_p);
+                }
+                if dy_p != 0 {
+                    c.jog(Axis::Y, dy_p);
+                }
+            }
+        }
+        status.pos_x = new_px;
+        status.pos_y = new_py;
+        status.laser_on = false;
+
+        let new_traveled: f64 = self.full_trajectory[..target_seg_idx]
+            .iter()
+            .map(|s| s.length_mm)
+            .sum::<f64>()
+            + local_prog;
+        let full_total: f64 = self.full_trajectory.iter().map(|s| s.length_mm).sum();
+
+        self.trajectory = self.full_trajectory.clone();
+        self.current_seg_idx = target_seg_idx;
+        self.seg_progress_mm = local_prog;
+        self.traveled_length_mm = new_traveled;
+        self.total_length_mm = full_total;
+        self.last_hw_dispatched_seg = None;
+
+        let new_cp = PauseCheckpoint {
+            point_mm,
+            seg_idx: target_seg_idx,
+            seg_progress_mm: local_prog,
+            traveled_length_mm: new_traveled,
+            path_index_1based: target_sp.path_index_1based,
+            mode: cp.mode,
+        };
+        self.paused_checkpoint = Some(new_cp);
+        if let Some(last) = self.pause_buffer.last_mut() {
+            *last = new_cp;
+        } else {
+            self.pause_buffer.push(new_cp);
+        }
+
+        let dir_label = if forward { "Forward" } else { "Backward" };
+        if crossed {
+            Some(format!(
+                "Stepped {} to Path #{} ({:.1}/{:.1} mm) @ X: {:.2}, Y: {:.2} mm.",
+                dir_label, target_sp.path_index_1based, target_s, target_sp.total_len_mm, point_mm.x, point_mm.y
+            ))
+        } else {
+            Some(format!(
+                "Stepped {} along Path #{} ({:.1}/{:.1} mm) @ X: {:.2}, Y: {:.2} mm.",
+                dir_label, target_sp.path_index_1based, target_s, target_sp.total_len_mm, point_mm.x, point_mm.y
+            ))
+        }
     }
 
     /// Resume from a recorded pause checkpoint. If the head was jogged away while paused,
@@ -221,6 +445,7 @@ impl PanelState {
             self.run_mode = RunMode::Idle;
             self.is_paused = false;
             self.trajectory.clear();
+            self.full_trajectory.clear();
             self.current_seg_idx = 0;
             self.seg_progress_mm = 0.0;
             self.last_tick = None;
@@ -285,7 +510,11 @@ impl PanelState {
         self.last_tick = Some(now);
 
         let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
-        let speed_mult = if hw_connected { 1.0 } else { self.sim_speed_multiplier };
+        let speed_mult = if hw_connected || self.run_mode != RunMode::DryCut {
+            1.0
+        } else {
+            self.sim_speed_multiplier
+        };
 
         let mut remaining_dt = dt;
         while remaining_dt > 1e-9 && self.current_seg_idx < self.trajectory.len() {
@@ -515,15 +744,27 @@ pub fn render_right_panels(
                     }
                 });
 
-                if let JogMode::Step(_) = panel_state.jog_mode {
+                if let JogMode::Step(mut step_val) = panel_state.jog_mode {
                     let step_options = [0.1, 1.0, 10.0, 50.0, 100.0];
                     ui.horizontal_wrapped(|ui| {
                         for (i, &step) in step_options.iter().enumerate() {
-                            let selected = panel_state.step_index == i;
+                            let selected = (step_val - step).abs() < 1e-6;
                             if ui.selectable_label(selected, format!("{}mm", step)).clicked() {
                                 panel_state.step_index = i;
                                 panel_state.jog_mode = JogMode::Step(step);
+                                step_val = step;
                             }
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut step_val)
+                                    .range(0.01..=1000.0)
+                                    .speed(0.5)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            panel_state.jog_mode = JogMode::Step(step_val);
                         }
                     });
                 }
@@ -630,7 +871,9 @@ pub fn render_right_panels(
                 // Row 1: ▶ Start / 🔄 Restart  |  🧭 Dry-Cut
                 ui.horizontal(|ui| {
                     let is_cutting = panel_state.run_mode == RunMode::Cutting && !panel_state.is_paused;
-                    let start_fill = if is_cutting {
+                    let start_fill = if !is_connected {
+                        Color32::from_rgb(48, 50, 62)
+                    } else if is_cutting {
                         Color32::from_rgb(35, 160, 75)
                     } else {
                         Color32::from_rgb(26, 110, 52)
@@ -639,12 +882,14 @@ pub fn render_right_panels(
                     let start_btn = Button::new(RichText::new(start_label).size(13.0).color(Color32::WHITE).strong())
                         .fill(start_fill);
                     if ui
-                        .add_sized([run_btn_w, 32.0], start_btn)
+                        .add_enabled_ui(is_connected, |ui| ui.add_sized([run_btn_w, 32.0], start_btn))
+                        .inner
                         .on_hover_text(if has_pause {
                             "Restart cutting job from the beginning (discards pause checkpoint)"
                         } else {
                             "Start cutting job along sorted toolpath sequence"
                         })
+                        .on_disabled_hover_text("Controller not connected (Start disabled offline)")
                         .clicked()
                     {
                         *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
@@ -720,6 +965,56 @@ pub fn render_right_panels(
                     }
                 });
 
+                ui.add_space(4.0);
+
+                // Row 3: ⏮ Backward  |  ⏭ Forward (active only while paused)
+                ui.horizontal(|ui| {
+                    let can_step = panel_state.is_paused && has_pause;
+                    let step_fill = if can_step {
+                        Color32::from_rgb(65, 95, 155)
+                    } else {
+                        Color32::from_rgb(48, 50, 62)
+                    };
+
+                    let back_btn = Button::new(RichText::new("⏮ Backward").size(12.5).color(Color32::WHITE).strong())
+                        .fill(step_fill);
+                    if ui
+                        .add_enabled_ui(can_step, |ui| ui.add_sized([run_btn_w, 30.0], back_btn))
+                        .inner
+                        .on_hover_text(format!(
+                            "Step backward {:.2} mm along active profile (or jump to previous profile endpoint)",
+                            step_dist
+                        ))
+                        .on_disabled_hover_text("Pause job first to step backward along path")
+                        .clicked()
+                    {
+                        if let Some(msg) =
+                            panel_state.step_along_path(false, step_dist, controller, status, pulses_cfg)
+                        {
+                            *status_message = msg;
+                        }
+                    }
+
+                    let fwd_btn = Button::new(RichText::new("⏭ Forward").size(12.5).color(Color32::WHITE).strong())
+                        .fill(step_fill);
+                    if ui
+                        .add_enabled_ui(can_step, |ui| ui.add_sized([run_btn_w, 30.0], fwd_btn))
+                        .inner
+                        .on_hover_text(format!(
+                            "Step forward {:.2} mm along active profile (or jump to next profile start)",
+                            step_dist
+                        ))
+                        .on_disabled_hover_text("Pause job first to step forward along path")
+                        .clicked()
+                    {
+                        if let Some(msg) =
+                            panel_state.step_along_path(true, step_dist, controller, status, pulses_cfg)
+                        {
+                            *status_message = msg;
+                        }
+                    }
+                });
+
                 // Pause Buffer Card (visible when a paused checkpoint is active)
                 if let Some(cp) = panel_state.paused_checkpoint {
                     ui.add_space(4.0);
@@ -790,19 +1085,19 @@ pub fn render_right_panels(
                     } else {
                         "Cutting"
                     };
-                    let bar_text = if is_connected {
-                        format!("{}: Path {}/{} ({:.0}%)", mode_tag, cur_path, total_paths, progress * 100.0)
-                    } else {
+                    let bar_text = if !is_connected && panel_state.run_mode == RunMode::DryCut {
                         format!(
                             "{}: Path {}/{} ({:.0}%) [{}x]",
                             mode_tag, cur_path, total_paths, progress * 100.0, panel_state.sim_speed_multiplier
                         )
+                    } else {
+                        format!("{}: Path {}/{} ({:.0}%)", mode_tag, cur_path, total_paths, progress * 100.0)
                     };
                     ui.add(ProgressBar::new(progress).text(bar_text));
                 }
 
-                // Fast-forward speed multiplier when purely simulating (controller offline)
-                if !is_connected {
+                // Fast-forward speed multiplier strictly for offline Dry-Cut simulation
+                if !is_connected && panel_state.run_mode != RunMode::Cutting {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Fast-Forward:").size(11.5).color(Color32::from_rgb(170, 200, 220)).strong());
@@ -954,5 +1249,142 @@ mod tests {
         assert_eq!(state.run_mode, RunMode::Idle);
         assert!(state.paused_checkpoint.is_none());
         assert!(state.pause_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_step_backward_and_forward_along_path_and_across_profiles() {
+        let pulses = PulseConfig::default();
+        let mut status = MachineStatus::default();
+        let mut state = PanelState::default();
+
+        let rapid_1_to_2 = kurbo::Point::new(40.0, 20.0).distance(kurbo::Point::new(100.0, 10.0));
+        let full = vec![
+            MotionSegment {
+                start: kurbo::Point::new(0.0, 0.0),
+                end: kurbo::Point::new(10.0, 0.0),
+                length_mm: 10.0,
+                speed_mm_s: 200.0,
+                is_rapid: true,
+                path_index_1based: 1,
+            },
+            // Profile 1: 30mm horizontal + 20mm vertical = 50mm total
+            MotionSegment {
+                start: kurbo::Point::new(10.0, 0.0),
+                end: kurbo::Point::new(40.0, 0.0),
+                length_mm: 30.0,
+                speed_mm_s: 50.0,
+                is_rapid: false,
+                path_index_1based: 1,
+            },
+            MotionSegment {
+                start: kurbo::Point::new(40.0, 0.0),
+                end: kurbo::Point::new(40.0, 20.0),
+                length_mm: 20.0,
+                speed_mm_s: 50.0,
+                is_rapid: false,
+                path_index_1based: 1,
+            },
+            MotionSegment {
+                start: kurbo::Point::new(40.0, 20.0),
+                end: kurbo::Point::new(100.0, 10.0),
+                length_mm: rapid_1_to_2,
+                speed_mm_s: 200.0,
+                is_rapid: true,
+                path_index_1based: 2,
+            },
+            // Profile 2: 40mm horizontal
+            MotionSegment {
+                start: kurbo::Point::new(100.0, 10.0),
+                end: kurbo::Point::new(140.0, 10.0),
+                length_mm: 40.0,
+                speed_mm_s: 50.0,
+                is_rapid: false,
+                path_index_1based: 2,
+            },
+        ];
+
+        state.trajectory = full.clone();
+        state.full_trajectory = full;
+        state.run_mode = RunMode::DryCut;
+        state.current_seg_idx = 1;
+        state.seg_progress_mm = 25.0; // At (35, 0), s = 25/50 along Profile 1
+        state.traveled_length_mm = 35.0;
+        state.total_length_mm = state.full_trajectory.iter().map(|s| s.length_mm).sum();
+
+        // Stepping must be disabled when not paused
+        assert!(state.step_along_path(true, 10.0, &None, &mut status, &pulses).is_none());
+
+        // Pause at (35, 0)
+        assert!(state.pause_run(&None, &mut status, &pulses).is_some());
+        let cp0 = state.paused_checkpoint.unwrap();
+        assert!((cp0.point_mm.x - 35.0).abs() < 1e-6 && cp0.point_mm.y.abs() < 1e-6);
+
+        // 1. Forward 15mm: crosses corner from (35, 0) -> (40, 0) -> (40, 10), s = 40/50
+        assert!(state.step_along_path(true, 15.0, &None, &mut status, &pulses).is_some());
+        let cp1 = state.paused_checkpoint.unwrap();
+        assert_eq!(cp1.path_index_1based, 1);
+        assert!((cp1.point_mm.x - 40.0).abs() < 1e-6 && (cp1.point_mm.y - 10.0).abs() < 1e-6);
+
+        // 2. Forward 25mm when only 10mm remain on Profile 1 -> clamps to endpoint (40, 20)
+        assert!(state.step_along_path(true, 25.0, &None, &mut status, &pulses).is_some());
+        let cp2 = state.paused_checkpoint.unwrap();
+        assert_eq!(cp2.path_index_1based, 1);
+        assert!((cp2.point_mm.x - 40.0).abs() < 1e-6 && (cp2.point_mm.y - 20.0).abs() < 1e-6);
+
+        // 3. Forward 15mm from endpoint (40, 20) -> travels to Profile 2 start (100, 10) + 15mm = (115, 10)
+        assert!(state.step_along_path(true, 15.0, &None, &mut status, &pulses).is_some());
+        let cp3 = state.paused_checkpoint.unwrap();
+        assert_eq!(cp3.path_index_1based, 2);
+        assert!((cp3.point_mm.x - 115.0).abs() < 1e-6 && (cp3.point_mm.y - 10.0).abs() < 1e-6);
+        assert!((pulses.pulses_to_mm_x(status.pos_x) - 115.0).abs() < 0.05);
+
+        // 4. Backward 25mm when only 15mm from start of Profile 2 -> clamps to start (100, 10)
+        assert!(state.step_along_path(false, 25.0, &None, &mut status, &pulses).is_some());
+        let cp4 = state.paused_checkpoint.unwrap();
+        assert_eq!(cp4.path_index_1based, 2);
+        assert!((cp4.point_mm.x - 100.0).abs() < 1e-6 && (cp4.point_mm.y - 10.0).abs() < 1e-6);
+
+        // 5. Backward 12mm from start (100, 10) -> travels to Profile 1 endpoint (40, 20) - 12mm = (40, 8)
+        assert!(state.step_along_path(false, 12.0, &None, &mut status, &pulses).is_some());
+        let cp5 = state.paused_checkpoint.unwrap();
+        assert_eq!(cp5.path_index_1based, 1);
+        assert!((cp5.point_mm.x - 40.0).abs() < 1e-6 && (cp5.point_mm.y - 8.0).abs() < 1e-6);
+
+        // 6. Continue from stepped point cleanly picks up remaining Profile 1 (12mm) + rapid + Profile 2
+        assert!(state.continue_run(cp5.point_mm, &None).is_some());
+        assert!(!state.is_paused);
+        assert_eq!(state.trajectory.len(), 3);
+        assert!((state.trajectory[0].length_mm - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fast_forward_only_applies_to_dry_cut() {
+        let pulses = PulseConfig::default();
+        let mut status = MachineStatus::default();
+        let mut state = PanelState::default();
+        state.sim_speed_multiplier = 8.0;
+        state.trajectory = vec![MotionSegment {
+            start: kurbo::Point::new(0.0, 0.0),
+            end: kurbo::Point::new(500.0, 0.0),
+            length_mm: 500.0,
+            speed_mm_s: 10.0,
+            is_rapid: false,
+            path_index_1based: 1,
+        }];
+        state.total_length_mm = 500.0;
+        state.run_mode = RunMode::Cutting;
+        state.last_tick = Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
+
+        // Cutting mode ignores sim_speed_multiplier (runs at 1x -> at most 0.1s * 10mm/s = 1.0mm)
+        state.tick_simulation(&None, &mut status, &pulses);
+        assert!(state.traveled_length_mm <= 1.05);
+
+        // DryCut mode offline uses 8x multiplier (0.1s * 10mm/s * 8 = ~8.0mm)
+        state.traveled_length_mm = 0.0;
+        state.seg_progress_mm = 0.0;
+        state.run_mode = RunMode::DryCut;
+        state.last_tick = Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
+        state.tick_simulation(&None, &mut status, &pulses);
+        assert!(state.traveled_length_mm >= 5.0);
     }
 }
