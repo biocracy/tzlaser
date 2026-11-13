@@ -14,6 +14,15 @@ pub enum RibbonTab {
     Laser,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSortAction {
+    SaveOverwriteOrder,
+    ChangeSortMode(SortMode),
+    ApplySort(SortMode),
+    EnterManualSort,
+    RestoreSavedOrder,
+}
+
 pub struct RibbonState {
     pub active_tab: RibbonTab,
     pub lead_config: LeadConfig,
@@ -22,6 +31,7 @@ pub struct RibbonState {
     pub follower_enabled: bool,
     pub red_pointer_enabled: bool,
     pub gas_open: bool,
+    pub pending_sort_action: Option<PendingSortAction>,
 }
 
 impl Default for RibbonState {
@@ -34,6 +44,7 @@ impl Default for RibbonState {
             follower_enabled: false,
             red_pointer_enabled: false,
             gas_open: false,
+            pending_sort_action: None,
         }
     }
 }
@@ -155,6 +166,132 @@ pub fn render_ribbon(
                 RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
                 RibbonTab::Laser => render_laser_tab(ui, state, controller, status, status_message),
             }
+        });
+
+    render_sort_overwrite_modal(ui.ctx(), state, doc, selection, history, canvas_state, status_message);
+}
+
+fn execute_sort_action(
+    action: PendingSortAction,
+    doc: &mut Document,
+    selection: &mut Vec<(usize, usize)>,
+    history: &mut HistoryManager,
+    canvas_state: &mut crate::canvas::CanvasState,
+    status_message: &mut String,
+) {
+    match action {
+        PendingSortAction::SaveOverwriteOrder => {
+            let label = if doc.has_saved_cut_order() {
+                "Overwrite Saved Cut Order"
+            } else {
+                "Save Cut Order"
+            };
+            history.record(doc, selection, label);
+            doc.save_current_cut_order();
+            *status_message = format!("Saved cutting order ({} profiles).", doc.saved_cut_order.len());
+        }
+        PendingSortAction::ChangeSortMode(new_mode) => {
+            let had_custom = doc.use_saved_cut_order || !doc.manual_sequence.is_empty();
+            if had_custom {
+                history.record(doc, selection, format!("Sort Method ({})", new_mode.label()));
+                doc.use_saved_cut_order = false;
+                doc.manual_sequence.clear();
+            }
+            doc.sort_mode = new_mode;
+            if new_mode != SortMode::Manual {
+                canvas_state.manual_sort_active = false;
+            }
+            *status_message = format!("Sort method set to: {}", new_mode.label());
+        }
+        PendingSortAction::ApplySort(mode) => {
+            history.record(doc, selection, format!("Sort ({})", mode.label()));
+            doc.apply_sort_order(mode);
+            let seq = doc.compute_cut_sequence();
+            *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), mode.label());
+        }
+        PendingSortAction::EnterManualSort => {
+            if doc.use_saved_cut_order || !doc.manual_sequence.is_empty() {
+                history.record(doc, selection, "Enter Manual Sort");
+                doc.use_saved_cut_order = false;
+                doc.manual_sequence.clear();
+            }
+            canvas_state.manual_sort_active = true;
+            canvas_state.manual_sort_next_index = 1;
+            canvas_state.show_cut_order = true;
+            selection.clear();
+            *status_message = "Manual Sort active: click paths on canvas in desired cut order.".to_string();
+        }
+        PendingSortAction::RestoreSavedOrder => {
+            history.record(doc, selection, "Restore Saved Cut Order");
+            doc.restore_saved_cut_order();
+            canvas_state.manual_sort_active = false;
+            canvas_state.show_cut_order = true;
+            *status_message = format!("Restored saved cutting order ({} profiles).", doc.saved_cut_order.len());
+        }
+    }
+}
+
+fn render_sort_overwrite_modal(
+    ctx: &egui::Context,
+    state: &mut RibbonState,
+    doc: &mut Document,
+    selection: &mut Vec<(usize, usize)>,
+    history: &mut HistoryManager,
+    canvas_state: &mut crate::canvas::CanvasState,
+    status_message: &mut String,
+) {
+    let Some(pending) = state.pending_sort_action.clone() else {
+        return;
+    };
+
+    let prompt_body = match &pending {
+        PendingSortAction::SaveOverwriteOrder => {
+            "A saved profile cutting order already exists for this table layout.\n\nDo you want to overwrite the saved cutting order with the current sequence?".to_string()
+        }
+        PendingSortAction::ChangeSortMode(mode) => format!(
+            "Changing sort method to '{}' will overwrite the active custom cutting order.\n\nDo you want to continue?",
+            mode.label()
+        ),
+        PendingSortAction::ApplySort(mode) => format!(
+            "Applying '{}' will overwrite the existing custom/saved profile cutting order.\n\nDo you want to continue?",
+            mode.label()
+        ),
+        PendingSortAction::EnterManualSort => {
+            "Starting interactive Manual Sort will overwrite the current custom/saved profile cutting order.\n\nDo you want to continue?".to_string()
+        }
+        PendingSortAction::RestoreSavedOrder => {
+            "Restoring the saved cutting order will overwrite the current profile sorting on the table.\n\nDo you want to continue?".to_string()
+        }
+    };
+
+    egui::Window::new("⚠ Overwrite Profile Cutting Order?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(340.0);
+            ui.label(RichText::new(prompt_body).size(12.5));
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let confirm_btn = Button::new(RichText::new("✓ Overwrite").color(Color32::WHITE).strong())
+                    .fill(Color32::from_rgb(175, 55, 45))
+                    .min_size(Vec2::new(110.0, 26.0));
+                if ui.add(confirm_btn).clicked() {
+                    execute_sort_action(pending, doc, selection, history, canvas_state, status_message);
+                    state.pending_sort_action = None;
+                }
+
+                ui.add_space(8.0);
+
+                let cancel_btn = Button::new(RichText::new("✕ Cancel").size(12.0))
+                    .fill(Color32::from_rgb(48, 52, 62))
+                    .min_size(Vec2::new(90.0, 26.0));
+                if ui.add(cancel_btn).clicked() {
+                    state.pending_sort_action = None;
+                }
+            });
         });
 }
 
@@ -356,7 +493,7 @@ fn render_profiles_tab(
 
         ui.add_space(2.0);
 
-        // 3. Toolpath Sorting (Multiple Sorting Methods + Index Coloring + Interactive Manual Sort)
+        // 3. Toolpath Sorting (Multiple Sorting Methods + Index Coloring + Interactive Manual Sort + Save/Restore)
         ribbon_group(ui, "Toolpath Sorting", |ui| {
             ui.vertical(|ui| {
                 // Row 1: Sort Method + Index Coloring Toggle + Palette Selector
@@ -364,10 +501,11 @@ fn render_profiles_tab(
                     let mut current_mode = doc.sort_mode;
                     egui::ComboBox::from_id_salt("cut_sort_mode_combo")
                         .selected_text(RichText::new(current_mode.label()).size(11.0).strong().color(Color32::from_rgb(255, 220, 100)))
-                        .width(135.0)
+                        .width(145.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
                             ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
+                            ui.selectable_value(&mut current_mode, SortMode::MaxDistanceInterior, "❄ Max Dist Interior (Cool)");
                             ui.selectable_value(&mut current_mode, SortMode::ShortestPath, "🚀 Shortest Travel (TSP)");
                             ui.selectable_value(&mut current_mode, SortMode::LeftToRight, "➡️ Left to Right (X)");
                             ui.selectable_value(&mut current_mode, SortMode::TopToBottom, "⬇️ Top to Bottom (Y)");
@@ -375,11 +513,18 @@ fn render_profiles_tab(
                         });
 
                     if current_mode != doc.sort_mode {
-                        doc.sort_mode = current_mode;
-                        if current_mode != SortMode::Manual {
-                            canvas_state.manual_sort_active = false;
+                        if doc.use_saved_cut_order || !doc.manual_sequence.is_empty() {
+                            state.pending_sort_action = Some(PendingSortAction::ChangeSortMode(current_mode));
+                        } else {
+                            execute_sort_action(
+                                PendingSortAction::ChangeSortMode(current_mode),
+                                doc,
+                                selection,
+                                history,
+                                canvas_state,
+                                status_message,
+                            );
                         }
-                        *status_message = format!("Sort method set to: {}", current_mode.label());
                     }
 
                     // Index Coloring Toggle
@@ -388,7 +533,7 @@ fn render_profiles_tab(
                     } else {
                         ("🎨 Color: OFF", Color32::from_rgb(170, 175, 185), Color32::from_rgb(38, 42, 50))
                     };
-                    if ui.add(Button::new(RichText::new(col_text).size(11.0).color(col_fg).strong()).fill(col_bg).min_size(Vec2::new(82.0, 19.0)))
+                    if ui.add(Button::new(RichText::new(col_text).size(11.0).color(col_fg).strong()).fill(col_bg).min_size(Vec2::new(80.0, 19.0)))
                         .on_hover_text("Color toolpaths according to their cut index using the selected palette")
                         .clicked()
                     {
@@ -398,7 +543,7 @@ fn render_profiles_tab(
                     // Color Palette Selector
                     egui::ComboBox::from_id_salt("cut_color_palette_combo")
                         .selected_text(RichText::new(canvas_state.color_palette.label()).size(11.0))
-                        .width(100.0)
+                        .width(92.0)
                         .show_ui(ui, |ui| {
                             use crate::canvas::ColorPalette;
                             ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Rainbow, "🌈 Rainbow");
@@ -409,20 +554,20 @@ fn render_profiles_tab(
                         });
                 });
 
-                // Row 2: Sort Action / Interactive Manual Sort Controls
+                // Row 2: Sort Action / Interactive Manual Sort + Save/Restore Order
                 ui.horizontal(|ui| {
                     if doc.sort_mode == SortMode::Manual {
                         if canvas_state.manual_sort_active {
                             let exit_btn = Button::new(RichText::new("✓ Exit Manual Sort").size(11.0).color(Color32::from_rgb(100, 255, 150)).strong())
                                 .fill(Color32::from_rgb(25, 70, 42))
-                                .min_size(Vec2::new(115.0, 19.0));
+                                .min_size(Vec2::new(112.0, 19.0));
                             if ui.add(exit_btn).on_hover_text("Exit interactive manual sorting and return to normal selection").clicked() {
                                 canvas_state.manual_sort_active = false;
                                 *status_message = "Exited manual sort mode.".to_string();
                             }
 
                             ui.label(RichText::new("Next Index:").size(11.0).color(Color32::from_rgb(255, 220, 100)).strong());
-                            let total_paths = doc.entity_count().max(1);
+                            let total_paths = doc.compute_cut_sequence().len().max(1);
                             ui.add(
                                 egui::DragValue::new(&mut canvas_state.manual_sort_next_index)
                                     .range(1..=total_paths)
@@ -434,23 +579,70 @@ fn render_profiles_tab(
                                 .fill(Color32::from_rgb(45, 40, 22))
                                 .min_size(Vec2::new(60.0, 19.0));
                             if ui.add(sort_btn).on_hover_text("Enter interactive Manual Sort mode: click paths in order to assign cut indices").clicked() {
-                                canvas_state.manual_sort_active = true;
-                                canvas_state.manual_sort_next_index = 1;
-                                canvas_state.show_cut_order = true;
-                                selection.clear();
-                                *status_message = "Manual Sort active: click paths on canvas in desired cut order.".to_string();
+                                if doc.use_saved_cut_order || !doc.manual_sequence.is_empty() {
+                                    state.pending_sort_action = Some(PendingSortAction::EnterManualSort);
+                                } else {
+                                    execute_sort_action(
+                                        PendingSortAction::EnterManualSort,
+                                        doc,
+                                        selection,
+                                        history,
+                                        canvas_state,
+                                        status_message,
+                                    );
+                                }
                             }
-                            ui.label(RichText::new("Press Sort to pick order").size(10.0).weak());
                         }
                     } else {
                         let sort_btn = Button::new(RichText::new("⚡ Sort").size(11.0).color(Color32::from_rgb(255, 215, 0)).strong())
                             .fill(Color32::from_rgb(45, 40, 22))
                             .min_size(Vec2::new(60.0, 19.0));
                         if ui.add(sort_btn).on_hover_text(format!("Apply '{}' sequence to document toolpaths: {}", doc.sort_mode.label(), doc.sort_mode.description())).clicked() {
-                            history.record(doc, selection, format!("Sort ({})", doc.sort_mode.label()));
-                            doc.apply_sort_order(doc.sort_mode);
-                            let seq = doc.compute_cut_sequence();
-                            *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), doc.sort_mode.label());
+                            if doc.has_saved_cut_order() || !doc.manual_sequence.is_empty() {
+                                state.pending_sort_action = Some(PendingSortAction::ApplySort(doc.sort_mode));
+                            } else {
+                                execute_sort_action(
+                                    PendingSortAction::ApplySort(doc.sort_mode),
+                                    doc,
+                                    selection,
+                                    history,
+                                    canvas_state,
+                                    status_message,
+                                );
+                            }
+                        }
+                    }
+
+                    // Save / Restore Profile Cutting Order
+                    let save_order_btn = Button::new(RichText::new("💾 Save Order").size(11.0).color(Color32::from_rgb(130, 215, 255)).strong())
+                        .fill(Color32::from_rgb(28, 48, 68))
+                        .min_size(Vec2::new(86.0, 19.0));
+                    if ui.add(save_order_btn).on_hover_text("Save the current profile cutting order for this table layout").clicked() {
+                        if doc.has_saved_cut_order() {
+                            state.pending_sort_action = Some(PendingSortAction::SaveOverwriteOrder);
+                        } else {
+                            execute_sort_action(
+                                PendingSortAction::SaveOverwriteOrder,
+                                doc,
+                                selection,
+                                history,
+                                canvas_state,
+                                status_message,
+                            );
+                        }
+                    }
+
+                    if doc.has_saved_cut_order() {
+                        if doc.use_saved_cut_order {
+                            ui.label(RichText::new("🔒 Saved").size(11.0).color(Color32::from_rgb(100, 235, 150)).strong())
+                                .on_hover_text("Saved cutting order is currently active and locked");
+                        } else {
+                            let restore_btn = Button::new(RichText::new("📂 Restore").size(11.0).color(Color32::from_rgb(180, 235, 180)))
+                                .fill(Color32::from_rgb(30, 58, 42))
+                                .min_size(Vec2::new(68.0, 19.0));
+                            if ui.add(restore_btn).on_hover_text("Restore previously saved cutting order for this table layout").clicked() {
+                                state.pending_sort_action = Some(PendingSortAction::RestoreSavedOrder);
+                            }
                         }
                     }
                 });

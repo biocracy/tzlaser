@@ -375,6 +375,8 @@ pub enum SortMode {
     OpenFirst,
     /// 1. Interior holes -> 2. Outer contours -> 3. Open lines (Greedy TSP within each group)
     InnerFirst,
+    /// 1. Open/Bend lines -> 2. Interior holes maximizing distance between cuts (heat dissipation) -> 3. Outer contours
+    MaxDistanceInterior,
     /// Pure shortest rapid travel distance (Greedy TSP across all paths)
     ShortestPath,
     /// Spatial sort from Left to Right (X ascending)
@@ -396,6 +398,7 @@ impl SortMode {
         match self {
             SortMode::OpenFirst => "Open / Bend First",
             SortMode::InnerFirst => "Inner Holes First",
+            SortMode::MaxDistanceInterior => "Max Dist Interior (Cool)",
             SortMode::ShortestPath => "Shortest Travel (TSP)",
             SortMode::LeftToRight => "Left to Right (X)",
             SortMode::TopToBottom => "Top to Bottom (Y)",
@@ -407,6 +410,7 @@ impl SortMode {
         match self {
             SortMode::OpenFirst => "Cut open/bend lines first, then interior cutouts, outer contours last",
             SortMode::InnerFirst => "Cut interior holes first to prevent part movement, then outer contours",
+            SortMode::MaxDistanceInterior => "Maximize distance between consecutive interior cuts to prevent overheating and allow travel cooling",
             SortMode::ShortestPath => "Minimize rapid transit travel distance between pierces",
             SortMode::LeftToRight => "Sort cut paths from left to right across table",
             SortMode::TopToBottom => "Sort cut paths from top to bottom across table",
@@ -460,6 +464,10 @@ pub struct Document {
     pub pasted_origins: HashMap<(usize, usize), PastedOrigin>,
     #[serde(default)]
     pub next_instance_id: usize,
+    #[serde(default)]
+    pub saved_cut_order: Vec<(usize, usize, Option<usize>)>,
+    #[serde(default)]
+    pub use_saved_cut_order: bool,
 }
 
 impl Default for Document {
@@ -479,6 +487,8 @@ impl Document {
             manual_sequence: Vec::new(),
             pasted_origins: HashMap::new(),
             next_instance_id: 0,
+            saved_cut_order: Vec::new(),
+            use_saved_cut_order: false,
         }
     }
 
@@ -626,6 +636,34 @@ impl Document {
                     if !self.manual_sequence.is_empty() {
                         self.manual_sequence.push((l_idx, new_idx));
                     }
+                    if self.use_saved_cut_order && !self.saved_cut_order.is_empty() {
+                        match &self.layers[l_idx].entities[new_idx] {
+                            Entity::Group { children } => {
+                                let mut added = vec![false; children.len()];
+                                let parent_children: Vec<usize> = self
+                                    .saved_cut_order
+                                    .iter()
+                                    .filter_map(|&(pl, pe, pc)| {
+                                        if pl == l_idx && pe == e_idx { pc } else { None }
+                                    })
+                                    .collect();
+                                for c_idx in parent_children {
+                                    if c_idx < children.len() && !added[c_idx] {
+                                        self.saved_cut_order.push((l_idx, new_idx, Some(c_idx)));
+                                        added[c_idx] = true;
+                                    }
+                                }
+                                for (c_idx, &was_added) in added.iter().enumerate() {
+                                    if !was_added {
+                                        self.saved_cut_order.push((l_idx, new_idx, Some(c_idx)));
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.saved_cut_order.push((l_idx, new_idx, None));
+                            }
+                        }
+                    }
                     new_selection.push((l_idx, new_idx));
                 }
             }
@@ -664,6 +702,8 @@ impl Document {
     pub fn delete_selection(&mut self, selection: &[(usize, usize)]) {
         self.manual_sequence.clear();
         self.pasted_origins.clear();
+        self.saved_cut_order.clear();
+        self.use_saved_cut_order = false;
         let mut to_remove: HashMap<usize, Vec<usize>> = HashMap::new();
         for &(l, e) in selection {
             to_remove.entry(l).or_default().push(e);
@@ -771,6 +811,8 @@ impl Document {
 
         self.pasted_origins.clear();
         self.manual_sequence.clear();
+        self.saved_cut_order.clear();
+        self.use_saved_cut_order = false;
 
         let new_group = Entity::Group { children: grouped_children };
         let new_idx = self.layers[target_layer_idx].entities.len();
@@ -783,6 +825,8 @@ impl Document {
     /// Ungroup any selected Group entities back into individual entities.
     pub fn ungroup_selection(&mut self, selection: &mut Vec<(usize, usize)>) {
         self.pasted_origins.clear();
+        self.saved_cut_order.clear();
+        self.use_saved_cut_order = false;
         let mut new_selection = Vec::new();
 
         let mut to_unpack: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -833,6 +877,8 @@ impl Document {
     pub fn auto_classify_profiles(&mut self) {
         self.manual_sequence.clear();
         self.pasted_origins.clear();
+        self.saved_cut_order.clear();
+        self.use_saved_cut_order = false;
         let mut all_entities = Vec::new();
         for layer in self.layers.drain(..) {
             all_entities.extend(layer.entities);
@@ -911,13 +957,61 @@ impl Document {
         self.layers = new_layers;
     }
 
-    /// Computes the toolpath cutting sequence using the document's currently selected SortMode.
+    /// Returns true if the document has a saved profile cutting order.
+    pub fn has_saved_cut_order(&self) -> bool {
+        !self.saved_cut_order.is_empty()
+    }
+
+    /// Saves the current cutting order of profiles and activates it.
+    pub fn save_current_cut_order(&mut self) {
+        let seq = self.compute_cut_sequence();
+        self.saved_cut_order = seq
+            .into_iter()
+            .map(|i| (i.layer_idx, i.entity_idx, i.child_idx))
+            .collect();
+        self.use_saved_cut_order = !self.saved_cut_order.is_empty();
+    }
+
+    /// Restores the previously saved profile cutting order as active.
+    pub fn restore_saved_cut_order(&mut self) {
+        if !self.saved_cut_order.is_empty() {
+            self.use_saved_cut_order = true;
+        }
+    }
+
+    /// Computes the toolpath cutting sequence using the active saved order (if enabled)
+    /// or the document's currently selected SortMode.
     pub fn compute_cut_sequence(&self) -> Vec<CutPathInfo> {
-        self.compute_cut_sequence_with_mode(self.sort_mode)
+        let mut paths = self.compute_cut_sequence_with_mode(self.sort_mode);
+        if self.use_saved_cut_order && !self.saved_cut_order.is_empty() {
+            let mut pos_by_key: HashMap<(usize, usize, Option<usize>), usize> =
+                HashMap::with_capacity(paths.len());
+            for (idx, item) in paths.iter().enumerate() {
+                pos_by_key.insert((item.layer_idx, item.entity_idx, item.child_idx), idx);
+            }
+
+            let mut result = Vec::with_capacity(paths.len());
+            let mut used = vec![false; paths.len()];
+            for &key in &self.saved_cut_order {
+                if let Some(&pos) = pos_by_key.get(&key) {
+                    if !used[pos] {
+                        result.push(paths[pos]);
+                        used[pos] = true;
+                    }
+                }
+            }
+            for (i, item) in paths.drain(..).enumerate() {
+                if !used[i] {
+                    result.push(item);
+                }
+            }
+            return result;
+        }
+        paths
     }
 
     /// Computes the toolpath cutting sequence under a specific SortMode.
-    /// Supports: OpenFirst, InnerFirst, ShortestPath (TSP), LeftToRight, TopToBottom, and Manual order.
+    /// Supports: OpenFirst, InnerFirst, MaxDistanceInterior, ShortestPath (TSP), LeftToRight, TopToBottom, and Manual order.
     pub fn compute_cut_sequence_with_mode(&self, mode: SortMode) -> Vec<CutPathInfo> {
         let mut raw_paths = Vec::new();
 
@@ -1106,6 +1200,26 @@ impl Document {
                 interior.extend(open);
                 interior
             }
+            SortMode::MaxDistanceInterior => {
+                let mut open = Vec::new();
+                let mut interior = Vec::new();
+                let mut outer = Vec::new();
+                for item in children {
+                    if item.is_open {
+                        open.push(item);
+                    } else if item.is_interior {
+                        interior.push(item);
+                    } else {
+                        outer.push(item);
+                    }
+                }
+                let mut current_pos = open.last().map(|p| p.end_point).unwrap_or(Point::ORIGIN);
+                let mut ordered_interior = Vec::with_capacity(interior.len());
+                Self::sequence_group_farthest_neighbor(&mut interior, &mut current_pos, &mut ordered_interior);
+                open.extend(ordered_interior);
+                open.extend(outer);
+                open
+            }
             _ => children,
         }
     }
@@ -1121,7 +1235,7 @@ impl Document {
                 raw_paths.sort_by(|a, b| b.start_point.y.partial_cmp(&a.start_point.y).unwrap_or(std::cmp::Ordering::Equal));
                 raw_paths
             }
-            SortMode::ShortestPath | SortMode::OpenFirst | SortMode::InnerFirst => {
+            SortMode::ShortestPath | SortMode::OpenFirst | SortMode::InnerFirst | SortMode::MaxDistanceInterior => {
                 let total_len = raw_paths.len();
                 let mut standalone = Vec::new();
                 let mut groups: std::collections::BTreeMap<(usize, usize), Vec<CutPathInfo>> =
@@ -1176,6 +1290,11 @@ impl Document {
                         Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
                         Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
                     }
+                    SortMode::MaxDistanceInterior => {
+                        Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
+                        Self::sequence_group_farthest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
+                        Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
+                    }
                     _ => unreachable!(),
                 }
 
@@ -1215,10 +1334,12 @@ impl Document {
     /// Reorders the entities within layers to permanently match the computed sort sequence.
     pub fn apply_sort_order(&mut self, mode: SortMode) {
         self.sort_mode = mode;
+        self.use_saved_cut_order = false;
         let seq = self.compute_cut_sequence_with_mode(mode);
         self.manual_sequence.clear();
 
         let mut old_to_new: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut old_child_to_new: HashMap<(usize, usize, usize), usize> = HashMap::new();
 
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             let mut ordered_entities = Vec::with_capacity(layer.entities.len());
@@ -1227,7 +1348,34 @@ impl Document {
             for info in &seq {
                 if info.layer_idx == l_idx && info.entity_idx < layer.entities.len() && !used[info.entity_idx] {
                     let new_idx = ordered_entities.len();
-                    ordered_entities.push(layer.entities[info.entity_idx].clone());
+                    let ent = match &layer.entities[info.entity_idx] {
+                        Entity::Group { children } => {
+                            let mut reordered = Vec::with_capacity(children.len());
+                            let mut c_used = vec![false; children.len()];
+                            for s in &seq {
+                                if s.layer_idx == l_idx && s.entity_idx == info.entity_idx {
+                                    if let Some(old_c) = s.child_idx {
+                                        if old_c < children.len() && !c_used[old_c] {
+                                            let new_c = reordered.len();
+                                            reordered.push(children[old_c].clone());
+                                            c_used[old_c] = true;
+                                            old_child_to_new.insert((l_idx, info.entity_idx, old_c), new_c);
+                                        }
+                                    }
+                                }
+                            }
+                            for (old_c, child) in children.iter().enumerate() {
+                                if !c_used[old_c] {
+                                    let new_c = reordered.len();
+                                    reordered.push(child.clone());
+                                    old_child_to_new.insert((l_idx, info.entity_idx, old_c), new_c);
+                                }
+                            }
+                            Entity::Group { children: reordered }
+                        }
+                        other => other.clone(),
+                    };
+                    ordered_entities.push(ent);
                     used[info.entity_idx] = true;
                     old_to_new.insert((l_idx, info.entity_idx), new_idx);
                 }
@@ -1257,11 +1405,23 @@ impl Document {
             }
             self.pasted_origins = remapped;
         }
+
+        if !self.saved_cut_order.is_empty() {
+            for (l_idx, e_idx, child_idx) in &mut self.saved_cut_order {
+                let old_e = *e_idx;
+                let new_e = old_to_new.get(&(*l_idx, old_e)).copied().unwrap_or(old_e);
+                if let Some(old_c) = child_idx {
+                    *old_c = old_child_to_new.get(&(*l_idx, old_e, *old_c)).copied().unwrap_or(*old_c);
+                }
+                *e_idx = new_e;
+            }
+        }
     }
 
     /// Assigns a specific 1-based cut order index to `(layer_idx, entity_idx)` in manual sort mode.
     pub fn assign_manual_cut_index(&mut self, layer_idx: usize, entity_idx: usize, target_1based: usize) {
         self.sort_mode = SortMode::Manual;
+        self.use_saved_cut_order = false;
         if self.manual_sequence.is_empty() {
             let current = self.compute_cut_sequence_with_mode(SortMode::Manual);
             for info in current {
@@ -1327,6 +1487,29 @@ impl Document {
             }
 
             let next_cut = group.swap_remove(best_idx);
+            *current_pos = next_cut.end_point;
+            result.push(next_cut);
+        }
+    }
+
+    fn sequence_group_farthest_neighbor(
+        group: &mut Vec<CutPathInfo>,
+        current_pos: &mut Point,
+        result: &mut Vec<CutPathInfo>,
+    ) {
+        while !group.is_empty() {
+            let mut best_idx = 0;
+            let mut best_dist = -1.0_f64;
+
+            for (i, item) in group.iter().enumerate() {
+                let d = (item.start_point.x - current_pos.x).hypot(item.start_point.y - current_pos.y);
+                if d > best_dist {
+                    best_dist = d;
+                    best_idx = i;
+                }
+            }
+
+            let next_cut = group.remove(best_idx);
             *current_pos = next_cut.end_point;
             result.push(next_cut);
         }
@@ -1767,5 +1950,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_max_distance_interior_sorting() {
+        let mut doc = Document::default();
+        let mut outer = Layer::new("Outer Profiles", Color::GREEN);
+        outer.entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(200.0, 0.0),
+                Point::new(200.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+
+        let mut inner = Layer::new("Interior Profiles", Color::YELLOW);
+        for x in [10.0, 20.0, 30.0, 180.0] {
+            inner.entities.push(Entity::Circle {
+                center: Point::new(x, 50.0),
+                radius: 2.0,
+            });
+        }
+        doc.layers = vec![outer, inner];
+
+        let max_seq = doc.compute_cut_sequence_with_mode(SortMode::MaxDistanceInterior);
+        assert_eq!(max_seq.len(), 5);
+        // All 4 interior holes first, maximizing travel distance between consecutive holes:
+        // from (0,0) -> 180 -> 10 -> 30 -> 20, then outer contour last
+        assert!(max_seq[0..4].iter().all(|p| p.is_interior));
+        assert!(!max_seq[4].is_interior);
+
+        let xs_max: Vec<f64> = max_seq[0..4].iter().map(|p| p.start_point.x - 2.0).collect();
+        assert_eq!(xs_max, vec![180.0, 10.0, 30.0, 20.0]);
+
+        let inner_seq = doc.compute_cut_sequence_with_mode(SortMode::InnerFirst);
+        let travel_dist = |seq: &[CutPathInfo]| -> f64 {
+            seq.windows(2)
+                .map(|w| (w[1].start_point.x - w[0].end_point.x).hypot(w[1].start_point.y - w[0].end_point.y))
+                .sum()
+        };
+        assert!(travel_dist(&max_seq[0..4]) > travel_dist(&inner_seq[0..4]));
+    }
+
+    #[test]
+    fn test_save_and_restore_cut_order() {
+        let mut doc = Document::default();
+        let mut layer = Layer::new("All", Color::GREEN);
+        layer.entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(200.0, 0.0),
+                Point::new(200.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        layer.entities.push(Entity::Circle {
+            center: Point::new(20.0, 50.0),
+            radius: 5.0,
+        });
+        layer.entities.push(Entity::Circle {
+            center: Point::new(150.0, 50.0),
+            radius: 5.0,
+        });
+        doc.layers = vec![layer];
+
+        assert!(!doc.has_saved_cut_order());
+        doc.assign_manual_cut_index(0, 2, 1);
+        doc.assign_manual_cut_index(0, 1, 2);
+        doc.assign_manual_cut_index(0, 0, 3);
+        doc.save_current_cut_order();
+        assert!(doc.has_saved_cut_order());
+        assert!(doc.use_saved_cut_order);
+
+        let saved_order_keys: Vec<(usize, usize, Option<usize>)> = doc
+            .compute_cut_sequence()
+            .iter()
+            .map(|p| (p.layer_idx, p.entity_idx, p.child_idx))
+            .collect();
+        assert_eq!(saved_order_keys, vec![(0, 2, None), (0, 1, None), (0, 0, None)]);
+
+        // Changing sort_mode while use_saved_cut_order is true preserves the active saved order
+        doc.sort_mode = SortMode::LeftToRight;
+        let still_saved: Vec<(usize, usize, Option<usize>)> = doc
+            .compute_cut_sequence()
+            .iter()
+            .map(|p| (p.layer_idx, p.entity_idx, p.child_idx))
+            .collect();
+        assert_eq!(still_saved, saved_order_keys);
+
+        // Applying LeftToRight disables use_saved_cut_order, but remaps saved_cut_order
+        doc.apply_sort_order(SortMode::LeftToRight);
+        assert!(!doc.use_saved_cut_order);
+        assert!(doc.has_saved_cut_order());
+
+        // After LeftToRight: entity 0 is Polyline (x=0), entity 1 is Circle(20), entity 2 is Circle(150)
+        // Restoring saved order puts Circle(150) -> Circle(20) -> Polyline back in exact saved sequence!
+        doc.restore_saved_cut_order();
+        assert!(doc.use_saved_cut_order);
+        let restored_starts: Vec<f64> = doc.compute_cut_sequence().iter().map(|p| p.start_point.x).collect();
+        assert_eq!(restored_starts, vec![155.0, 25.0, 0.0]);
     }
 }
