@@ -228,7 +228,6 @@ fn render_entity(
     base_stroke: Stroke,
     sel_glow_stroke: Stroke,
     sel_core_stroke: Stroke,
-    sel_fill_tint: Color32,
     state: &CanvasState,
     origin_screen: Pos2,
 ) {
@@ -243,7 +242,6 @@ fn render_entity(
                     base_stroke,
                     sel_glow_stroke,
                     sel_core_stroke,
-                    sel_fill_tint,
                     state,
                     origin_screen,
                 );
@@ -276,14 +274,6 @@ fn render_entity(
                     .iter()
                     .map(|p| state.world_to_screen(*p, origin_screen))
                     .collect();
-
-                if is_selected && *closed && screen_pts.len() >= 3 {
-                    painter.add(egui::Shape::convex_polygon(
-                        screen_pts.clone(),
-                        sel_fill_tint,
-                        Stroke::NONE,
-                    ));
-                }
 
                 for pass in if is_selected { 0..2 } else { 0..1 } {
                     let stroke = if is_selected {
@@ -323,7 +313,6 @@ fn render_entity(
             let sc = state.world_to_screen(*center, origin_screen);
             let sr = (*radius as f32) * state.zoom;
             if is_selected {
-                painter.circle_filled(sc, sr, sel_fill_tint);
                 painter.circle_stroke(sc, sr, sel_glow_stroke);
                 painter.circle_stroke(sc, sr, sel_core_stroke);
             } else {
@@ -638,7 +627,6 @@ pub fn render_canvas(
         // Selection highlight styles: electric bright gold-yellow with prominent glow
         let sel_glow_stroke = Stroke::new(6.0, Color32::from_rgba_unmultiplied(255, 230, 0, 90));
         let sel_core_stroke = Stroke::new(2.8, Color32::from_rgb(255, 235, 10));
-        let sel_fill_tint = Color32::from_rgba_unmultiplied(255, 230, 0, 35);
 
         let layer_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
         for (e_idx, entity) in layer.entities.iter().enumerate() {
@@ -659,7 +647,6 @@ pub fn render_canvas(
                 base_stroke,
                 sel_glow_stroke,
                 sel_core_stroke,
-                sel_fill_tint,
                 state,
                 origin_screen,
             );
