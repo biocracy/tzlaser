@@ -15,6 +15,17 @@ pub enum RunMode {
     Cutting,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PauseCheckpoint {
+    pub point_mm: kurbo::Point,
+    pub seg_idx: usize,
+    #[allow(dead_code)]
+    pub seg_progress_mm: f64,
+    pub traveled_length_mm: f64,
+    pub path_index_1based: usize,
+    pub mode: RunMode,
+}
+
 pub struct PanelState {
     pub jog_mode: JogMode,
     pub step_index: usize,
@@ -29,6 +40,8 @@ pub struct PanelState {
     pub traveled_length_mm: f64,
     pub last_tick: Option<std::time::Instant>,
     pub last_hw_dispatched_seg: Option<usize>,
+    pub paused_checkpoint: Option<PauseCheckpoint>,
+    pub pause_buffer: Vec<PauseCheckpoint>,
 }
 
 impl Default for PanelState {
@@ -47,6 +60,8 @@ impl Default for PanelState {
             traveled_length_mm: 0.0,
             last_tick: None,
             last_hw_dispatched_seg: None,
+            paused_checkpoint: None,
+            pause_buffer: Vec::new(),
         }
     }
 }
@@ -72,6 +87,8 @@ impl PanelState {
         self.run_mode = mode;
         self.last_tick = Some(std::time::Instant::now());
         self.last_hw_dispatched_seg = None;
+        self.paused_checkpoint = None;
+        self.pause_buffer.clear();
 
         if mode == RunMode::DryCut {
             if let Some(ref c) = controller {
@@ -91,6 +108,8 @@ impl PanelState {
         self.is_paused = false;
         self.last_tick = None;
         self.last_hw_dispatched_seg = None;
+        self.paused_checkpoint = None;
+        self.pause_buffer.clear();
         status.laser_on = false;
         if was_dry {
             status.red_pointer_on = false;
@@ -102,6 +121,149 @@ impl PanelState {
                 }
                 c.stop();
             }
+        }
+    }
+
+    /// Pause the active run/simulation, turn the laser off, stop controller motion,
+    /// and record the exact head position and segment state in the pause buffer.
+    pub fn pause_run(
+        &mut self,
+        controller: &Option<LaserController>,
+        status: &mut MachineStatus,
+        pulses_cfg: &PulseConfig,
+    ) -> Option<String> {
+        if self.run_mode == RunMode::Idle
+            || self.is_paused
+            || self.current_seg_idx >= self.trajectory.len()
+        {
+            return None;
+        }
+
+        let seg = self.trajectory[self.current_seg_idx];
+        let frac = (self.seg_progress_mm / seg.length_mm.max(1e-9)).clamp(0.0, 1.0);
+        let point_mm = kurbo::Point::new(
+            seg.start.x + (seg.end.x - seg.start.x) * frac,
+            seg.start.y + (seg.end.y - seg.start.y) * frac,
+        );
+
+        status.pos_x = pulses_cfg.mm_to_pulses_x(point_mm.x);
+        status.pos_y = pulses_cfg.mm_to_pulses_y(point_mm.y);
+        status.laser_on = false;
+
+        if let Some(ref c) = controller {
+            if c.is_connected() {
+                c.stop();
+            }
+        }
+
+        let cp = PauseCheckpoint {
+            point_mm,
+            seg_idx: self.current_seg_idx,
+            seg_progress_mm: self.seg_progress_mm,
+            traveled_length_mm: self.traveled_length_mm,
+            path_index_1based: seg.path_index_1based,
+            mode: self.run_mode,
+        };
+        self.is_paused = true;
+        self.last_tick = None;
+        self.last_hw_dispatched_seg = None;
+        self.paused_checkpoint = Some(cp);
+        self.pause_buffer.push(cp);
+
+        Some(format!(
+            "Paused at X: {:.2}, Y: {:.2} mm (Path #{}). Head unlocked for manual jogging.",
+            point_mm.x, point_mm.y, cp.path_index_1based
+        ))
+    }
+
+    /// Resume from a recorded pause checkpoint. If the head was jogged away while paused,
+    /// prepends a rapid laser-OFF return segment back to the recorded pause position before
+    /// continuing the interrupted segment and all remaining paths.
+    pub fn continue_run(
+        &mut self,
+        current_head: kurbo::Point,
+        controller: &Option<LaserController>,
+    ) -> Option<String> {
+        let cp = self.paused_checkpoint.take()?;
+
+        let mut new_traj: Vec<MotionSegment> = Vec::new();
+        let return_dist = current_head.distance(cp.point_mm);
+        if return_dist > 1e-4 {
+            new_traj.push(MotionSegment {
+                start: current_head,
+                end: cp.point_mm,
+                length_mm: return_dist,
+                speed_mm_s: 200.0,
+                is_rapid: true,
+                path_index_1based: cp.path_index_1based,
+            });
+        }
+
+        if cp.seg_idx < self.trajectory.len() {
+            let orig_seg = self.trajectory[cp.seg_idx];
+            let rem_len = cp.point_mm.distance(orig_seg.end);
+            if rem_len > 1e-6 {
+                new_traj.push(MotionSegment {
+                    start: cp.point_mm,
+                    end: orig_seg.end,
+                    length_mm: rem_len,
+                    speed_mm_s: orig_seg.speed_mm_s,
+                    is_rapid: orig_seg.is_rapid,
+                    path_index_1based: orig_seg.path_index_1based,
+                });
+            }
+            if cp.seg_idx + 1 < self.trajectory.len() {
+                new_traj.extend_from_slice(&self.trajectory[(cp.seg_idx + 1)..]);
+            }
+        }
+
+        if new_traj.is_empty() {
+            self.run_mode = RunMode::Idle;
+            self.is_paused = false;
+            self.trajectory.clear();
+            self.current_seg_idx = 0;
+            self.seg_progress_mm = 0.0;
+            self.last_tick = None;
+            self.last_hw_dispatched_seg = None;
+            if cp.mode == RunMode::DryCut {
+                if let Some(ref c) = controller {
+                    if c.is_connected() {
+                        c.set_red_pointer(false);
+                    }
+                }
+            }
+            return Some("No remaining segments to continue; job complete.".to_string());
+        }
+
+        let rem_total: f64 = new_traj.iter().map(|s| s.length_mm).sum();
+        self.trajectory = new_traj;
+        self.current_seg_idx = 0;
+        self.seg_progress_mm = 0.0;
+        self.traveled_length_mm = cp.traveled_length_mm;
+        self.total_length_mm = cp.traveled_length_mm + rem_total;
+        self.run_mode = cp.mode;
+        self.is_paused = false;
+        self.last_tick = Some(std::time::Instant::now());
+        self.last_hw_dispatched_seg = None;
+
+        if cp.mode == RunMode::DryCut {
+            if let Some(ref c) = controller {
+                if c.is_connected() {
+                    c.set_red_pointer(true);
+                }
+            }
+        }
+
+        if return_dist > 1e-4 {
+            Some(format!(
+                "Continuing from X: {:.2}, Y: {:.2} mm (returning {:.1} mm to pause point {:.2}, {:.2} mm).",
+                current_head.x, current_head.y, return_dist, cp.point_mm.x, cp.point_mm.y
+            ))
+        } else {
+            Some(format!(
+                "Continuing from pause point X: {:.2}, Y: {:.2} mm (Path #{}).",
+                cp.point_mm.x, cp.point_mm.y, cp.path_index_1based
+            ))
         }
     }
 
@@ -454,7 +616,7 @@ pub fn render_right_panels(
                 ui.separator();
                 ui.add_space(4.0);
 
-                // Job Execution & Dry-Cut Simulation
+                // Job Execution & Dry-Cut Simulation (2x2 Pendant Grid + Pause Buffer)
                 ui.label(RichText::new("Job Execution & Dry-Cut:").strong().size(12.0));
                 ui.add_space(3.0);
 
@@ -463,25 +625,32 @@ pub fn render_right_panels(
                     pulses_cfg.pulses_to_mm_y(status.pos_y),
                 );
                 let run_btn_w = ((ui.available_width() - 8.0) / 2.0).max(95.0);
+                let has_pause = panel_state.paused_checkpoint.is_some();
 
+                // Row 1: ▶ Start / 🔄 Restart  |  🧭 Dry-Cut
                 ui.horizontal(|ui| {
-                    let is_cutting = panel_state.run_mode == RunMode::Cutting;
+                    let is_cutting = panel_state.run_mode == RunMode::Cutting && !panel_state.is_paused;
                     let start_fill = if is_cutting {
                         Color32::from_rgb(35, 160, 75)
                     } else {
                         Color32::from_rgb(26, 110, 52)
                     };
-                    let start_btn = Button::new(RichText::new("▶ Start").size(13.0).color(Color32::WHITE).strong())
+                    let start_label = if has_pause { "🔄 Restart" } else { "▶ Start" };
+                    let start_btn = Button::new(RichText::new(start_label).size(13.0).color(Color32::WHITE).strong())
                         .fill(start_fill);
                     if ui
                         .add_sized([run_btn_w, 32.0], start_btn)
-                        .on_hover_text("Start cutting job along sorted toolpath sequence")
+                        .on_hover_text(if has_pause {
+                            "Restart cutting job from the beginning (discards pause checkpoint)"
+                        } else {
+                            "Start cutting job along sorted toolpath sequence"
+                        })
                         .clicked()
                     {
                         *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
                     }
 
-                    let is_dry = panel_state.run_mode == RunMode::DryCut;
+                    let is_dry = panel_state.run_mode == RunMode::DryCut && !panel_state.is_paused;
                     let dry_fill = if is_dry {
                         Color32::from_rgb(20, 130, 165)
                     } else {
@@ -507,29 +676,102 @@ pub fn render_right_panels(
                     }
                 });
 
-                // Pause / Stop & Progress during an active run
-                if panel_state.run_mode != RunMode::Idle {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let pause_label = if panel_state.is_paused { "▶ Resume" } else { "⏸ Pause" };
-                        let pause_btn = Button::new(RichText::new(pause_label).size(12.0).strong())
-                            .fill(Color32::from_rgb(55, 58, 72));
-                        if ui.add_sized([run_btn_w, 26.0], pause_btn).clicked() {
-                            panel_state.is_paused = !panel_state.is_paused;
-                            panel_state.last_tick = if panel_state.is_paused {
-                                None
-                            } else {
-                                Some(std::time::Instant::now())
-                            };
-                        }
+                ui.add_space(4.0);
 
-                        let stop_run_btn = Button::new(RichText::new("⏹ Stop").size(12.0).color(Color32::WHITE).strong())
-                            .fill(Color32::from_rgb(160, 42, 42));
-                        if ui.add_sized([run_btn_w, 26.0], stop_run_btn).clicked() {
-                            panel_state.stop_run(controller, status);
-                            *status_message = "Run stopped.".to_string();
+                // Row 2: ⏸ Pause  |  ⏯ Continue
+                ui.horizontal(|ui| {
+                    let can_pause = panel_state.run_mode != RunMode::Idle && !panel_state.is_paused;
+                    let can_continue = panel_state.is_paused && has_pause;
+
+                    let pause_fill = if can_pause {
+                        Color32::from_rgb(175, 115, 22)
+                    } else {
+                        Color32::from_rgb(48, 50, 62)
+                    };
+                    let pause_btn = Button::new(RichText::new("⏸ Pause").size(12.5).color(Color32::WHITE).strong())
+                        .fill(pause_fill);
+                    if ui
+                        .add_enabled_ui(can_pause, |ui| ui.add_sized([run_btn_w, 30.0], pause_btn))
+                        .inner
+                        .on_hover_text("Pause job, turn laser off, record position in buffer, and allow manual jogging")
+                        .clicked()
+                    {
+                        if let Some(msg) = panel_state.pause_run(controller, status, pulses_cfg) {
+                            *status_message = msg;
                         }
-                    });
+                    }
+
+                    let cont_fill = if can_continue {
+                        Color32::from_rgb(28, 135, 108)
+                    } else {
+                        Color32::from_rgb(48, 50, 62)
+                    };
+                    let cont_btn = Button::new(RichText::new("⏯ Continue").size(12.5).color(Color32::WHITE).strong())
+                        .fill(cont_fill);
+                    if ui
+                        .add_enabled_ui(can_continue, |ui| ui.add_sized([run_btn_w, 30.0], cont_btn))
+                        .inner
+                        .on_hover_text("Return from current position to recorded pause point and continue")
+                        .clicked()
+                    {
+                        if let Some(msg) = panel_state.continue_run(current_head, controller) {
+                            *status_message = msg;
+                        }
+                    }
+                });
+
+                // Pause Buffer Card (visible when a paused checkpoint is active)
+                if let Some(cp) = panel_state.paused_checkpoint {
+                    ui.add_space(4.0);
+                    Frame::group(ui.style())
+                        .fill(Color32::from_rgb(36, 30, 20))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(205, 145, 38)))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "📌 Paused @ X: {:.2}, Y: {:.2} mm (Path #{})",
+                                    cp.point_mm.x, cp.point_mm.y, cp.path_index_1based
+                                ))
+                                .size(11.5)
+                                .color(Color32::from_rgb(255, 205, 90))
+                                .strong(),
+                            );
+                            ui.horizontal(|ui| {
+                                let offset = current_head.distance(cp.point_mm);
+                                let buf_info = if offset > 0.05 {
+                                    format!(
+                                        "Buffer: {} pt(s)  •  Jog offset: {:.1} mm",
+                                        panel_state.pause_buffer.len(),
+                                        offset
+                                    )
+                                } else {
+                                    format!("Pause buffer: {} point(s)", panel_state.pause_buffer.len())
+                                };
+                                ui.label(
+                                    RichText::new(buf_info)
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(215, 205, 185)),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let reset_btn = Button::new(
+                                        RichText::new("⏹ Reset").size(11.0).color(Color32::WHITE).strong(),
+                                    )
+                                    .fill(Color32::from_rgb(155, 42, 42));
+                                    if ui
+                                        .add(reset_btn)
+                                        .on_hover_text("Discard paused checkpoint and stop job")
+                                        .clicked()
+                                    {
+                                        panel_state.stop_run(controller, status);
+                                        *status_message = "Job reset; pause buffer cleared.".to_string();
+                                    }
+                                });
+                            });
+                        });
+                }
+
+                // Active Run Progress Bar
+                if panel_state.run_mode != RunMode::Idle {
 
                     ui.add_space(4.0);
                     let progress = if panel_state.total_length_mm > 1e-6 {
@@ -617,4 +859,100 @@ pub fn render_right_panels(
                 }
             });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pause_jog_and_continue_trajectory() {
+        let pulses = PulseConfig::default();
+        let mut status = MachineStatus::default();
+        let mut state = PanelState::default();
+
+        state.trajectory = vec![
+            MotionSegment {
+                start: kurbo::Point::new(0.0, 0.0),
+                end: kurbo::Point::new(100.0, 0.0),
+                length_mm: 100.0,
+                speed_mm_s: 50.0,
+                is_rapid: false,
+                path_index_1based: 1,
+            },
+            MotionSegment {
+                start: kurbo::Point::new(100.0, 0.0),
+                end: kurbo::Point::new(100.0, 50.0),
+                length_mm: 50.0,
+                speed_mm_s: 50.0,
+                is_rapid: false,
+                path_index_1based: 1,
+            },
+        ];
+        state.run_mode = RunMode::Cutting;
+        state.current_seg_idx = 0;
+        state.seg_progress_mm = 40.0;
+        state.traveled_length_mm = 40.0;
+        state.total_length_mm = 150.0;
+        status.laser_on = true;
+
+        // 1. Pause mid-cut at (40, 0)
+        let msg = state.pause_run(&None, &mut status, &pulses);
+        assert!(msg.is_some());
+        assert!(state.is_paused);
+        assert!(!status.laser_on);
+        assert_eq!(state.pause_buffer.len(), 1);
+        let cp = state.paused_checkpoint.expect("checkpoint should be recorded");
+        assert!((cp.point_mm.x - 40.0).abs() < 1e-6);
+        assert!(cp.point_mm.y.abs() < 1e-6);
+        assert_eq!(cp.mode, RunMode::Cutting);
+
+        // 2. Simulate user jogging away to (80, 60) while paused, then pressing Continue
+        let jogged_pos = kurbo::Point::new(80.0, 60.0);
+        let cont_msg = state.continue_run(jogged_pos, &None);
+        assert!(cont_msg.is_some());
+        assert!(!state.is_paused);
+        assert!(state.paused_checkpoint.is_none());
+        assert_eq!(state.run_mode, RunMode::Cutting);
+        assert_eq!(state.pause_buffer.len(), 1);
+
+        // Expect: [rapid return (80,60)->(40,0), remainder cut (40,0)->(100,0), seg2 (100,0)->(100,50)]
+        assert_eq!(state.trajectory.len(), 3);
+        let ret = state.trajectory[0];
+        assert!(ret.is_rapid);
+        assert!((ret.start.x - 80.0).abs() < 1e-6 && (ret.start.y - 60.0).abs() < 1e-6);
+        assert!((ret.end.x - 40.0).abs() < 1e-6 && ret.end.y.abs() < 1e-6);
+        assert!((ret.length_mm - 72.1110255).abs() < 1e-4);
+
+        let rem = state.trajectory[1];
+        assert!(!rem.is_rapid);
+        assert!((rem.start.x - 40.0).abs() < 1e-6 && rem.start.y.abs() < 1e-6);
+        assert!((rem.end.x - 100.0).abs() < 1e-6 && rem.end.y.abs() < 1e-6);
+        assert!((rem.length_mm - 60.0).abs() < 1e-6);
+
+        let seg2 = state.trajectory[2];
+        assert!(!seg2.is_rapid);
+        assert!((seg2.length_mm - 50.0).abs() < 1e-6);
+
+        // 3. Pause a second time at midpoint of segment 1 ((70, 0)), do not jog, and continue
+        state.current_seg_idx = 1;
+        state.seg_progress_mm = 30.0;
+        assert!(state.pause_run(&None, &mut status, &pulses).is_some());
+        assert_eq!(state.pause_buffer.len(), 2);
+        let cp2 = state.paused_checkpoint.unwrap();
+        assert!((cp2.point_mm.x - 70.0).abs() < 1e-6);
+
+        assert!(state.continue_run(cp2.point_mm, &None).is_some());
+        // No rapid return needed since head wasn't jogged
+        assert_eq!(state.trajectory.len(), 2);
+        assert!(!state.trajectory[0].is_rapid);
+        assert!((state.trajectory[0].start.x - 70.0).abs() < 1e-6);
+        assert!((state.trajectory[0].length_mm - 30.0).abs() < 1e-6);
+
+        // 4. Stop/reset clears checkpoint and pause buffer
+        state.stop_run(&None, &mut status);
+        assert_eq!(state.run_mode, RunMode::Idle);
+        assert!(state.paused_checkpoint.is_none());
+        assert!(state.pause_buffer.is_empty());
+    }
 }

@@ -169,6 +169,13 @@ impl eframe::App for TzlaserApp {
                 self.pulse_config.pulses_to_mm_x(self.status.pos_x),
                 self.pulse_config.pulses_to_mm_y(self.status.pos_y),
             );
+            let paused_points_mm: Vec<Point> = self
+                .panel_state
+                .pause_buffer
+                .iter()
+                .map(|c| c.point_mm)
+                .collect();
+            let active_pause_mm = self.panel_state.paused_checkpoint.map(|c| c.point_mm);
             render_canvas(
                 ui,
                 &mut self.canvas_state,
@@ -178,6 +185,8 @@ impl eframe::App for TzlaserApp {
                 laser_pos,
                 self.panel_state.run_mode == panels::RunMode::DryCut,
                 self.status.laser_on,
+                &paused_points_mm,
+                active_pause_mm,
             );
         });
 

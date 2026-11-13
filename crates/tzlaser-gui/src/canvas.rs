@@ -400,6 +400,8 @@ pub fn render_canvas(
     laser_pos_mm: Point,
     is_dry_cut: bool,
     laser_on: bool,
+    paused_points_mm: &[Point],
+    active_pause_mm: Option<Point>,
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
     state.last_viewport_size = response.rect.size();
@@ -782,8 +784,92 @@ pub fn render_canvas(
         }
     }
 
-    // 10. Render Physical Laser Head Position Crosshair
+    // 10. Render Pause Buffer Markers & Physical Laser Head Position Crosshair
     let head_pos = state.world_to_screen(laser_pos_mm, origin_screen);
+
+    for &pt in paused_points_mm {
+        if active_pause_mm.map_or(false, |ap| ap.distance(pt) < 1e-3) {
+            continue;
+        }
+        let p = state.world_to_screen(pt, origin_screen);
+        let r = 5.5;
+        let diamond = vec![
+            Pos2::new(p.x, p.y - r),
+            Pos2::new(p.x + r, p.y),
+            Pos2::new(p.x, p.y + r),
+            Pos2::new(p.x - r, p.y),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            diamond,
+            Color32::from_rgba_unmultiplied(245, 165, 35, 130),
+            Stroke::new(1.2, Color32::from_rgb(255, 200, 70)),
+        ));
+    }
+
+    if let Some(pause_mm) = active_pause_mm {
+        let pause_screen = state.world_to_screen(pause_mm, origin_screen);
+
+        if laser_pos_mm.distance(pause_mm) > 0.5 {
+            let delta = pause_screen - head_pos;
+            let dist = delta.length();
+            if dist > 1.0 {
+                let dir = delta / dist;
+                let mut t = 0.0;
+                let dash = 6.0;
+                let gap = 4.0;
+                while t < dist {
+                    let t_end = (t + dash).min(dist);
+                    painter.line_segment(
+                        [head_pos + dir * t, head_pos + dir * t_end],
+                        Stroke::new(1.8, Color32::from_rgba_unmultiplied(255, 185, 50, 215)),
+                    );
+                    t += dash + gap;
+                }
+            }
+        }
+
+        painter.circle_stroke(
+            pause_screen,
+            13.0,
+            Stroke::new(2.0, Color32::from_rgb(255, 185, 40)),
+        );
+        let r = 7.0;
+        let diamond = vec![
+            Pos2::new(pause_screen.x, pause_screen.y - r),
+            Pos2::new(pause_screen.x + r, pause_screen.y),
+            Pos2::new(pause_screen.x, pause_screen.y + r),
+            Pos2::new(pause_screen.x - r, pause_screen.y),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            diamond,
+            Color32::from_rgb(255, 175, 30),
+            Stroke::new(1.5, Color32::from_rgb(255, 240, 170)),
+        ));
+
+        let badge_rect = egui::Rect::from_min_size(
+            Pos2::new(pause_screen.x + 14.0, pause_screen.y - 18.0),
+            egui::Vec2::new(66.0, 17.0),
+        );
+        painter.rect_filled(
+            badge_rect,
+            3.0,
+            Color32::from_rgba_unmultiplied(45, 32, 12, 230),
+        );
+        painter.rect_stroke(
+            badge_rect,
+            3.0,
+            Stroke::new(1.0, Color32::from_rgb(255, 185, 40)),
+            egui::StrokeKind::Outside,
+        );
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⏸ PAUSE",
+            egui::FontId::proportional(10.5),
+            Color32::from_rgb(255, 220, 110),
+        );
+    }
+
     let cross_len = 13.0;
     let cross_color = if laser_on {
         Color32::from_rgb(255, 85, 30)
