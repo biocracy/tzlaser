@@ -578,7 +578,7 @@ mod tests {
     fn test_cutie_danutz_panouri_import() {
         let path = Path::new("/Users/dinu/Projects/various geometries/cutieDanutz_panouri.dxf");
         if path.exists() {
-            let doc = DxfImporter::load_file(path).expect("Should load cutieDanutz_panouri.dxf cleanly");
+            let mut doc = DxfImporter::load_file(path).expect("Should load cutieDanutz_panouri.dxf cleanly");
             let bbox = doc.bounding_box().expect("Should have valid bounding box");
             
             // Expected bounds: X in [58.32, 1112.59], Y in [198.48, 937.35]
@@ -587,12 +587,12 @@ mod tests {
             assert!((bbox.min_y() - 198.48).abs() < 1.0, "Expected min_y ~198.48, got {}", bbox.min_y());
             assert!((bbox.max_y() - 937.35).abs() < 1.0, "Expected max_y ~937.35, got {}", bbox.max_y());
             
-            println!("cutieDanutz_panouri layers:");
-            for l in &doc.layers {
-                println!("  Layer '{}': {} entities", l.name, l.entities.len());
-            }
+            // Raw DXF contains 230 individual entities on layer 'Visible'
+            assert_eq!(doc.entity_count(), 230);
 
-            // 10 outer panel loops + 174 interior hole circles = 184 profiles
+            // When auto-classified, the perimeter lines chain into 10 closed outer loops,
+            // segregating 10 outer panels and 174 interior hole circles (184 total profiles).
+            doc.auto_classify_profiles();
             assert_eq!(doc.entity_count(), 184);
             assert_eq!(doc.layers.len(), 2);
             assert_eq!(doc.layers[0].name, "Outer Profiles");

@@ -16,6 +16,7 @@ impl Color {
     pub const YELLOW: Self = Self { r: 255, g: 220, b: 20 };
     pub const CYAN: Self = Self { r: 0, g: 230, b: 230 };
     pub const MAGENTA: Self = Self { r: 240, g: 60, b: 240 };
+    pub const WHITE: Self = Self { r: 255, g: 255, b: 255 };
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,9 +376,63 @@ impl Layer {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortMode {
+    /// 1. Bend / Open lines -> 2. Interior holes -> 3. Outer contours (Greedy TSP within each group)
+    OpenFirst,
+    /// 1. Interior holes -> 2. Outer contours -> 3. Open lines (Greedy TSP within each group)
+    InnerFirst,
+    /// Pure shortest rapid travel distance (Greedy TSP across all paths)
+    ShortestPath,
+    /// Spatial sort from Left to Right (X ascending)
+    LeftToRight,
+    /// Spatial sort from Top to Bottom (Y descending)
+    TopToBottom,
+    /// Manual / Document order (preserve entity list order without automatic optimization)
+    Manual,
+}
+
+impl Default for SortMode {
+    fn default() -> Self {
+        SortMode::OpenFirst
+    }
+}
+
+impl SortMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::OpenFirst => "Open / Bend First",
+            SortMode::InnerFirst => "Inner Holes First",
+            SortMode::ShortestPath => "Shortest Travel (TSP)",
+            SortMode::LeftToRight => "Left to Right (X)",
+            SortMode::TopToBottom => "Top to Bottom (Y)",
+            SortMode::Manual => "Manual / Document Order",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            SortMode::OpenFirst => "Cut open/bend lines first, then interior cutouts, outer contours last",
+            SortMode::InnerFirst => "Cut interior holes first to prevent part movement, then outer contours",
+            SortMode::ShortestPath => "Minimize rapid transit travel distance between pierces",
+            SortMode::LeftToRight => "Sort cut paths from left to right across table",
+            SortMode::TopToBottom => "Sort cut paths from top to bottom across table",
+            SortMode::Manual => "Preserve exact entity list order without automatic optimization",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub layers: Vec<Layer>,
+    #[serde(default)]
+    pub sort_mode: SortMode,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Document {
@@ -387,6 +442,7 @@ impl Document {
                 Layer::new("Cut 1", Color::RED),
                 Layer::new("Mark / Engrave", Color::BLUE),
             ],
+            sort_mode: SortMode::default(),
         }
     }
 
@@ -722,22 +778,22 @@ impl Document {
         self.layers = new_layers;
     }
 
-    /// Computes the optimal laser cutting sequence:
-    /// 1. Bend / Mark / Open lines first
-    /// 2. Interior holes / cutouts next (to prevent part drop/tilt)
-    /// 3. Outer part contours last
-    /// Each group is path-optimized using Greedy Nearest-Neighbor.
+    /// Computes the toolpath cutting sequence using the document's currently selected SortMode.
     pub fn compute_cut_sequence(&self) -> Vec<CutPathInfo> {
-        let mut bend_paths = Vec::new();
-        let mut interior_paths = Vec::new();
-        let mut outer_paths = Vec::new();
+        self.compute_cut_sequence_with_mode(self.sort_mode)
+    }
+
+    /// Computes the toolpath cutting sequence under a specific SortMode.
+    /// Supports: OpenFirst, InnerFirst, ShortestPath (TSP), LeftToRight, TopToBottom, and Manual order.
+    pub fn compute_cut_sequence_with_mode(&self, mode: SortMode) -> Vec<CutPathInfo> {
+        let mut raw_paths = Vec::new();
 
         for (l_idx, layer) in self.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
             let name_lower = layer.name.to_lowercase();
-            let is_bend = name_lower.contains("bend")
+            let is_bend_layer = name_lower.contains("bend")
                 || name_lower.contains("mark")
                 || name_lower.contains("engrave");
             let is_interior_layer = name_lower.contains("interior")
@@ -748,53 +804,180 @@ impl Document {
                 match entity {
                     Entity::Group { children } => {
                         for child in children {
-                            let info = CutPathInfo {
+                            let open = !child.is_closed();
+                            let is_bend = is_bend_layer || open;
+                            let is_interior = is_interior_layer;
+                            raw_paths.push(CutPathInfo {
                                 layer_idx: l_idx,
                                 entity_idx: e_idx,
                                 start_point: child.start_point(),
                                 end_point: child.end_point(),
-                                is_interior: is_interior_layer || !child.is_closed(),
-                            };
-
-                            if is_bend || !child.is_closed() {
-                                bend_paths.push(info);
-                            } else if is_interior_layer {
-                                interior_paths.push(info);
-                            } else {
-                                outer_paths.push(info);
-                            }
+                                is_interior,
+                                is_open: is_bend,
+                            });
                         }
                     }
                     _ => {
-                        let info = CutPathInfo {
+                        let open = !entity.is_closed();
+                        let is_bend = is_bend_layer || open;
+                        let is_interior = is_interior_layer;
+                        raw_paths.push(CutPathInfo {
                             layer_idx: l_idx,
                             entity_idx: e_idx,
                             start_point: entity.start_point(),
                             end_point: entity.end_point(),
-                            is_interior: is_interior_layer || !entity.is_closed(),
-                        };
-
-                        if is_bend || !entity.is_closed() {
-                            bend_paths.push(info);
-                        } else if is_interior_layer {
-                            interior_paths.push(info);
-                        } else {
-                            outer_paths.push(info);
-                        }
+                            is_interior,
+                            is_open: is_bend,
+                        });
                     }
                 }
             }
         }
 
-        let mut result =
-            Vec::with_capacity(bend_paths.len() + interior_paths.len() + outer_paths.len());
-        let mut current_pos = Point::ORIGIN;
+        // Geometric containment detection:
+        // Even if layers haven't been segregated into "Interior Profiles", detect if a closed shape
+        // is nested inside another closed shape on any visible layer.
+        for item in &mut raw_paths {
+            if !item.is_open && !item.is_interior {
+                let test_pt = item.start_point;
+                for (other_l_idx, other_layer) in self.layers.iter().enumerate() {
+                    if !other_layer.visible { continue; }
+                    for (other_e_idx, other_ent) in other_layer.entities.iter().enumerate() {
+                        if item.layer_idx == other_l_idx && item.entity_idx == other_e_idx {
+                            continue;
+                        }
+                        if other_ent.is_closed() && other_ent.contains_point(test_pt) {
+                            item.is_interior = true;
+                            break;
+                        }
+                    }
+                    if item.is_interior { break; }
+                }
+            }
+        }
 
-        Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
-        Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
-        Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
+        match mode {
+            SortMode::Manual => {
+                // Exact layer order & entity index order
+                raw_paths
+            }
+            SortMode::LeftToRight => {
+                raw_paths.sort_by(|a, b| a.start_point.x.partial_cmp(&b.start_point.x).unwrap_or(std::cmp::Ordering::Equal));
+                raw_paths
+            }
+            SortMode::TopToBottom => {
+                raw_paths.sort_by(|a, b| b.start_point.y.partial_cmp(&a.start_point.y).unwrap_or(std::cmp::Ordering::Equal));
+                raw_paths
+            }
+            SortMode::ShortestPath => {
+                let mut result = Vec::with_capacity(raw_paths.len());
+                let mut current_pos = Point::ORIGIN;
+                Self::sequence_group_nearest_neighbor(&mut raw_paths, &mut current_pos, &mut result);
+                result
+            }
+            SortMode::OpenFirst => {
+                let mut bend_paths = Vec::new();
+                let mut interior_paths = Vec::new();
+                let mut outer_paths = Vec::new();
 
-        result
+                for item in raw_paths {
+                    if item.is_open {
+                        bend_paths.push(item);
+                    } else if item.is_interior {
+                        interior_paths.push(item);
+                    } else {
+                        outer_paths.push(item);
+                    }
+                }
+
+                let mut result = Vec::with_capacity(bend_paths.len() + interior_paths.len() + outer_paths.len());
+                let mut current_pos = Point::ORIGIN;
+                Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
+                Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
+                Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
+                result
+            }
+            SortMode::InnerFirst => {
+                let mut bend_paths = Vec::new();
+                let mut interior_paths = Vec::new();
+                let mut outer_paths = Vec::new();
+
+                for item in raw_paths {
+                    if item.is_open {
+                        bend_paths.push(item);
+                    } else if item.is_interior {
+                        interior_paths.push(item);
+                    } else {
+                        outer_paths.push(item);
+                    }
+                }
+
+                let mut result = Vec::with_capacity(bend_paths.len() + interior_paths.len() + outer_paths.len());
+                let mut current_pos = Point::ORIGIN;
+                Self::sequence_group_nearest_neighbor(&mut interior_paths, &mut current_pos, &mut result);
+                Self::sequence_group_nearest_neighbor(&mut outer_paths, &mut current_pos, &mut result);
+                Self::sequence_group_nearest_neighbor(&mut bend_paths, &mut current_pos, &mut result);
+                result
+            }
+        }
+    }
+
+    /// Reorders the entities within layers to permanently match the computed sort sequence.
+    pub fn apply_sort_order(&mut self, mode: SortMode) {
+        self.sort_mode = mode;
+        let seq = self.compute_cut_sequence_with_mode(mode);
+
+        for (l_idx, layer) in self.layers.iter_mut().enumerate() {
+            let mut ordered_entities = Vec::with_capacity(layer.entities.len());
+            let mut used = vec![false; layer.entities.len()];
+
+            for info in &seq {
+                if info.layer_idx == l_idx && info.entity_idx < layer.entities.len() && !used[info.entity_idx] {
+                    ordered_entities.push(layer.entities[info.entity_idx].clone());
+                    used[info.entity_idx] = true;
+                }
+            }
+
+            // Append any unvisited entities (e.g. from hidden layers)
+            for (i, ent) in layer.entities.drain(..).enumerate() {
+                if !used[i] {
+                    ordered_entities.push(ent);
+                }
+            }
+            layer.entities = ordered_entities;
+        }
+    }
+
+    /// Move selected entities earlier in their layer entity sequence (for manual order adjustments).
+    pub fn move_selection_earlier(&mut self, selection: &mut [(usize, usize)]) -> bool {
+        let mut changed = false;
+        for (l_idx, e_idx) in selection.iter_mut() {
+            if *e_idx > 0 {
+                if let Some(layer) = self.layers.get_mut(*l_idx) {
+                    if *e_idx < layer.entities.len() {
+                        layer.entities.swap(*e_idx, *e_idx - 1);
+                        *e_idx -= 1;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Move selected entities later in their layer entity sequence (for manual order adjustments).
+    pub fn move_selection_later(&mut self, selection: &mut [(usize, usize)]) -> bool {
+        let mut changed = false;
+        for (l_idx, e_idx) in selection.iter_mut().rev() {
+            if let Some(layer) = self.layers.get_mut(*l_idx) {
+                if *e_idx + 1 < layer.entities.len() {
+                    layer.entities.swap(*e_idx, *e_idx + 1);
+                    *e_idx += 1;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     fn sequence_group_nearest_neighbor(
@@ -821,13 +1004,14 @@ impl Document {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CutPathInfo {
     pub layer_idx: usize,
     pub entity_idx: usize,
     pub start_point: Point,
     pub end_point: Point,
     pub is_interior: bool,
+    pub is_open: bool,
 }
 
 /// Chaining algorithm to connect contiguous lines and arcs into polylines.
@@ -1058,5 +1242,58 @@ mod tests {
         } else {
             panic!("Expected circle");
         }
+    }
+
+    #[test]
+    fn test_sorting_modes_open_first_and_inner_first_and_manual() {
+        let mut doc = Document::default();
+        let mut layer = Layer::new("All", Color::WHITE);
+        // Outer box 0..100
+        layer.entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(100.0, 0.0),
+                Point::new(100.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        // Open line (e.g. bend/score line)
+        layer.entities.push(Entity::Line {
+            start: Point::new(10.0, 20.0),
+            end: Point::new(90.0, 20.0),
+        });
+        // Inner hole circle at 50, 50
+        layer.entities.push(Entity::Circle {
+            center: Point::new(50.0, 50.0),
+            radius: 8.0,
+        });
+        doc.layers = vec![layer];
+
+        // 1. OpenFirst: Open line -> Inner circle -> Outer contour
+        let seq_open = doc.compute_cut_sequence_with_mode(SortMode::OpenFirst);
+        assert_eq!(seq_open.len(), 3);
+        assert!(seq_open[0].is_open); // Open line first
+        assert!(seq_open[1].is_interior); // Inner hole next
+        assert!(!seq_open[2].is_interior && !seq_open[2].is_open); // Outer last
+
+        // 2. InnerFirst: Inner circle -> Outer contour -> Open line
+        let seq_inner = doc.compute_cut_sequence_with_mode(SortMode::InnerFirst);
+        assert_eq!(seq_inner.len(), 3);
+        assert!(seq_inner[0].is_interior); // Inner hole first
+        assert!(!seq_inner[1].is_interior && !seq_inner[1].is_open); // Outer next
+        assert!(seq_inner[2].is_open); // Open line last
+
+        // 3. Manual: Exact insertion order: 0 (Outer), 1 (Open), 2 (Inner)
+        let seq_manual = doc.compute_cut_sequence_with_mode(SortMode::Manual);
+        assert_eq!(seq_manual.len(), 3);
+        assert_eq!(seq_manual[0].entity_idx, 0);
+        assert_eq!(seq_manual[1].entity_idx, 1);
+        assert_eq!(seq_manual[2].entity_idx, 2);
+
+        // 4. Apply sort and reorder
+        doc.apply_sort_order(SortMode::OpenFirst);
+        // Entity at index 0 in layer must now be the open line
+        assert!(!doc.layers[0].entities[0].is_closed());
     }
 }

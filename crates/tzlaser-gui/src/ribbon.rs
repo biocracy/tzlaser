@@ -2,7 +2,9 @@ use eframe::egui::{
     self, Button, Color32, Frame, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
 };
 use std::net::SocketAddr;
-use tzlaser_core::{apply_lead_lines, Document, DxfImporter, HistoryManager, LeadConfig, LeadType};
+use tzlaser_core::{
+    apply_lead_lines, Document, DxfImporter, HistoryManager, LeadConfig, LeadType, SortMode,
+};
 use tzlaser_protocol::{LaserController, MachineStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,22 +347,65 @@ fn render_profiles_tab(
 
         ui.add_space(4.0);
 
-        // 2. Classification & Toolpath Optimization
-        ribbon_group(ui, "Classification & Sequence", |ui| {
+        // 2. Layer Auto-Classification
+        ribbon_group(ui, "Classification", |ui| {
             let classify_btn = Button::new(RichText::new("⚡ Auto-Classify").size(12.5).color(Color32::from_rgb(100, 220, 255)).strong())
                 .fill(Color32::from_rgb(25, 48, 70));
-            if ui.add(classify_btn).on_hover_text("Auto-segregate Outer Profiles, Interior Holes, and Bend Lines").clicked() {
+            if ui.add(classify_btn).on_hover_text("Auto-segregate Outer Profiles, Interior Holes, and Bend Lines into dedicated cutting layers").clicked() {
                 history.record(doc, selection, "Auto-Classify");
                 doc.auto_classify_profiles();
                 selection.clear();
                 *status_message = format!("Auto-classified {} layers: {}", doc.layers.len(), doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
             }
+        });
 
-            let opt_btn = Button::new(RichText::new("⚡ Optimize Path").size(12.5).color(Color32::from_rgb(255, 215, 0)))
+        ui.add_space(4.0);
+
+        // 3. Toolpath Sorting (Multiple Sorting Methods)
+        ribbon_group(ui, "Toolpath Sorting", |ui| {
+            let mut current_mode = doc.sort_mode;
+            egui::ComboBox::from_id_salt("cut_sort_mode_combo")
+                .selected_text(RichText::new(current_mode.label()).size(12.0).strong().color(Color32::from_rgb(255, 220, 100)))
+                .width(175.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
+                    ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
+                    ui.selectable_value(&mut current_mode, SortMode::ShortestPath, "🚀 Shortest Travel (TSP)");
+                    ui.selectable_value(&mut current_mode, SortMode::LeftToRight, "➡️ Left to Right (X)");
+                    ui.selectable_value(&mut current_mode, SortMode::TopToBottom, "⬇️ Top to Bottom (Y)");
+                    ui.selectable_value(&mut current_mode, SortMode::Manual, "📝 Manual / Document Order");
+                });
+
+            if current_mode != doc.sort_mode {
+                doc.sort_mode = current_mode;
+                *status_message = format!("Sort method set to: {}", current_mode.label());
+            }
+
+            let sort_btn = Button::new(RichText::new("⚡ Sort").size(12.0).color(Color32::from_rgb(255, 215, 0)).strong())
                 .fill(Color32::from_rgb(45, 40, 22));
-            if ui.add(opt_btn).on_hover_text("Greedy nearest-neighbor TSP optimizer: Bend lines → Interior holes → Outer contours").clicked() {
+            if ui.add(sort_btn).on_hover_text(format!("Apply '{}' sequence to document toolpaths: {}", doc.sort_mode.label(), doc.sort_mode.description())).clicked() {
+                history.record(doc, selection, format!("Sort ({})", doc.sort_mode.label()));
+                doc.apply_sort_order(doc.sort_mode);
                 let seq = doc.compute_cut_sequence();
-                *status_message = format!("Toolpath sequence optimized: {} pierce cuts planned (bends → holes → perimeters).", seq.len());
+                *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), doc.sort_mode.label());
+            }
+
+            // In Manual mode or when selection exists, provide fine-grained manual order adjustments
+            if doc.sort_mode == SortMode::Manual && !selection.is_empty() {
+                ui.horizontal(|ui| {
+                    if ui.add(Button::new(RichText::new("▲ Earlier").size(11.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile earlier in cutting sequence").clicked() {
+                        history.record(doc, selection, "Move Earlier");
+                        if doc.move_selection_earlier(selection) {
+                            *status_message = "Moved selected profile earlier in cut order.".to_string();
+                        }
+                    }
+                    if ui.add(Button::new(RichText::new("▼ Later").size(11.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile later in cutting sequence").clicked() {
+                        history.record(doc, selection, "Move Later");
+                        if doc.move_selection_later(selection) {
+                            *status_message = "Moved selected profile later in cut order.".to_string();
+                        }
+                    }
+                });
             }
         });
 
