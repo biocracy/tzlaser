@@ -540,8 +540,12 @@ impl Document {
     /// Duplicate selected entities translated by (dx, dy). Returns the indices of the new entities.
     pub fn duplicate_selection(&mut self, selection: &[(usize, usize)], dx: f64, dy: f64) -> Vec<(usize, usize)> {
         let mut new_selection = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
         for &(l_idx, e_idx) in selection {
+            if !seen.insert((l_idx, e_idx)) {
+                continue;
+            }
             if let Some(layer) = self.layers.get(l_idx) {
                 if let Some(entity) = layer.entities.get(e_idx) {
                     let mut cloned = entity.clone();
@@ -801,13 +805,14 @@ impl Document {
             for (e_idx, entity) in layer.entities.iter().enumerate() {
                 match entity {
                     Entity::Group { children } => {
-                        for child in children {
+                        for (c_idx, child) in children.iter().enumerate() {
                             let open = !child.is_closed();
                             let is_bend = is_bend_layer || open;
                             let is_interior = is_interior_layer;
                             raw_paths.push(CutPathInfo {
                                 layer_idx: l_idx,
                                 entity_idx: e_idx,
+                                child_idx: Some(c_idx),
                                 start_point: child.start_point(),
                                 end_point: child.end_point(),
                                 is_interior,
@@ -822,6 +827,7 @@ impl Document {
                         raw_paths.push(CutPathInfo {
                             layer_idx: l_idx,
                             entity_idx: e_idx,
+                            child_idx: None,
                             start_point: entity.start_point(),
                             end_point: entity.end_point(),
                             is_interior,
@@ -833,21 +839,40 @@ impl Document {
         }
 
         // Geometric containment detection:
-        // Even if layers haven't been segregated into "Interior Profiles", detect if a closed shape
-        // is nested inside another closed shape on any visible layer.
+        // Detect if a closed shape is nested inside another closed shape on any visible layer
+        // or inside a sibling entity in the same Group.
         for item in &mut raw_paths {
             if !item.is_open && !item.is_interior {
                 let test_pt = item.start_point;
                 for (other_l_idx, other_layer) in self.layers.iter().enumerate() {
                     if !other_layer.visible { continue; }
                     for (other_e_idx, other_ent) in other_layer.entities.iter().enumerate() {
-                        if item.layer_idx == other_l_idx && item.entity_idx == other_e_idx {
-                            continue;
+                        match other_ent {
+                            Entity::Group { children } => {
+                                for (other_c_idx, other_child) in children.iter().enumerate() {
+                                    if item.layer_idx == other_l_idx
+                                        && item.entity_idx == other_e_idx
+                                        && item.child_idx == Some(other_c_idx)
+                                    {
+                                        continue;
+                                    }
+                                    if other_child.is_closed() && other_child.contains_point(test_pt) {
+                                        item.is_interior = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {
+                                if item.layer_idx == other_l_idx && item.entity_idx == other_e_idx {
+                                    continue;
+                                }
+                                if other_ent.is_closed() && other_ent.contains_point(test_pt) {
+                                    item.is_interior = true;
+                                    break;
+                                }
+                            }
                         }
-                        if other_ent.is_closed() && other_ent.contains_point(test_pt) {
-                            item.is_interior = true;
-                            break;
-                        }
+                        if item.is_interior { break; }
                     }
                     if item.is_interior { break; }
                 }
@@ -1043,6 +1068,7 @@ impl Document {
 pub struct CutPathInfo {
     pub layer_idx: usize,
     pub entity_idx: usize,
+    pub child_idx: Option<usize>,
     pub start_point: Point,
     pub end_point: Point,
     pub is_interior: bool,
@@ -1338,5 +1364,49 @@ mod tests {
         assert_eq!(manual_seq[0].entity_idx, 2);
         assert_eq!(manual_seq[1].entity_idx, 1);
         assert_eq!(manual_seq[2].entity_idx, 0);
+    }
+
+    #[test]
+    fn test_grouped_copy_preserves_unique_indices_and_containment() {
+        let mut doc = Document::default();
+        let mut layer = Layer::new("Outer Profiles", Color::GREEN);
+        layer.entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(100.0, 0.0),
+                Point::new(100.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        layer.entities.push(Entity::Circle {
+            center: Point::new(50.0, 50.0),
+            radius: 15.0,
+        });
+        doc.layers = vec![layer];
+
+        let mut sel = vec![(0, 0), (0, 1)];
+        doc.group_selection(&mut sel);
+        assert_eq!(sel.len(), 1);
+
+        // Copy group to the right (+Copy X)
+        let copies = doc.duplicate_selection(&sel, 120.0, 0.0);
+        assert_eq!(copies.len(), 1);
+
+        let seq = doc.compute_cut_sequence();
+        assert_eq!(seq.len(), 4);
+
+        // Both interior holes must be detected as interior and cut before the 2 outer contours
+        assert!(seq[0].is_interior);
+        assert!(seq[1].is_interior);
+        assert!(!seq[2].is_interior);
+        assert!(!seq[3].is_interior);
+
+        // Every CutPathInfo must have a unique (layer_idx, entity_idx, child_idx) key
+        let unique_keys: std::collections::HashSet<_> = seq
+            .iter()
+            .map(|i| (i.layer_idx, i.entity_idx, i.child_idx))
+            .collect();
+        assert_eq!(unique_keys.len(), 4);
     }
 }

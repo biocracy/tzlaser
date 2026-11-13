@@ -603,12 +603,12 @@ pub fn render_canvas(
 
     // 6. Render Document Layers & Entities with High-Visibility Glow
     let has_selection = !selection.is_empty();
-    let index_color_map: HashMap<(usize, usize), Color32> = if state.color_by_cut_index {
+    let index_color_map: HashMap<(usize, usize, Option<usize>), Color32> = if state.color_by_cut_index {
         let seq = doc.compute_cut_sequence();
         let total = seq.len();
         let mut map = HashMap::new();
         for (order_idx, info) in seq.iter().enumerate() {
-            map.entry((info.layer_idx, info.entity_idx))
+            map.entry((info.layer_idx, info.entity_idx, info.child_idx))
                 .or_insert_with(|| state.color_palette.color_for_index(order_idx, total));
         }
         map
@@ -631,25 +631,52 @@ pub fn render_canvas(
         let layer_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
         for (e_idx, entity) in layer.entities.iter().enumerate() {
             let is_selected = selection.contains(&(l_idx, e_idx));
-            let ent_color = index_color_map
-                .get(&(l_idx, e_idx))
-                .copied()
-                .unwrap_or(layer_color);
-            let base_stroke = Stroke::new(
-                if state.color_by_cut_index { 2.0 } else { 1.5 },
-                Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
-            );
-            render_entity(
-                &painter,
-                entity,
-                is_selected,
-                ent_color,
-                base_stroke,
-                sel_glow_stroke,
-                sel_core_stroke,
-                state,
-                origin_screen,
-            );
+            match entity {
+                Entity::Group { children } => {
+                    for (c_idx, child) in children.iter().enumerate() {
+                        let ent_color = index_color_map
+                            .get(&(l_idx, e_idx, Some(c_idx)))
+                            .copied()
+                            .unwrap_or(layer_color);
+                        let base_stroke = Stroke::new(
+                            if state.color_by_cut_index { 2.0 } else { 1.5 },
+                            Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
+                        );
+                        render_entity(
+                            &painter,
+                            child,
+                            is_selected,
+                            ent_color,
+                            base_stroke,
+                            sel_glow_stroke,
+                            sel_core_stroke,
+                            state,
+                            origin_screen,
+                        );
+                    }
+                }
+                _ => {
+                    let ent_color = index_color_map
+                        .get(&(l_idx, e_idx, None))
+                        .copied()
+                        .unwrap_or(layer_color);
+                    let base_stroke = Stroke::new(
+                        if state.color_by_cut_index { 2.0 } else { 1.5 },
+                        Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
+                    );
+                    render_entity(
+                        &painter,
+                        entity,
+                        is_selected,
+                        ent_color,
+                        base_stroke,
+                        sel_glow_stroke,
+                        sel_core_stroke,
+                        state,
+                        origin_screen,
+                    );
+                }
+            }
         }
     }
 
