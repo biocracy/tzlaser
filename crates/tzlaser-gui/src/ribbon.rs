@@ -1,5 +1,5 @@
 use eframe::egui::{
-    self, Button, Color32, Frame, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
+    self, Button, Color32, Frame, Margin, RichText, Stroke, Ui, Vec2,
 };
 use std::net::SocketAddr;
 use tzlaser_core::{
@@ -144,21 +144,17 @@ pub fn render_ribbon(
 
     ui.add_space(3.0);
 
-    // 2. Ribbon Content Area with Horizontal Scrolling (Never clips on smaller screens)
+    // 2. Ribbon Content Area (Rendered directly without horizontal scrollbar)
     Frame::new()
         .fill(Color32::from_rgb(28, 30, 36))
-        .inner_margin(Margin::symmetric(6, 5))
+        .inner_margin(Margin::symmetric(6, 4))
         .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 54)))
         .show(ui, |ui| {
-            ScrollArea::horizontal()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    match state.active_tab {
-                        RibbonTab::File => render_file_tab(ui, doc, selection, history, canvas_state, status_message),
-                        RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
-                        RibbonTab::Laser => render_laser_tab(ui, state, controller, status, status_message),
-                    }
-                });
+            match state.active_tab {
+                RibbonTab::File => render_file_tab(ui, doc, selection, history, canvas_state, status_message),
+                RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
+                RibbonTab::Laser => render_laser_tab(ui, state, controller, status, status_message),
+            }
         });
 }
 
