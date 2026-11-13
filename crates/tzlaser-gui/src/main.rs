@@ -5,6 +5,7 @@ use tzlaser_core::{Document, Entity, HistoryManager, PulseConfig};
 use tzlaser_protocol::{LaserController, MachineStatus};
 
 mod canvas;
+mod layer_popup;
 mod panels;
 mod ribbon;
 mod selection_hud;
@@ -220,6 +221,14 @@ impl eframe::App for TzlaserApp {
                 self.canvas_state.bed_height_mm,
             );
         }
+
+        // 6. Floating Layer Properties & DB Pop-up Window (opened by clicking a layer in the right legend)
+        layer_popup::render_layer_popup(
+            ctx,
+            &mut self.panel_state,
+            &mut self.document,
+            &mut self.status_message,
+        );
     }
 }
 

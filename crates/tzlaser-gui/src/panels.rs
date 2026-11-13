@@ -1,6 +1,6 @@
 use egui::{Button, CollapsingHeader, Color32, Frame, Grid, ProgressBar, RichText, ScrollArea, Ui};
 use tzlaser_core::document::closest_point_on_segment;
-use tzlaser_core::{CuttingParams, Document, MaterialLibrary, MaterialPreset, MotionSegment, PulseConfig};
+use tzlaser_core::{Document, MaterialLibrary, MotionSegment, PulseConfig};
 use tzlaser_protocol::{Axis, LaserController, MachineStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,13 +45,10 @@ pub struct PanelState {
     pub paused_checkpoint: Option<PauseCheckpoint>,
     pub pause_buffer: Vec<PauseCheckpoint>,
     pub material_db: MaterialLibrary,
-    pub mat_filter: String,
-    pub mat_target_layer: usize,
-    pub layer_config_name: String,
+    pub active_layer_popup: Option<usize>,
     pub new_mat_name: String,
     pub new_mat_material: String,
     pub new_mat_thickness: f64,
-    pub new_mat_params: CuttingParams,
 }
 
 impl Default for PanelState {
@@ -74,13 +71,10 @@ impl Default for PanelState {
             paused_checkpoint: None,
             pause_buffer: Vec::new(),
             material_db: MaterialLibrary::with_default_presets(),
-            mat_filter: String::new(),
-            mat_target_layer: 0,
-            layer_config_name: String::new(),
+            active_layer_popup: None,
             new_mat_name: String::new(),
             new_mat_material: "Mild Steel".to_string(),
             new_mat_thickness: 2.0,
-            new_mat_params: CuttingParams::default(),
         }
     }
 }
@@ -1267,390 +1261,76 @@ pub fn render_right_panels(
         ui.separator();
 
         // ==========================================
-        // 3. CUTTING LAYERS (Collapsible with arrow icon)
+        // 3. CUTTING LAYERS LEGEND (Click a layer for Properties & DB Pop-up)
         // ==========================================
-        let mut speed_changed = false;
         CollapsingHeader::new(RichText::new("🎨 Cutting Layers").strong().size(14.0))
             .default_open(true)
             .show(ui, |ui| {
                 ui.add_space(2.0);
-
-                // Save / Load layer configuration files (.json)
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("💾 Save File")
-                        .on_hover_text("Save current layer parameters to a JSON file")
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Layer Config", &["json"])
-                            .set_file_name("layers_config.json")
-                            .save_file()
-                        {
-                            match MaterialLibrary::export_layers_to_file(doc, &path) {
-                                Ok(()) => {
-                                    *status_message = format!("Layer configuration saved to {}.", path.display());
-                                }
-                                Err(e) => {
-                                    *status_message = e;
-                                }
-                            }
-                        }
-                    }
-
-                    if ui
-                        .button("📂 Load File")
-                        .on_hover_text("Load layer parameters from a JSON file (preserves geometry)")
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Layer Config", &["json"])
-                            .pick_file()
-                        {
-                            match MaterialLibrary::import_layers_from_file(doc, &path) {
-                                Ok(count) => {
-                                    speed_changed = true;
-                                    *status_message = format!("Loaded {} layer config(s) from {}.", count, path.display());
-                                }
-                                Err(e) => {
-                                    *status_message = e;
-                                }
-                            }
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-
-                for (l_idx, layer) in doc.layers.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut layer.visible, "");
-                            ui.colored_label(
-                                Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b),
-                                "■",
-                            );
-                            ui.label(RichText::new(&layer.name).strong());
-                            ui.label(format!("({} profiles)", layer.entities.len()));
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                egui::ComboBox::from_id_salt(format!("layer_preset_{}", l_idx))
-                                    .selected_text("Preset")
-                                    .width(82.0)
-                                    .show_ui(ui, |ui| {
-                                        for preset in &panel_state.material_db.materials {
-                                            if ui.selectable_label(false, &preset.name).clicked() {
-                                                layer.params = preset.params.clone();
-                                                speed_changed = true;
-                                                *status_message = format!(
-                                                    "Applied '{}' to layer '{}'.",
-                                                    preset.name, layer.name
-                                                );
-                                            }
-                                        }
-                                    });
-                            });
-                        });
-
-                        Grid::new(format!("layer_grid_{}", layer.name)).num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
-                            ui.label("Speed:");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut layer.params.speed_mm_s)
-                                        .range(0.5..=2000.0)
-                                        .speed(1.0)
-                                        .suffix(" mm/s"),
-                                )
-                                .changed()
-                            {
-                                speed_changed = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("Power:");
-                            ui.add(
-                                egui::DragValue::new(&mut layer.params.power_percent)
-                                    .range(0.0..=100.0)
-                                    .speed(1.0)
-                                    .suffix(" %"),
-                            );
-                            ui.end_row();
-
-                            ui.label("Pierce:");
-                            ui.add(
-                                egui::DragValue::new(&mut layer.params.pierce_time_ms)
-                                    .range(0..=10000)
-                                    .speed(10.0)
-                                    .suffix(" ms"),
-                            );
-                            ui.end_row();
-
-                            ui.label("Gas:");
-                            egui::ComboBox::from_id_salt(format!("layer_gas_{}", l_idx))
-                                .selected_text(&layer.params.gas_type)
-                                .width(85.0)
-                                .show_ui(ui, |ui| {
-                                    for gas in ["Air", "O2", "N2", "None"] {
-                                        if ui.selectable_label(layer.params.gas_type == gas, gas).clicked() {
-                                            layer.params.gas_type = gas.to_string();
-                                        }
-                                    }
-                                });
-                            ui.end_row();
-                        });
-                    });
-                }
-            });
-
-        if speed_changed {
-            panel_state.sync_layer_speeds(doc);
-        }
-
-        ui.add_space(4.0);
-        ui.separator();
-
-        // ==========================================
-        // 4. MATERIAL LIBRARY & LAYER DB
-        // ==========================================
-        CollapsingHeader::new(RichText::new("📚 Material Library").strong().size(14.0))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.add_space(2.0);
-
-                // 4A. Saved Layer Configurations (Internal DB)
-                ui.label(RichText::new("Saved Layer Configs (DB):").strong().size(12.0));
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut panel_state.layer_config_name)
-                            .hint_text("Config name...")
-                            .desired_width(145.0),
-                    );
-                    if ui.button("💾 Save Layers").clicked() {
-                        let name = panel_state.layer_config_name.trim().to_string();
-                        if !name.is_empty() {
-                            match panel_state.material_db.save_layer_config(name.clone(), doc) {
-                                Ok(updated) => {
-                                    panel_state.layer_config_name.clear();
-                                    *status_message = if updated {
-                                        format!("Updated layer config '{}' in DB.", name)
-                                    } else {
-                                        format!("Saved layer config '{}' to DB.", name)
-                                    };
-                                }
-                                Err(e) => *status_message = e,
-                            }
-                        } else {
-                            *status_message = "Enter a name to save the layer configuration.".to_string();
-                        }
-                    }
-                });
-
-                let mut apply_cfg_idx: Option<usize> = None;
-                let mut remove_cfg_idx: Option<usize> = None;
-                if panel_state.material_db.layer_configs.is_empty() {
-                    ui.label(RichText::new("No saved layer configurations yet.").size(11.0).weak());
-                } else {
-                    for (idx, cfg) in panel_state.material_db.layer_configs.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("• {} ({} layers)", cfg.name, cfg.layers.len())).size(11.5));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("🗑").on_hover_text("Delete from DB").clicked() {
-                                    remove_cfg_idx = Some(idx);
-                                }
-                                if ui.small_button("Apply").on_hover_text("Apply saved layer parameters").clicked() {
-                                    apply_cfg_idx = Some(idx);
-                                }
-                            });
-                        });
-                    }
-                }
-                if let Some(idx) = apply_cfg_idx {
-                    if let Some(name) = panel_state.material_db.apply_layer_config(idx, doc) {
-                        panel_state.sync_layer_speeds(doc);
-                        *status_message = format!("Applied layer configuration '{}'.", name);
-                    }
-                }
-                if let Some(idx) = remove_cfg_idx {
-                    if let Err(e) = panel_state.material_db.remove_layer_config(idx) {
-                        *status_message = e;
-                    }
-                }
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                // 4B. Material Presets (Internal DB)
-                if !doc.layers.is_empty() {
-                    panel_state.mat_target_layer = panel_state.mat_target_layer.min(doc.layers.len() - 1);
-                }
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Apply to Layer:").size(11.5).strong());
-                    let target_name = doc
-                        .layers
-                        .get(panel_state.mat_target_layer)
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("None");
-                    egui::ComboBox::from_id_salt("mat_target_layer_combo")
-                        .selected_text(target_name)
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            for (i, layer) in doc.layers.iter().enumerate() {
-                                ui.selectable_value(&mut panel_state.mat_target_layer, i, &layer.name);
-                            }
-                        });
-                });
-
-                ui.add(
-                    egui::TextEdit::singleline(&mut panel_state.mat_filter)
-                        .hint_text("Search materials (e.g. Steel, N2, 3mm)...")
-                        .desired_width(f32::INFINITY),
+                ui.label(
+                    RichText::new("Click a layer to edit parameters & DB profiles:")
+                        .size(10.5)
+                        .weak(),
                 );
                 ui.add_space(3.0);
 
-                let filter_lower = panel_state.mat_filter.trim().to_lowercase();
-                let mut apply_mat_idx: Option<usize> = None;
-                let mut remove_mat_idx: Option<usize> = None;
+                for (l_idx, layer) in doc.layers.iter_mut().enumerate() {
+                    let is_open = panel_state.active_layer_popup == Some(l_idx);
+                    let row_fill = if is_open {
+                        Color32::from_rgb(35, 45, 58)
+                    } else {
+                        Color32::from_rgb(28, 30, 36)
+                    };
+                    let row_stroke = if is_open {
+                        egui::Stroke::new(1.0, Color32::from_rgb(80, 175, 235))
+                    } else {
+                        egui::Stroke::new(1.0, Color32::from_rgb(44, 47, 56))
+                    };
 
-                ScrollArea::vertical()
-                    .id_salt("material_presets_scroll")
-                    .max_height(190.0)
-                    .show(ui, |ui| {
-                        for (idx, mat) in panel_state.material_db.materials.iter().enumerate() {
-                            if !filter_lower.is_empty()
-                                && !mat.name.to_lowercase().contains(&filter_lower)
-                                && !mat.material.to_lowercase().contains(&filter_lower)
-                                && !mat.params.gas_type.to_lowercase().contains(&filter_lower)
-                            {
-                                continue;
-                            }
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&mat.name).size(11.5).strong());
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("🗑").on_hover_text("Delete preset from DB").clicked() {
-                                            remove_mat_idx = Some(idx);
-                                        }
-                                        if ui.small_button("Apply").on_hover_text("Apply preset to target layer").clicked() {
-                                            apply_mat_idx = Some(idx);
-                                        }
-                                    });
-                                });
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{:.1} mm/s  |  {:.0}%  |  {} ms  |  {}",
-                                        mat.params.speed_mm_s,
-                                        mat.params.power_percent,
-                                        mat.params.pierce_time_ms,
-                                        mat.params.gas_type
-                                    ))
-                                    .size(10.5)
-                                    .color(Color32::from_rgb(175, 195, 215)),
+                    Frame::group(ui.style())
+                        .fill(row_fill)
+                        .stroke(row_stroke)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut layer.visible, "");
+                                let swatch_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
+                                let summary = format!(
+                                    "{} paths · {:.0} mm/s · {:.0}% · {}",
+                                    layer.entities.len(),
+                                    layer.params.speed_mm_s,
+                                    layer.params.power_percent,
+                                    layer.params.gas_type
                                 );
-                            });
-                        }
-                    });
+                                let btn = Button::new(
+                                    RichText::new(format!("■  {}", layer.name))
+                                        .color(swatch_color)
+                                        .strong()
+                                        .size(12.5),
+                                )
+                                .frame(false);
+                                let clicked = ui
+                                    .add(btn)
+                                    .on_hover_text("Click to open Layer Properties & Material DB pop-up")
+                                    .clicked();
 
-                if let Some(idx) = apply_mat_idx {
-                    if let (Some(mat), Some(layer)) = (
-                        panel_state.material_db.materials.get(idx),
-                        doc.layers.get_mut(panel_state.mat_target_layer),
-                    ) {
-                        layer.params = mat.params.clone();
-                        let mat_name = mat.name.clone();
-                        let layer_name = layer.name.clone();
-                        panel_state.sync_layer_speeds(doc);
-                        *status_message = format!("Applied '{}' to layer '{}'.", mat_name, layer_name);
-                    }
-                }
-                if let Some(idx) = remove_mat_idx {
-                    if let Err(e) = panel_state.material_db.remove_material(idx) {
-                        *status_message = e;
-                    }
-                }
-
-                ui.add_space(4.0);
-                CollapsingHeader::new(RichText::new("➕ Add / Update Material Preset").size(12.0).strong())
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if ui.small_button("📥 Copy Params from Target Layer").clicked() {
-                            if let Some(layer) = doc.layers.get(panel_state.mat_target_layer) {
-                                panel_state.new_mat_params = layer.params.clone();
-                                if panel_state.new_mat_name.trim().is_empty() {
-                                    panel_state.new_mat_name = format!(
-                                        "{} {:.1}mm ({})",
-                                        panel_state.new_mat_material,
-                                        panel_state.new_mat_thickness,
-                                        panel_state.new_mat_params.gas_type
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(summary)
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(175, 185, 200)),
                                     );
-                                }
-                            }
-                        }
-
-                        Grid::new("new_material_grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
-                            ui.label("Name:");
-                            ui.text_edit_singleline(&mut panel_state.new_mat_name);
-                            ui.end_row();
-
-                            ui.label("Material:");
-                            ui.text_edit_singleline(&mut panel_state.new_mat_material);
-                            ui.end_row();
-
-                            ui.label("Thick:");
-                            ui.add(egui::DragValue::new(&mut panel_state.new_mat_thickness).range(0.0..=100.0).speed(0.5).suffix(" mm"));
-                            ui.end_row();
-
-                            ui.label("Speed:");
-                            ui.add(egui::DragValue::new(&mut panel_state.new_mat_params.speed_mm_s).range(0.5..=2000.0).speed(1.0).suffix(" mm/s"));
-                            ui.end_row();
-
-                            ui.label("Power:");
-                            ui.add(egui::DragValue::new(&mut panel_state.new_mat_params.power_percent).range(0.0..=100.0).speed(1.0).suffix(" %"));
-                            ui.end_row();
-
-                            ui.label("Pierce:");
-                            ui.add(egui::DragValue::new(&mut panel_state.new_mat_params.pierce_time_ms).range(0..=10000).speed(10.0).suffix(" ms"));
-                            ui.end_row();
-
-                            ui.label("Gas:");
-                            egui::ComboBox::from_id_salt("new_mat_gas")
-                                .selected_text(&panel_state.new_mat_params.gas_type)
-                                .width(85.0)
-                                .show_ui(ui, |ui| {
-                                    for gas in ["Air", "O2", "N2", "None"] {
-                                        if ui.selectable_label(panel_state.new_mat_params.gas_type == gas, gas).clicked() {
-                                            panel_state.new_mat_params.gas_type = gas.to_string();
-                                        }
-                                    }
                                 });
-                            ui.end_row();
-                        });
 
-                        if ui.button("💾 Save Preset to DB").clicked() {
-                            let name = panel_state.new_mat_name.trim().to_string();
-                            if name.is_empty() {
-                                *status_message = "Please enter a preset name.".to_string();
-                            } else {
-                                let preset = MaterialPreset {
-                                    name: name.clone(),
-                                    material: panel_state.new_mat_material.trim().to_string(),
-                                    thickness_mm: panel_state.new_mat_thickness,
-                                    params: panel_state.new_mat_params.clone(),
-                                    notes: String::new(),
-                                };
-                                match panel_state.material_db.upsert_material(preset) {
-                                    Ok(updated) => {
-                                        *status_message = if updated {
-                                            format!("Updated material '{}' in DB.", name)
-                                        } else {
-                                            format!("Saved material '{}' to DB.", name)
-                                        };
+                                if clicked {
+                                    if is_open {
+                                        panel_state.active_layer_popup = None;
+                                    } else {
+                                        panel_state.active_layer_popup = Some(l_idx);
                                     }
-                                    Err(e) => *status_message = e,
                                 }
-                            }
-                        }
-                    });
+                            });
+                        });
+                }
             });
     });
 }
