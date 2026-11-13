@@ -312,9 +312,42 @@ fn render_profiles_tab(
     status_message: &mut String,
 ) {
     ui.horizontal(|ui| {
-        // 1. Structure & Classification (Most critical for DXF CAM!)
-        ribbon_group(ui, "Structure & Group", |ui| {
-            let classify_btn = Button::new(RichText::new("⚡ Auto-Classify").size(12.0).color(Color32::from_rgb(100, 220, 255)).strong())
+        // 1. Cut Toolpath Overlays (Cut Index & Cut Direction Toggles)
+        ribbon_group(ui, "Cut Overlays", |ui| {
+            let order_label = if canvas_state.show_cut_order {
+                RichText::new("🔢 Cut Index: ON").size(12.5).color(Color32::from_rgb(0, 230, 255)).strong()
+            } else {
+                RichText::new("🔢 Cut Index: OFF").size(12.5).color(Color32::from_rgb(170, 175, 185))
+            };
+            let order_bg = if canvas_state.show_cut_order {
+                Color32::from_rgb(20, 65, 95)
+            } else {
+                Color32::from_rgb(38, 42, 50)
+            };
+            if ui.add(Button::new(order_label).fill(order_bg)).on_hover_text("Toggle visibility of cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
+                canvas_state.show_cut_order = !canvas_state.show_cut_order;
+            }
+
+            let dir_label = if canvas_state.show_cut_direction {
+                RichText::new("🧭 Direction: ON").size(12.5).color(Color32::from_rgb(0, 255, 120)).strong()
+            } else {
+                RichText::new("🧭 Direction: OFF").size(12.5).color(Color32::from_rgb(170, 175, 185))
+            };
+            let dir_bg = if canvas_state.show_cut_direction {
+                Color32::from_rgb(20, 65, 45)
+            } else {
+                Color32::from_rgb(38, 42, 50)
+            };
+            if ui.add(Button::new(dir_label).fill(dir_bg)).on_hover_text("Toggle visibility of cut direction arrowheads along profile toolpaths").clicked() {
+                canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // 2. Classification & Toolpath Optimization
+        ribbon_group(ui, "Classification & Sequence", |ui| {
+            let classify_btn = Button::new(RichText::new("⚡ Auto-Classify").size(12.5).color(Color32::from_rgb(100, 220, 255)).strong())
                 .fill(Color32::from_rgb(25, 48, 70));
             if ui.add(classify_btn).on_hover_text("Auto-segregate Outer Profiles, Interior Holes, and Bend Lines").clicked() {
                 history.record(doc, selection, "Auto-Classify");
@@ -323,56 +356,9 @@ fn render_profiles_tab(
                 *status_message = format!("Auto-classified {} layers: {}", doc.layers.len(), doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
             }
 
-            let group_enabled = selection.len() > 1;
-            let group_btn = Button::new(RichText::new("🔗 Group").size(12.0).color(if group_enabled { Color32::from_rgb(100, 220, 255) } else { Color32::GRAY }))
-                .fill(Color32::from_rgb(24, 45, 65));
-            if ui.add_enabled(group_enabled, group_btn).on_hover_text("Lock selected profiles into a single compound object (Cmd+G)").clicked() {
-                history.record(doc, selection, "Group Profiles");
-                doc.group_selection(selection);
-            }
-
-            let has_group = doc.selection_has_group(selection);
-            let ungroup_btn = Button::new(RichText::new("🔓 Ungroup").size(12.0).color(if has_group { Color32::from_rgb(255, 190, 70) } else { Color32::GRAY }))
-                .fill(Color32::from_rgb(45, 38, 25));
-            if ui.add_enabled(has_group, ungroup_btn).on_hover_text("Break compound group back into individual profiles (Cmd+Shift+G)").clicked() {
-                history.record(doc, selection, "Ungroup Profiles");
-                doc.ungroup_selection(selection);
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // 2. Cut Toolpath & Ordering
-        ribbon_group(ui, "Cut Toolpath", |ui| {
-            let order_bg = if canvas_state.show_cut_order {
-                Color32::from_rgb(20, 65, 95)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            let order_color = if canvas_state.show_cut_order {
-                Color32::from_rgb(0, 225, 255)
-            } else {
-                Color32::WHITE
-            };
-            if ui.add(Button::new(RichText::new("🔢 Cut Order").size(12.0).color(order_color)).fill(order_bg)).on_hover_text("Toggle cut sequence number badges and pierce start markers").clicked() {
-                canvas_state.show_cut_order = !canvas_state.show_cut_order;
-            }
-
-            let dir_bg = if canvas_state.show_cut_direction {
-                Color32::from_rgb(20, 65, 45)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            let dir_color = if canvas_state.show_cut_direction {
-                Color32::from_rgb(0, 255, 120)
-            } else {
-                Color32::WHITE
-            };
-            if ui.add(Button::new(RichText::new("🧭 Direction").size(12.0).color(dir_color)).fill(dir_bg)).on_hover_text("Toggle cut direction arrowheads along toolpath").clicked() {
-                canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
-            }
-
-            if ui.add(Button::new(RichText::new("⚡ Optimize").size(12.0).color(Color32::from_rgb(255, 215, 0))).fill(Color32::from_rgb(45, 40, 22))).on_hover_text("Greedy nearest-neighbor TSP optimizer ensuring bend lines → interior holes → outer contours").clicked() {
+            let opt_btn = Button::new(RichText::new("⚡ Optimize Path").size(12.5).color(Color32::from_rgb(255, 215, 0)))
+                .fill(Color32::from_rgb(45, 40, 22));
+            if ui.add(opt_btn).on_hover_text("Greedy nearest-neighbor TSP optimizer: Bend lines → Interior holes → Outer contours").clicked() {
                 let seq = doc.compute_cut_sequence();
                 *status_message = format!("Toolpath sequence optimized: {} pierce cuts planned (bends → holes → perimeters).", seq.len());
             }
