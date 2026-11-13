@@ -110,50 +110,6 @@ pub fn render_ribbon(
             }
         }
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Quick CAM Toggles (Always visible regardless of active tab)
-        let order_bg = if canvas_state.show_cut_order {
-            Color32::from_rgb(20, 65, 95)
-        } else {
-            Color32::from_rgb(34, 38, 46)
-        };
-        let order_color = if canvas_state.show_cut_order {
-            Color32::from_rgb(0, 225, 255)
-        } else {
-            Color32::from_rgb(190, 195, 205)
-        };
-        if ui.add(Button::new(RichText::new("🔢 Cut Order").size(11.5).color(order_color)).fill(order_bg))
-            .on_hover_text("Toggle cut sequence number badges and pierce start markers").clicked() {
-            canvas_state.show_cut_order = !canvas_state.show_cut_order;
-        }
-
-        let dir_bg = if canvas_state.show_cut_direction {
-            Color32::from_rgb(20, 65, 45)
-        } else {
-            Color32::from_rgb(34, 38, 46)
-        };
-        let dir_color = if canvas_state.show_cut_direction {
-            Color32::from_rgb(0, 255, 120)
-        } else {
-            Color32::from_rgb(190, 195, 205)
-        };
-        if ui.add(Button::new(RichText::new("🧭 Direction").size(11.5).color(dir_color)).fill(dir_bg))
-            .on_hover_text("Toggle cut direction arrowheads along toolpath").clicked() {
-            canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
-        }
-
-        let classify_btn = Button::new(RichText::new("⚡ Auto-Classify").size(11.5).color(Color32::from_rgb(100, 220, 255)))
-            .fill(Color32::from_rgb(25, 45, 65));
-        if ui.add(classify_btn).on_hover_text("Auto-segregate Outer Profiles, Interior Holes, and Bend Lines").clicked() {
-            history.record(doc, selection, "Auto-Classify");
-            doc.auto_classify_profiles();
-            selection.clear();
-            *status_message = format!("Auto-classified {} layers: {}", doc.layers.len(), doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
-        }
-
         // Right Aligned: Hardware Connection Badge
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(ref c) = controller {
@@ -280,29 +236,6 @@ fn render_file_tab(
                 *doc = Document::new();
                 selection.clear();
                 *status_message = "New job created. Workspace cleared.".to_string();
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // Immediate CAM Actions on Import
-        ribbon_group(ui, "Quick CAM", |ui| {
-            let classify_btn = Button::new(RichText::new("⚡ Auto-Classify").size(12.0).color(Color32::from_rgb(100, 220, 255)))
-                .fill(Color32::from_rgb(25, 45, 65));
-            if ui.add(classify_btn).on_hover_text("Auto-segregate Outer Profiles, Interior Holes, and Bend Lines").clicked() {
-                history.record(doc, selection, "Auto-Classify");
-                doc.auto_classify_profiles();
-                selection.clear();
-                *status_message = format!("Auto-classified {} layers: {}", doc.layers.len(), doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
-            }
-
-            let order_bg = if canvas_state.show_cut_order {
-                Color32::from_rgb(20, 65, 95)
-            } else {
-                Color32::from_rgb(40, 45, 55)
-            };
-            if ui.add(Button::new(RichText::new("🔢 Cut Order").size(12.0)).fill(order_bg)).clicked() {
-                canvas_state.show_cut_order = !canvas_state.show_cut_order;
             }
         });
 

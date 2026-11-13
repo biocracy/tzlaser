@@ -23,3 +23,4 @@ cargo run -p tzlaser-gui
 ```bash
 cargo test --workspace
 ```
+
