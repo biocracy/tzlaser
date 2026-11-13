@@ -68,8 +68,22 @@ impl eframe::App for TzlaserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll status from background thread if connected
         if let Some(ref c) = self.controller {
-            self.status = c.get_status();
+            if c.is_connected() {
+                self.status = c.get_status();
+            }
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+
+        // Advance active Start / Dry-Cut simulation along toolpaths
+        if self.panel_state.run_mode != panels::RunMode::Idle && !self.panel_state.is_paused {
+            if let Some(done_msg) = self.panel_state.tick_simulation(
+                &self.controller,
+                &mut self.status,
+                &self.pulse_config,
+            ) {
+                self.status_message = done_msg;
+            }
+            ctx.request_repaint();
         }
 
         // Global Keyboard Shortcuts: Cmd+Z (Undo) and Cmd+Shift+Z / Cmd+Y (Redo)
@@ -142,9 +156,10 @@ impl eframe::App for TzlaserApp {
                     ui,
                     &mut self.panel_state,
                     &self.controller,
-                    &self.status,
+                    &mut self.status,
                     &self.pulse_config,
                     &mut self.document,
+                    &mut self.status_message,
                 );
             });
 
@@ -161,6 +176,8 @@ impl eframe::App for TzlaserApp {
                 &mut self.selection,
                 &mut self.history,
                 laser_pos,
+                self.panel_state.run_mode == panels::RunMode::DryCut,
+                self.status.laser_on,
             );
         });
 

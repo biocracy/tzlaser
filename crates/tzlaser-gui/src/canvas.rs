@@ -398,6 +398,8 @@ pub fn render_canvas(
     selection: &mut Vec<(usize, usize)>,
     history: &mut HistoryManager,
     laser_pos_mm: Point,
+    is_dry_cut: bool,
+    laser_on: bool,
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
     state.last_viewport_size = response.rect.size();
@@ -782,8 +784,23 @@ pub fn render_canvas(
 
     // 10. Render Physical Laser Head Position Crosshair
     let head_pos = state.world_to_screen(laser_pos_mm, origin_screen);
-    let cross_len = 12.0;
-    let cross_color = Color32::from_rgb(255, 50, 50);
+    let cross_len = 13.0;
+    let cross_color = if laser_on {
+        Color32::from_rgb(255, 85, 30)
+    } else if is_dry_cut {
+        Color32::from_rgb(0, 235, 255)
+    } else {
+        Color32::from_rgb(255, 50, 50)
+    };
+
+    if laser_on {
+        painter.circle_filled(head_pos, 5.5, Color32::from_rgba_unmultiplied(255, 190, 60, 140));
+        painter.circle_stroke(head_pos, 12.0, Stroke::new(2.0, Color32::from_rgb(255, 110, 40)));
+    } else if is_dry_cut {
+        painter.circle_stroke(head_pos, 11.0, Stroke::new(2.0, Color32::from_rgb(0, 235, 255)));
+        painter.circle_filled(head_pos, 3.0, Color32::from_rgb(0, 255, 160));
+    }
+
     painter.line_segment(
         [Pos2::new(head_pos.x - cross_len, head_pos.y), Pos2::new(head_pos.x + cross_len, head_pos.y)],
         Stroke::new(2.0, cross_color),
@@ -792,7 +809,11 @@ pub fn render_canvas(
         [Pos2::new(head_pos.x, head_pos.y - cross_len), Pos2::new(head_pos.x, head_pos.y + cross_len)],
         Stroke::new(2.0, cross_color),
     );
-    painter.circle_stroke(head_pos, 8.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 50, 50, 150)));
+    painter.circle_stroke(
+        head_pos,
+        8.0,
+        Stroke::new(1.2, cross_color.linear_multiply(0.75)),
+    );
 
     response
 }

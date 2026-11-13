@@ -161,6 +161,65 @@ impl Entity {
         }
     }
 
+    /// Sample ordered polyline waypoints along the entity for motion execution and dry-cut simulation.
+    pub fn sample_points(&self) -> Vec<Point> {
+        match self {
+            Entity::Line { start, end } => vec![*start, *end],
+            Entity::Polyline { points, closed } => {
+                let mut pts = points.clone();
+                if *closed && pts.len() >= 2 {
+                    pts.push(pts[0]);
+                }
+                pts
+            }
+            Entity::Circle { center, radius } => {
+                let segments = 64usize;
+                let mut pts = Vec::with_capacity(segments + 1);
+                for i in 0..=segments {
+                    let ang = if i == segments {
+                        0.0
+                    } else {
+                        std::f64::consts::TAU * (i as f64) / (segments as f64)
+                    };
+                    pts.push(Point::new(
+                        center.x + radius * ang.cos(),
+                        center.y + radius * ang.sin(),
+                    ));
+                }
+                pts
+            }
+            Entity::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                let segments = 32usize;
+                let s = *start_angle;
+                let mut e = *end_angle;
+                if e < s {
+                    e += 360.0;
+                }
+                let mut pts = Vec::with_capacity(segments + 1);
+                for i in 0..=segments {
+                    let ang = (s + (e - s) * (i as f64) / (segments as f64)).to_radians();
+                    pts.push(Point::new(
+                        center.x + radius * ang.cos(),
+                        center.y + radius * ang.sin(),
+                    ));
+                }
+                pts
+            }
+            Entity::Group { children } => {
+                let mut pts = Vec::new();
+                for child in children {
+                    pts.extend(child.sample_points());
+                }
+                pts
+            }
+        }
+    }
+
     /// Approximate 2D area (positive for closed shapes, 0 for open shapes)
     pub fn area(&self) -> f64 {
         match self {
@@ -1514,6 +1573,90 @@ impl Document {
             result.push(next_cut);
         }
     }
+
+    /// Build ordered rapid and cutting motion segments across the document's active cut sequence,
+    /// starting from `start_origin` and returning to `start_origin` at the end.
+    pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
+        let seq = self.compute_cut_sequence();
+        let rapid_speed = rapid_speed_mm_s.max(10.0);
+        let mut segments = Vec::new();
+        let mut current_pos = start_origin;
+
+        for (idx, info) in seq.iter().enumerate() {
+            let Some(layer) = self.layers.get(info.layer_idx) else { continue; };
+            let Some(entity) = layer.entities.get(info.entity_idx) else { continue; };
+            let target = match (entity, info.child_idx) {
+                (Entity::Group { children }, Some(c_idx)) => match children.get(c_idx) {
+                    Some(c) => c,
+                    None => continue,
+                },
+                _ => entity,
+            };
+
+            let cut_speed = layer.params.speed_mm_s.max(5.0);
+            let pts = target.sample_points();
+            if pts.len() < 2 {
+                continue;
+            }
+
+            let path_index_1based = idx + 1;
+            let rapid_len = (pts[0].x - current_pos.x).hypot(pts[0].y - current_pos.y);
+            if rapid_len > 1e-4 {
+                segments.push(MotionSegment {
+                    start: current_pos,
+                    end: pts[0],
+                    length_mm: rapid_len,
+                    speed_mm_s: rapid_speed,
+                    is_rapid: true,
+                    path_index_1based,
+                });
+            }
+
+            for pair in pts.windows(2) {
+                let seg_len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+                if seg_len > 1e-6 {
+                    segments.push(MotionSegment {
+                        start: pair[0],
+                        end: pair[1],
+                        length_mm: seg_len,
+                        speed_mm_s: cut_speed,
+                        is_rapid: false,
+                        path_index_1based,
+                    });
+                }
+            }
+
+            if let Some(&end_pt) = pts.last() {
+                current_pos = end_pt;
+            }
+        }
+
+        if !segments.is_empty() {
+            let return_len = (start_origin.x - current_pos.x).hypot(start_origin.y - current_pos.y);
+            if return_len > 1e-4 {
+                segments.push(MotionSegment {
+                    start: current_pos,
+                    end: start_origin,
+                    length_mm: return_len,
+                    speed_mm_s: rapid_speed,
+                    is_rapid: true,
+                    path_index_1based: seq.len(),
+                });
+            }
+        }
+
+        segments
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionSegment {
+    pub start: Point,
+    pub end: Point,
+    pub length_mm: f64,
+    pub speed_mm_s: f64,
+    pub is_rapid: bool,
+    pub path_index_1based: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2052,5 +2195,41 @@ mod tests {
         assert!(doc.use_saved_cut_order);
         let restored_starts: Vec<f64> = doc.compute_cut_sequence().iter().map(|p| p.start_point.x).collect();
         assert_eq!(restored_starts, vec![155.0, 25.0, 0.0]);
+    }
+
+    #[test]
+    fn test_build_motion_trajectory_for_dry_cut() {
+        let mut doc = Document::default();
+        let mut outer = Layer::new("Outer Profiles", Color::GREEN);
+        outer.entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(10.0, 10.0),
+                Point::new(110.0, 10.0),
+                Point::new(110.0, 60.0),
+                Point::new(10.0, 60.0),
+            ],
+            closed: true,
+        });
+        let mut inner = Layer::new("Interior Profiles", Color::YELLOW);
+        inner.entities.push(Entity::Circle {
+            center: Point::new(50.0, 35.0),
+            radius: 10.0,
+        });
+        doc.layers = vec![outer, inner];
+
+        let origin = Point::ORIGIN;
+        let traj = doc.build_motion_trajectory(origin, 200.0);
+        assert!(!traj.is_empty());
+
+        // Starts at origin and returns to origin
+        assert_eq!(traj.first().unwrap().start, origin);
+        assert!(traj.first().unwrap().is_rapid);
+        assert_eq!(traj.last().unwrap().end, origin);
+        assert!(traj.last().unwrap().is_rapid);
+
+        // Path 1 is the interior circle (start at x=60, y=35), Path 2 is outer box (4 cutting segments)
+        let cut_segs: Vec<&MotionSegment> = traj.iter().filter(|s| !s.is_rapid).collect();
+        assert_eq!(cut_segs.iter().filter(|s| s.path_index_1based == 1).count(), 64);
+        assert_eq!(cut_segs.iter().filter(|s| s.path_index_1based == 2).count(), 4);
     }
 }
