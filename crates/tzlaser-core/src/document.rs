@@ -427,6 +427,8 @@ pub struct Document {
     pub layers: Vec<Layer>,
     #[serde(default)]
     pub sort_mode: SortMode,
+    #[serde(default)]
+    pub manual_sequence: Vec<(usize, usize)>,
 }
 
 impl Default for Document {
@@ -443,6 +445,7 @@ impl Document {
                 Layer::new("Mark / Engrave", Color::BLUE),
             ],
             sort_mode: SortMode::default(),
+            manual_sequence: Vec::new(),
         }
     }
 
@@ -589,6 +592,7 @@ impl Document {
 
     /// Delete selected entities from the document.
     pub fn delete_selection(&mut self, selection: &[(usize, usize)]) {
+        self.manual_sequence.clear();
         let mut to_remove: HashMap<usize, Vec<usize>> = HashMap::new();
         for &(l, e) in selection {
             to_remove.entry(l).or_default().push(e);
@@ -700,6 +704,7 @@ impl Document {
 
     /// Auto-detects and classifies profiles into Outer Profiles, Interior Profiles, and Bend / Open Lines.
     pub fn auto_classify_profiles(&mut self) {
+        self.manual_sequence.clear();
         let mut all_entities = Vec::new();
         for layer in self.layers.drain(..) {
             all_entities.extend(layer.entities);
@@ -858,8 +863,26 @@ impl Document {
 
         match mode {
             SortMode::Manual => {
-                // Exact layer order & entity index order
-                raw_paths
+                if self.manual_sequence.is_empty() {
+                    raw_paths
+                } else {
+                    let mut result = Vec::with_capacity(raw_paths.len());
+                    let mut used = vec![false; raw_paths.len()];
+                    for &(l_idx, e_idx) in &self.manual_sequence {
+                        for (i, item) in raw_paths.iter().enumerate() {
+                            if !used[i] && item.layer_idx == l_idx && item.entity_idx == e_idx {
+                                result.push(*item);
+                                used[i] = true;
+                            }
+                        }
+                    }
+                    for (i, item) in raw_paths.into_iter().enumerate() {
+                        if !used[i] {
+                            result.push(item);
+                        }
+                    }
+                    result
+                }
             }
             SortMode::LeftToRight => {
                 raw_paths.sort_by(|a, b| a.start_point.x.partial_cmp(&b.start_point.x).unwrap_or(std::cmp::Ordering::Equal));
@@ -926,6 +949,7 @@ impl Document {
     pub fn apply_sort_order(&mut self, mode: SortMode) {
         self.sort_mode = mode;
         let seq = self.compute_cut_sequence_with_mode(mode);
+        self.manual_sequence.clear();
 
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             let mut ordered_entities = Vec::with_capacity(layer.entities.len());
@@ -946,6 +970,24 @@ impl Document {
             }
             layer.entities = ordered_entities;
         }
+    }
+
+    /// Assigns a specific 1-based cut order index to `(layer_idx, entity_idx)` in manual sort mode.
+    pub fn assign_manual_cut_index(&mut self, layer_idx: usize, entity_idx: usize, target_1based: usize) {
+        self.sort_mode = SortMode::Manual;
+        if self.manual_sequence.is_empty() {
+            let current = self.compute_cut_sequence_with_mode(SortMode::Manual);
+            for info in current {
+                let pair = (info.layer_idx, info.entity_idx);
+                if !self.manual_sequence.contains(&pair) {
+                    self.manual_sequence.push(pair);
+                }
+            }
+        }
+
+        self.manual_sequence.retain(|&p| p != (layer_idx, entity_idx));
+        let insert_pos = target_1based.saturating_sub(1).min(self.manual_sequence.len());
+        self.manual_sequence.insert(insert_pos, (layer_idx, entity_idx));
     }
 
     /// Move selected entities earlier in their layer entity sequence (for manual order adjustments).
@@ -1295,5 +1337,13 @@ mod tests {
         doc.apply_sort_order(SortMode::OpenFirst);
         // Entity at index 0 in layer must now be the open line
         assert!(!doc.layers[0].entities[0].is_closed());
+
+        // 5. Interactive manual cut index assignment
+        doc.assign_manual_cut_index(0, 2, 1); // Put 3rd entity at index #1
+        doc.assign_manual_cut_index(0, 1, 2); // Put 2nd entity at index #2
+        let manual_seq = doc.compute_cut_sequence_with_mode(SortMode::Manual);
+        assert_eq!(manual_seq[0].entity_idx, 2);
+        assert_eq!(manual_seq[1].entity_idx, 1);
+        assert_eq!(manual_seq[2].entity_idx, 0);
     }
 }

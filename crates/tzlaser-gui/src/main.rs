@@ -164,16 +164,18 @@ impl eframe::App for TzlaserApp {
             );
         });
 
-        // 5. Floating Selection Coordinates & D-Pad Nudge Pop-up Window
-        render_selection_hud(
-            ctx,
-            &mut self.hud_state,
-            &mut self.document,
-            &mut self.selection,
-            &mut self.history,
-            self.canvas_state.bed_width_mm,
-            self.canvas_state.bed_height_mm,
-        );
+        // 5. Floating Selection Coordinates & D-Pad Nudge Pop-up Window (hidden during interactive manual sort)
+        if !self.canvas_state.manual_sort_active {
+            render_selection_hud(
+                ctx,
+                &mut self.hud_state,
+                &mut self.document,
+                &mut self.selection,
+                &mut self.history,
+                self.canvas_state.bed_width_mm,
+                self.canvas_state.bed_height_mm,
+            );
+        }
     }
 }
 

@@ -1,6 +1,132 @@
 use egui::{Color32, Key, PointerButton, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
 use kurbo::Point;
+use std::collections::HashMap;
 use tzlaser_core::{Document, Entity, HistoryManager};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorPalette {
+    Rainbow,
+    Thermal,
+    HighContrast,
+    OceanDepth,
+    MonochromeFade,
+}
+
+impl ColorPalette {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ColorPalette::Rainbow => "🌈 Rainbow",
+            ColorPalette::Thermal => "🔥 Thermal",
+            ColorPalette::HighContrast => "🎯 High Contrast",
+            ColorPalette::OceanDepth => "🌊 Ocean",
+            ColorPalette::MonochromeFade => "💎 Cyan Fade",
+        }
+    }
+
+    pub fn color_for_index(&self, idx: usize, total: usize) -> Color32 {
+        let t = if total <= 1 {
+            0.0
+        } else {
+            (idx as f32 / (total - 1) as f32).clamp(0.0, 1.0)
+        };
+
+        match self {
+            ColorPalette::Rainbow => {
+                // Smooth HSV spectrum from Red (0°) through Yellow/Green/Cyan/Blue to Violet (290°)
+                let hue = t * 290.0;
+                hsv_to_color32(hue, 0.92, 1.0)
+            }
+            ColorPalette::Thermal => {
+                // Cool Blue -> Cyan -> Green -> Yellow -> Hot Red
+                let stops = [
+                    (40.0, 130.0, 255.0),
+                    (0.0, 230.0, 255.0),
+                    (60.0, 240.0, 110.0),
+                    (255.0, 220.0, 40.0),
+                    (255.0, 55.0, 55.0),
+                ];
+                lerp_gradient(&stops, t)
+            }
+            ColorPalette::HighContrast => {
+                const PALETTE: [Color32; 12] = [
+                    Color32::from_rgb(0, 230, 255),
+                    Color32::from_rgb(255, 215, 0),
+                    Color32::from_rgb(255, 70, 160),
+                    Color32::from_rgb(80, 255, 110),
+                    Color32::from_rgb(255, 130, 40),
+                    Color32::from_rgb(150, 110, 255),
+                    Color32::from_rgb(0, 255, 200),
+                    Color32::from_rgb(255, 80, 80),
+                    Color32::from_rgb(190, 255, 60),
+                    Color32::from_rgb(100, 170, 255),
+                    Color32::from_rgb(255, 160, 220),
+                    Color32::from_rgb(255, 255, 255),
+                ];
+                PALETTE[idx % PALETTE.len()]
+            }
+            ColorPalette::OceanDepth => {
+                let stops = [
+                    (120.0, 255.0, 235.0),
+                    (0.0, 200.0, 255.0),
+                    (45.0, 115.0, 255.0),
+                    (155.0, 75.0, 255.0),
+                ];
+                lerp_gradient(&stops, t)
+            }
+            ColorPalette::MonochromeFade => {
+                let stops = [
+                    (235.0, 250.0, 255.0),
+                    (60.0, 210.0, 255.0),
+                    (65.0, 110.0, 180.0),
+                ];
+                lerp_gradient(&stops, t)
+            }
+        }
+    }
+}
+
+fn lerp_gradient(stops: &[(f32, f32, f32)], t: f32) -> Color32 {
+    if stops.is_empty() {
+        return Color32::WHITE;
+    }
+    if stops.len() == 1 {
+        return Color32::from_rgb(stops[0].0 as u8, stops[0].1 as u8, stops[0].2 as u8);
+    }
+    let scaled = t * (stops.len() - 1) as f32;
+    let i = (scaled.floor() as usize).min(stops.len() - 2);
+    let frac = scaled - i as f32;
+    let (r0, g0, b0) = stops[i];
+    let (r1, g1, b1) = stops[i + 1];
+    Color32::from_rgb(
+        (r0 + (r1 - r0) * frac) as u8,
+        (g0 + (g1 - g0) * frac) as u8,
+        (b0 + (b1 - b0) * frac) as u8,
+    )
+}
+
+fn hsv_to_color32(h_deg: f32, s: f32, v: f32) -> Color32 {
+    let c = v * s;
+    let x = c * (1.0 - ((h_deg / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h_deg < 60.0 {
+        (c, x, 0.0)
+    } else if h_deg < 120.0 {
+        (x, c, 0.0)
+    } else if h_deg < 180.0 {
+        (0.0, c, x)
+    } else if h_deg < 240.0 {
+        (0.0, x, c)
+    } else if h_deg < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    Color32::from_rgb(
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
 
 pub struct CanvasState {
     pub pan: Vec2,          // Pan offset in screen pixels
@@ -13,6 +139,11 @@ pub struct CanvasState {
     pub box_select_current: Option<Point>,
     pub show_cut_order: bool,
     pub show_cut_direction: bool,
+    pub color_by_cut_index: bool,
+    pub color_palette: ColorPalette,
+    pub manual_sort_active: bool,
+    pub manual_sort_next_index: usize,
+    pub last_viewport_size: Vec2,
 }
 
 impl Default for CanvasState {
@@ -28,11 +159,38 @@ impl Default for CanvasState {
             box_select_current: None,
             show_cut_order: true,
             show_cut_direction: true,
+            color_by_cut_index: false,
+            color_palette: ColorPalette::Rainbow,
+            manual_sort_active: false,
+            manual_sort_next_index: 1,
+            last_viewport_size: Vec2::new(800.0, 600.0),
         }
     }
 }
 
 impl CanvasState {
+    pub fn fit_view_to_doc(&mut self, doc: &Document) {
+        let bounds = doc.bounding_box().unwrap_or_else(|| {
+            kurbo::Rect::new(0.0, 0.0, self.bed_width_mm as f64, self.bed_height_mm as f64)
+        });
+
+        let obj_w = (bounds.width() as f32).max(10.0);
+        let obj_h = (bounds.height() as f32).max(10.0);
+        let vp_w = self.last_viewport_size.x.max(100.0);
+        let vp_h = self.last_viewport_size.y.max(100.0);
+
+        let zoom_x = (vp_w * 0.85) / obj_w;
+        let zoom_y = (vp_h * 0.85) / obj_h;
+        self.zoom = zoom_x.min(zoom_y).clamp(0.05, 50.0);
+
+        let cx = ((bounds.min_x() + bounds.max_x()) / 2.0) as f32;
+        let cy = ((bounds.min_y() + bounds.max_y()) / 2.0) as f32;
+        self.pan = Vec2::new(
+            vp_w / 2.0 - cx * self.zoom,
+            vp_h / 2.0 + cy * self.zoom,
+        );
+    }
+
     pub fn world_to_screen(&self, pt: Point, origin_screen: Pos2) -> Pos2 {
         Pos2::new(
             origin_screen.x + self.pan.x + (pt.x as f32) * self.zoom,
@@ -253,6 +411,7 @@ pub fn render_canvas(
     laser_pos_mm: Point,
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
+    state.last_viewport_size = response.rect.size();
     let origin_screen = response.rect.min;
     let tolerance_mm = (15.0 / (state.zoom as f64)).clamp(0.5, 30.0);
 
@@ -282,7 +441,23 @@ pub fn render_canvas(
         if let Some(press_pos) = response.hover_pos() {
             let press_world = state.screen_to_world(press_pos, origin_screen);
 
-            if let Some(hit) = doc.hit_test(press_world, tolerance_mm) {
+            if state.manual_sort_active {
+                // Interactive Manual Sort Mode: single-path selection & assign next cut index
+                if let Some((l_idx, e_idx)) = doc.hit_test(press_world, tolerance_mm) {
+                    history.record(doc, selection, "Manual Cut Order");
+                    doc.assign_manual_cut_index(l_idx, e_idx, state.manual_sort_next_index);
+                    state.manual_sort_next_index += 1;
+                    selection.clear();
+                    selection.push((l_idx, e_idx));
+                    state.is_dragging_selection = false;
+                    state.box_select_start = None;
+                } else {
+                    selection.clear();
+                    state.is_dragging_selection = false;
+                    state.box_select_start = Some(press_world);
+                    state.box_select_current = Some(press_world);
+                }
+            } else if let Some(hit) = doc.hit_test(press_world, tolerance_mm) {
                 if is_shift {
                     if let Some(pos) = selection.iter().position(|&x| x == hit) {
                         selection.remove(pos);
@@ -318,17 +493,19 @@ pub fn render_canvas(
     }
 
     // Process drag motion
-    if response.drag_started_by(PointerButton::Primary) && state.is_dragging_selection && !selection.is_empty() {
-        history.record(doc, selection, "Move Selection");
+    if !state.manual_sort_active {
+        if response.drag_started_by(PointerButton::Primary) && state.is_dragging_selection && !selection.is_empty() {
+            history.record(doc, selection, "Move Selection");
+        }
     }
 
     if response.dragged_by(PointerButton::Primary) {
-        if state.is_dragging_selection && !selection.is_empty() {
+        if !state.manual_sort_active && state.is_dragging_selection && !selection.is_empty() {
             let drag_screen = response.drag_delta();
             let dx_mm = (drag_screen.x as f64) / (state.zoom as f64);
             let dy_mm = -(drag_screen.y as f64) / (state.zoom as f64);
             doc.translate_selection(selection, dx_mm, dy_mm);
-        } else if let Some(_) = state.box_select_start {
+        } else if state.box_select_start.is_some() {
             if let Some(curr_pos) = response.hover_pos() {
                 state.box_select_current = Some(state.screen_to_world(curr_pos, origin_screen));
             }
@@ -340,12 +517,20 @@ pub fn render_canvas(
         if let (Some(p1), Some(p2)) = (state.box_select_start, state.box_select_current) {
             let sel_rect = kurbo::Rect::from_points(p1, p2);
             if sel_rect.width() > tolerance_mm || sel_rect.height() > tolerance_mm {
-                for (l_idx, layer) in doc.layers.iter().enumerate() {
+                'outer_marquee: for (l_idx, layer) in doc.layers.iter().enumerate() {
                     if !layer.visible { continue; }
                     for (e_idx, ent) in layer.entities.iter().enumerate() {
                         let eb = ent.bounding_box();
                         if sel_rect.intersect(eb).area() > 0.0 || sel_rect.contains(eb.origin()) {
-                            if !selection.contains(&(l_idx, e_idx)) {
+                            if state.manual_sort_active {
+                                // In manual sort mode, marquee selection allows only single path selection
+                                history.record(doc, selection, "Manual Cut Order");
+                                doc.assign_manual_cut_index(l_idx, e_idx, state.manual_sort_next_index);
+                                state.manual_sort_next_index += 1;
+                                selection.clear();
+                                selection.push((l_idx, e_idx));
+                                break 'outer_marquee;
+                            } else if !selection.contains(&(l_idx, e_idx)) {
                                 selection.push((l_idx, e_idx));
                             }
                         }
@@ -429,6 +614,18 @@ pub fn render_canvas(
 
     // 6. Render Document Layers & Entities with High-Visibility Glow
     let has_selection = !selection.is_empty();
+    let index_color_map: HashMap<(usize, usize), Color32> = if state.color_by_cut_index {
+        let seq = doc.compute_cut_sequence();
+        let total = seq.len();
+        let mut map = HashMap::new();
+        for (order_idx, info) in seq.iter().enumerate() {
+            map.entry((info.layer_idx, info.entity_idx))
+                .or_insert_with(|| state.color_palette.color_for_index(order_idx, total));
+        }
+        map
+    } else {
+        HashMap::new()
+    };
 
     for (l_idx, layer) in doc.layers.iter().enumerate() {
         if !layer.visible {
@@ -437,10 +634,6 @@ pub fn render_canvas(
 
         // Unselected stroke (dimmed slightly if there is an active selection so selection pops out)
         let unsel_alpha = if has_selection { 180 } else { 255 };
-        let base_stroke = Stroke::new(
-            1.5,
-            Color32::from_rgba_unmultiplied(layer.color.r, layer.color.g, layer.color.b, unsel_alpha),
-        );
 
         // Selection highlight styles: electric bright gold-yellow with prominent glow
         let sel_glow_stroke = Stroke::new(6.0, Color32::from_rgba_unmultiplied(255, 230, 0, 90));
@@ -450,11 +643,19 @@ pub fn render_canvas(
         let layer_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
         for (e_idx, entity) in layer.entities.iter().enumerate() {
             let is_selected = selection.contains(&(l_idx, e_idx));
+            let ent_color = index_color_map
+                .get(&(l_idx, e_idx))
+                .copied()
+                .unwrap_or(layer_color);
+            let base_stroke = Stroke::new(
+                if state.color_by_cut_index { 2.0 } else { 1.5 },
+                Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
+            );
             render_entity(
                 &painter,
                 entity,
                 is_selected,
-                layer_color,
+                ent_color,
                 base_stroke,
                 sel_glow_stroke,
                 sel_core_stroke,
@@ -465,8 +666,9 @@ pub fn render_canvas(
         }
     }
 
-    // 7. Render Selection Bounding Box with Clear Handles
-    if let Some(bounds) = doc.selection_bounding_box(selection) {
+    // 7. Render Selection Bounding Box with Clear Handles (hidden in manual sort mode)
+    if !state.manual_sort_active {
+        if let Some(bounds) = doc.selection_bounding_box(selection) {
         let p_top_left = state.world_to_screen(Point::new(bounds.min_x(), bounds.max_y()), origin_screen);
         let p_bottom_right = state.world_to_screen(Point::new(bounds.max_x(), bounds.min_y()), origin_screen);
         let sel_rect = Rect::from_two_pos(p_top_left, p_bottom_right);
@@ -494,6 +696,7 @@ pub fn render_canvas(
             painter.rect_stroke(h_rect, 1.0, Stroke::new(1.2, Color32::from_rgb(20, 20, 25)), StrokeKind::Outside);
             // Center indicator dot
             painter.circle_filled(c, 1.5, Color32::from_rgb(0, 180, 255));
+        }
         }
     }
 

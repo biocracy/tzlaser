@@ -262,15 +262,8 @@ fn render_file_tab(
         ui.add_space(4.0);
 
         ribbon_group(ui, "Bed & Viewport", |ui| {
-            if ui.add(Button::new(RichText::new("🔍 Fit View").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).clicked() {
-                if let Some(bounds) = doc.bounding_box() {
-                    let center_x = (bounds.min_x() + bounds.max_x()) / 2.0;
-                    let center_y = (bounds.min_y() + bounds.max_y()) / 2.0;
-                    canvas_state.pan = Vec2::new(
-                        420.0 - (center_x as f32) * canvas_state.zoom,
-                        340.0 + (center_y as f32) * canvas_state.zoom,
-                    );
-                }
+            if ui.add(Button::new(RichText::new("🔍 Fit View").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Frame all objects on the cutting bed").clicked() {
+                canvas_state.fit_view_to_doc(doc);
             }
 
             if ui.add(Button::new(RichText::new("1:1").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).clicked() {
@@ -363,53 +356,102 @@ fn render_profiles_tab(
 
         ui.add_space(2.0);
 
-        // 3. Toolpath Sorting (Multiple Sorting Methods)
+        // 3. Toolpath Sorting (Multiple Sorting Methods + Index Coloring + Interactive Manual Sort)
         ribbon_group(ui, "Toolpath Sorting", |ui| {
             ui.vertical(|ui| {
-                let mut current_mode = doc.sort_mode;
-                egui::ComboBox::from_id_salt("cut_sort_mode_combo")
-                    .selected_text(RichText::new(current_mode.label()).size(11.0).strong().color(Color32::from_rgb(255, 220, 100)))
-                    .width(140.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
-                        ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
-                        ui.selectable_value(&mut current_mode, SortMode::ShortestPath, "🚀 Shortest Travel (TSP)");
-                        ui.selectable_value(&mut current_mode, SortMode::LeftToRight, "➡️ Left to Right (X)");
-                        ui.selectable_value(&mut current_mode, SortMode::TopToBottom, "⬇️ Top to Bottom (Y)");
-                        ui.selectable_value(&mut current_mode, SortMode::Manual, "📝 Manual / Document Order");
-                    });
-
-                if current_mode != doc.sort_mode {
-                    doc.sort_mode = current_mode;
-                    *status_message = format!("Sort method set to: {}", current_mode.label());
-                }
-
+                // Row 1: Sort Method + Index Coloring Toggle + Palette Selector
                 ui.horizontal(|ui| {
-                    let sort_btn = Button::new(RichText::new("⚡ Sort").size(11.0).color(Color32::from_rgb(255, 215, 0)).strong())
-                        .fill(Color32::from_rgb(45, 40, 22))
-                        .min_size(Vec2::new(55.0, 19.0));
-                    if ui.add(sort_btn).on_hover_text(format!("Apply '{}' sequence to document toolpaths: {}", doc.sort_mode.label(), doc.sort_mode.description())).clicked() {
-                        history.record(doc, selection, format!("Sort ({})", doc.sort_mode.label()));
-                        doc.apply_sort_order(doc.sort_mode);
-                        let seq = doc.compute_cut_sequence();
-                        *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), doc.sort_mode.label());
+                    let mut current_mode = doc.sort_mode;
+                    egui::ComboBox::from_id_salt("cut_sort_mode_combo")
+                        .selected_text(RichText::new(current_mode.label()).size(11.0).strong().color(Color32::from_rgb(255, 220, 100)))
+                        .width(135.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
+                            ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
+                            ui.selectable_value(&mut current_mode, SortMode::ShortestPath, "🚀 Shortest Travel (TSP)");
+                            ui.selectable_value(&mut current_mode, SortMode::LeftToRight, "➡️ Left to Right (X)");
+                            ui.selectable_value(&mut current_mode, SortMode::TopToBottom, "⬇️ Top to Bottom (Y)");
+                            ui.selectable_value(&mut current_mode, SortMode::Manual, "📝 Manual / Document Order");
+                        });
+
+                    if current_mode != doc.sort_mode {
+                        doc.sort_mode = current_mode;
+                        if current_mode != SortMode::Manual {
+                            canvas_state.manual_sort_active = false;
+                        }
+                        *status_message = format!("Sort method set to: {}", current_mode.label());
                     }
 
-                    if doc.sort_mode == SortMode::Manual && !selection.is_empty() {
-                        if ui.add(Button::new(RichText::new("▲").size(10.5)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile earlier in sequence").clicked() {
-                            history.record(doc, selection, "Move Earlier");
-                            if doc.move_selection_earlier(selection) {
-                                *status_message = "Moved cut earlier in sequence.".to_string();
+                    // Index Coloring Toggle
+                    let (col_text, col_fg, col_bg) = if canvas_state.color_by_cut_index {
+                        ("🎨 Color: ON", Color32::from_rgb(0, 255, 180), Color32::from_rgb(20, 68, 60))
+                    } else {
+                        ("🎨 Color: OFF", Color32::from_rgb(170, 175, 185), Color32::from_rgb(38, 42, 50))
+                    };
+                    if ui.add(Button::new(RichText::new(col_text).size(11.0).color(col_fg).strong()).fill(col_bg).min_size(Vec2::new(82.0, 19.0)))
+                        .on_hover_text("Color toolpaths according to their cut index using the selected palette")
+                        .clicked()
+                    {
+                        canvas_state.color_by_cut_index = !canvas_state.color_by_cut_index;
+                    }
+
+                    // Color Palette Selector
+                    egui::ComboBox::from_id_salt("cut_color_palette_combo")
+                        .selected_text(RichText::new(canvas_state.color_palette.label()).size(11.0))
+                        .width(100.0)
+                        .show_ui(ui, |ui| {
+                            use crate::canvas::ColorPalette;
+                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Rainbow, "🌈 Rainbow");
+                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Thermal, "🔥 Thermal");
+                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::HighContrast, "🎯 High Contrast");
+                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::OceanDepth, "🌊 Ocean");
+                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::MonochromeFade, "💎 Cyan Fade");
+                        });
+                });
+
+                // Row 2: Sort Action / Interactive Manual Sort Controls
+                ui.horizontal(|ui| {
+                    if doc.sort_mode == SortMode::Manual {
+                        if canvas_state.manual_sort_active {
+                            let exit_btn = Button::new(RichText::new("✓ Exit Manual Sort").size(11.0).color(Color32::from_rgb(100, 255, 150)).strong())
+                                .fill(Color32::from_rgb(25, 70, 42))
+                                .min_size(Vec2::new(115.0, 19.0));
+                            if ui.add(exit_btn).on_hover_text("Exit interactive manual sorting and return to normal selection").clicked() {
+                                canvas_state.manual_sort_active = false;
+                                *status_message = "Exited manual sort mode.".to_string();
                             }
-                        }
-                        if ui.add(Button::new(RichText::new("▼").size(10.5)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Move selected profile later in sequence").clicked() {
-                            history.record(doc, selection, "Move Later");
-                            if doc.move_selection_later(selection) {
-                                *status_message = "Moved cut later in sequence.".to_string();
+
+                            ui.label(RichText::new("Next Index:").size(11.0).color(Color32::from_rgb(255, 220, 100)).strong());
+                            let total_paths = doc.entity_count().max(1);
+                            ui.add(
+                                egui::DragValue::new(&mut canvas_state.manual_sort_next_index)
+                                    .range(1..=total_paths)
+                                    .speed(0.2),
+                            )
+                            .on_hover_text("Cut index to assign to the next clicked path (editable; auto-increments on click)");
+                        } else {
+                            let sort_btn = Button::new(RichText::new("⚡ Sort").size(11.0).color(Color32::from_rgb(255, 215, 0)).strong())
+                                .fill(Color32::from_rgb(45, 40, 22))
+                                .min_size(Vec2::new(60.0, 19.0));
+                            if ui.add(sort_btn).on_hover_text("Enter interactive Manual Sort mode: click paths in order to assign cut indices").clicked() {
+                                canvas_state.manual_sort_active = true;
+                                canvas_state.manual_sort_next_index = 1;
+                                canvas_state.show_cut_order = true;
+                                selection.clear();
+                                *status_message = "Manual Sort active: click paths on canvas in desired cut order.".to_string();
                             }
+                            ui.label(RichText::new("Press Sort to pick order").size(10.0).weak());
                         }
                     } else {
-                        ui.label(RichText::new(doc.sort_mode.label()).size(9.5).weak());
+                        let sort_btn = Button::new(RichText::new("⚡ Sort").size(11.0).color(Color32::from_rgb(255, 215, 0)).strong())
+                            .fill(Color32::from_rgb(45, 40, 22))
+                            .min_size(Vec2::new(60.0, 19.0));
+                        if ui.add(sort_btn).on_hover_text(format!("Apply '{}' sequence to document toolpaths: {}", doc.sort_mode.label(), doc.sort_mode.description())).clicked() {
+                            history.record(doc, selection, format!("Sort ({})", doc.sort_mode.label()));
+                            doc.apply_sort_order(doc.sort_mode);
+                            let seq = doc.compute_cut_sequence();
+                            *status_message = format!("Sorted {} cut paths using '{}'.", seq.len(), doc.sort_mode.label());
+                        }
                     }
                 });
             });
