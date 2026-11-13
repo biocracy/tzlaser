@@ -48,12 +48,16 @@ impl Default for TzlaserApp {
             });
         }
 
+        let mut panel_state = PanelState::default();
+        panel_state.material_db =
+            tzlaser_core::MaterialLibrary::load_or_init(tzlaser_core::MaterialLibrary::default_db_path());
+
         Self {
             document: doc,
             selection: Vec::new(),
             history: HistoryManager::default(),
             canvas_state: CanvasState::default(),
-            panel_state: PanelState::default(),
+            panel_state,
             hud_state: SelectionHudState::default(),
             ribbon_state: RibbonState::default(),
             pulse_config: PulseConfig::default(),

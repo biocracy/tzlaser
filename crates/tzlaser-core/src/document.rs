@@ -19,7 +19,7 @@ impl Color {
     pub const WHITE: Self = Self { r: 255, g: 255, b: 255 };
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CuttingParams {
     pub speed_mm_s: f64,
     pub power_percent: f64,
@@ -1598,7 +1598,7 @@ impl Document {
                 _ => entity,
             };
 
-            let cut_speed = layer.params.speed_mm_s.max(5.0);
+            let cut_speed = layer.params.speed_mm_s.max(0.5);
             let pts = target.sample_points();
             if pts.len() < 2 {
                 continue;
