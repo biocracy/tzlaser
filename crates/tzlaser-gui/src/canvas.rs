@@ -128,6 +128,13 @@ fn hsv_to_color32(h_deg: f32, s: f32, v: f32) -> Color32 {
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct PathContextMenu {
+    pub screen_pos: Pos2,
+    pub point_mm: Point,
+    pub path_index_1based: usize,
+}
+
 pub struct CanvasState {
     pub pan: Vec2,          // Pan offset in screen pixels
     pub zoom: f32,          // Pixels per millimeter
@@ -144,6 +151,8 @@ pub struct CanvasState {
     pub manual_sort_active: bool,
     pub manual_sort_next_index: usize,
     pub last_viewport_size: Vec2,
+    pub context_menu: Option<PathContextMenu>,
+    pub pending_continue_from_point: Option<Point>,
 }
 
 impl Default for CanvasState {
@@ -164,6 +173,8 @@ impl Default for CanvasState {
             manual_sort_active: false,
             manual_sort_next_index: 1,
             last_viewport_size: Vec2::new(800.0, 600.0),
+            context_menu: None,
+            pending_continue_from_point: None,
         }
     }
 }
@@ -402,6 +413,7 @@ pub fn render_canvas(
     laser_on: bool,
     paused_points_mm: &[Point],
     active_pause_mm: Option<Point>,
+    can_context_menu: bool,
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
     state.last_viewport_size = response.rect.size();
@@ -411,6 +423,31 @@ pub fn render_canvas(
     // 1. Pan with Middle or Right Mouse Button
     if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary) {
         state.pan += response.drag_delta();
+        state.context_menu = None;
+    }
+
+    // 1B. Right-click Path Context Menu (only when paused or stopped)
+    let mut context_menu_just_opened = false;
+    if !can_context_menu {
+        state.context_menu = None;
+    } else if response.secondary_clicked() {
+        let click_pos = response
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+            .or(response.hover_pos());
+        if let Some(screen_pos) = click_pos {
+            let click_world = state.screen_to_world(screen_pos, origin_screen);
+            if let Some((snapped_pt, path_idx, _)) = doc.closest_point_on_cut_paths(click_world, tolerance_mm) {
+                state.context_menu = Some(PathContextMenu {
+                    screen_pos,
+                    point_mm: snapped_pt,
+                    path_index_1based: path_idx,
+                });
+                context_menu_just_opened = true;
+            } else {
+                state.context_menu = None;
+            }
+        }
     }
 
     // 2. Zoom with Mouse Wheel centered on cursor
@@ -900,6 +937,60 @@ pub fn render_canvas(
         8.0,
         Stroke::new(1.2, cross_color.linear_multiply(0.75)),
     );
+
+    // 11. Render Right-Click Path Context Menu (when paused or stopped)
+    if let Some(menu) = state.context_menu.clone() {
+        let menu_screen = state.world_to_screen(menu.point_mm, origin_screen);
+        painter.circle_stroke(
+            menu_screen,
+            9.0,
+            Stroke::new(2.0, Color32::from_rgb(90, 220, 255)),
+        );
+        painter.circle_filled(menu_screen, 3.5, Color32::from_rgb(90, 220, 255));
+
+        let mut close_menu = false;
+        let area_resp = egui::Area::new(egui::Id::new("path_context_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.screen_pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_rgb(28, 31, 38))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(85, 150, 210)))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Path #{} ({:.1}, {:.1} mm)",
+                                menu.path_index_1based, menu.point_mm.x, menu.point_mm.y
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 215, 245)),
+                        );
+                        ui.add_space(2.0);
+                        let btn = egui::Button::new(
+                            egui::RichText::new("From this point continue")
+                                .size(12.5)
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(30, 120, 98));
+                        if ui.add(btn).clicked() {
+                            state.pending_continue_from_point = Some(menu.point_mm);
+                            close_menu = true;
+                        }
+                    });
+            });
+
+        if close_menu || ui.input(|i| i.key_pressed(Key::Escape)) {
+            state.context_menu = None;
+        } else if !context_menu_just_opened && ui.input(|i| i.pointer.any_pressed()) {
+            let press_inside = ui
+                .input(|i| i.pointer.interact_pos())
+                .map_or(false, |p| area_resp.response.rect.contains(p));
+            if !press_inside {
+                state.context_menu = None;
+            }
+        }
+    }
 
     response
 }

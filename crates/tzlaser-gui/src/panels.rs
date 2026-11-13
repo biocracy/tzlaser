@@ -1,4 +1,5 @@
 use egui::{Button, CollapsingHeader, Color32, Frame, Grid, ProgressBar, RichText, ScrollArea, Ui};
+use tzlaser_core::document::closest_point_on_segment;
 use tzlaser_core::{Document, MotionSegment, PulseConfig};
 use tzlaser_protocol::{Axis, LaserController, MachineStatus};
 
@@ -490,6 +491,120 @@ impl PanelState {
                 cp.point_mm.x, cp.point_mm.y, cp.path_index_1based
             ))
         }
+    }
+
+    /// Move the head to the closest point on `doc`'s cutting path near `target_pt_mm`
+    /// and enter Pause mode at that exact trajectory position (valid when Stopped or Paused).
+    pub fn set_pause_at_path_point(
+        &mut self,
+        doc: &Document,
+        target_pt_mm: kurbo::Point,
+        controller: &Option<LaserController>,
+        status: &mut MachineStatus,
+        pulses_cfg: &PulseConfig,
+    ) -> Option<String> {
+        if self.run_mode != RunMode::Idle && !self.is_paused {
+            return None;
+        }
+
+        let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
+        if self.run_mode == RunMode::Idle || self.full_trajectory.is_empty() {
+            let origin_head = kurbo::Point::new(
+                pulses_cfg.pulses_to_mm_x(status.pos_x),
+                pulses_cfg.pulses_to_mm_y(status.pos_y),
+            );
+            let traj = doc.build_motion_trajectory(origin_head, 200.0);
+            if traj.is_empty() {
+                return None;
+            }
+            self.full_trajectory = traj;
+        }
+
+        let mut best: Option<(usize, kurbo::Point, f64, f64)> = None;
+        for only_cutting in [true, false] {
+            for (idx, seg) in self.full_trajectory.iter().enumerate() {
+                if only_cutting && seg.is_rapid {
+                    continue;
+                }
+                let (proj, dist, t) = closest_point_on_segment(target_pt_mm, seg.start, seg.end);
+                if best.map_or(true, |(_, _, _, b_dist)| dist < b_dist) {
+                    let prog = (t * seg.length_mm).clamp(0.0, seg.length_mm);
+                    best = Some((idx, proj, prog, dist));
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+
+        let (best_seg_idx, best_pt, best_prog_mm, _) = best?;
+        let best_seg = self.full_trajectory[best_seg_idx];
+        let new_traveled: f64 = self.full_trajectory[..best_seg_idx]
+            .iter()
+            .map(|s| s.length_mm)
+            .sum::<f64>()
+            + best_prog_mm;
+        let full_total: f64 = self.full_trajectory.iter().map(|s| s.length_mm).sum();
+
+        let new_px = pulses_cfg.mm_to_pulses_x(best_pt.x);
+        let new_py = pulses_cfg.mm_to_pulses_y(best_pt.y);
+        if let Some(ref c) = controller {
+            if c.is_connected() {
+                c.stop();
+                let dx_p = new_px - status.pos_x;
+                let dy_p = new_py - status.pos_y;
+                if dx_p != 0 {
+                    c.jog(Axis::X, dx_p);
+                }
+                if dy_p != 0 {
+                    c.jog(Axis::Y, dy_p);
+                }
+            }
+        }
+        status.pos_x = new_px;
+        status.pos_y = new_py;
+        status.laser_on = false;
+
+        if self.run_mode == RunMode::Idle {
+            self.run_mode = if hw_connected {
+                RunMode::Cutting
+            } else {
+                RunMode::DryCut
+            };
+        }
+        if self.run_mode == RunMode::DryCut {
+            status.red_pointer_on = true;
+            if let Some(ref c) = controller {
+                if c.is_connected() {
+                    c.set_red_pointer(true);
+                }
+            }
+        }
+
+        self.trajectory = self.full_trajectory.clone();
+        self.current_seg_idx = best_seg_idx;
+        self.seg_progress_mm = best_prog_mm;
+        self.traveled_length_mm = new_traveled;
+        self.total_length_mm = full_total;
+        self.is_paused = true;
+        self.last_tick = None;
+        self.last_hw_dispatched_seg = None;
+
+        let cp = PauseCheckpoint {
+            point_mm: best_pt,
+            seg_idx: best_seg_idx,
+            seg_progress_mm: best_prog_mm,
+            traveled_length_mm: new_traveled,
+            path_index_1based: best_seg.path_index_1based,
+            mode: self.run_mode,
+        };
+        self.paused_checkpoint = Some(cp);
+        self.pause_buffer.push(cp);
+
+        Some(format!(
+            "Head moved to Path #{} @ X: {:.2}, Y: {:.2} mm (Pause mode). Press Continue or step along path.",
+            best_seg.path_index_1based, best_pt.x, best_pt.y
+        ))
     }
 
     pub fn tick_simulation(
@@ -1386,5 +1501,55 @@ mod tests {
         state.last_tick = Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         state.tick_simulation(&None, &mut status, &pulses);
         assert!(state.traveled_length_mm >= 5.0);
+    }
+
+    #[test]
+    fn test_set_pause_at_path_point_from_stopped_and_continue() {
+        let pulses = PulseConfig::default();
+        let mut status = MachineStatus::default();
+        let mut state = PanelState::default();
+
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(tzlaser_core::Entity::Polyline {
+            points: vec![
+                kurbo::Point::new(50.0, 50.0),
+                kurbo::Point::new(150.0, 50.0),
+                kurbo::Point::new(150.0, 150.0),
+                kurbo::Point::new(50.0, 150.0),
+            ],
+            closed: true,
+        });
+
+        let (snapped_pt, path_idx, dist) = doc
+            .closest_point_on_cut_paths(kurbo::Point::new(100.0, 52.0), 5.0)
+            .expect("should snap near bottom edge");
+        assert_eq!(path_idx, 1);
+        assert!((snapped_pt.x - 100.0).abs() < 1e-6 && (snapped_pt.y - 50.0).abs() < 1e-6);
+        assert!((dist - 2.0).abs() < 1e-6);
+
+        // From stopped (Idle) state, move head to clicked path point and enter Pause mode
+        assert_eq!(state.run_mode, RunMode::Idle);
+        let msg = state.set_pause_at_path_point(&doc, snapped_pt, &None, &mut status, &pulses);
+        assert!(msg.is_some());
+        assert!(state.is_paused);
+        assert_eq!(state.run_mode, RunMode::DryCut);
+        assert!(!status.laser_on);
+        assert!((pulses.pulses_to_mm_x(status.pos_x) - 100.0).abs() < 0.05);
+        assert!((pulses.pulses_to_mm_y(status.pos_y) - 50.0).abs() < 0.05);
+        assert_eq!(state.pause_buffer.len(), 1);
+        let cp = state.paused_checkpoint.unwrap();
+        assert!((cp.point_mm.x - 100.0).abs() < 1e-6 && (cp.point_mm.y - 50.0).abs() < 1e-6);
+
+        // Stepping forward and continuing from this paused point work seamlessly
+        assert!(state.step_along_path(true, 10.0, &None, &mut status, &pulses).is_some());
+        let stepped = state.paused_checkpoint.unwrap().point_mm;
+        assert!((stepped.x - 110.0).abs() < 1e-6 && (stepped.y - 50.0).abs() < 1e-6);
+
+        assert!(state.continue_run(stepped, &None).is_some());
+        assert!(!state.is_paused);
+        assert!((state.trajectory[0].start.x - 110.0).abs() < 1e-6);
+
+        // Active unpaused state must reject right-click jump-to-pause
+        assert!(state.set_pause_at_path_point(&doc, snapped_pt, &None, &mut status, &pulses).is_none());
     }
 }

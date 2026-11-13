@@ -394,17 +394,22 @@ fn point_in_polygon(p: Point, poly: &[Point]) -> bool {
     inside
 }
 
-fn dist_point_to_segment(p: Point, a: Point, b: Point) -> f64 {
+/// Project point `p` onto segment `a -> b`, returning `(projected_point, distance, t_clamped)`.
+pub fn closest_point_on_segment(p: Point, a: Point, b: Point) -> (Point, f64, f64) {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let len_sq = dx * dx + dy * dy;
     if len_sq < 1e-9 {
-        return (p.x - a.x).hypot(p.y - a.y);
+        return (a, (p.x - a.x).hypot(p.y - a.y), 0.0);
     }
     let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len_sq).clamp(0.0, 1.0);
-    let proj_x = a.x + t * dx;
-    let proj_y = a.y + t * dy;
-    (p.x - proj_x).hypot(p.y - proj_y)
+    let proj = Point::new(a.x + t * dx, a.y + t * dy);
+    let dist = (p.x - proj.x).hypot(p.y - proj.y);
+    (proj, dist, t)
+}
+
+fn dist_point_to_segment(p: Point, a: Point, b: Point) -> f64 {
+    closest_point_on_segment(p, a, b).1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1646,6 +1651,48 @@ impl Document {
         }
 
         segments
+    }
+
+    /// Find the closest point along any active cutting path in the document within `tolerance_mm`.
+    /// Returns `Some((projected_point_mm, path_index_1based, distance_mm))`.
+    pub fn closest_point_on_cut_paths(
+        &self,
+        pt: Point,
+        tolerance_mm: f64,
+    ) -> Option<(Point, usize, f64)> {
+        let seq = self.compute_cut_sequence();
+        let mut best: Option<(Point, usize, f64)> = None;
+
+        for (idx, info) in seq.iter().enumerate() {
+            let Some(layer) = self.layers.get(info.layer_idx) else {
+                continue;
+            };
+            let Some(entity) = layer.entities.get(info.entity_idx) else {
+                continue;
+            };
+            let target = match (entity, info.child_idx) {
+                (Entity::Group { children }, Some(c_idx)) => match children.get(c_idx) {
+                    Some(c) => c,
+                    None => continue,
+                },
+                _ => entity,
+            };
+
+            let pts = target.sample_points();
+            if pts.len() < 2 {
+                continue;
+            }
+            let path_index_1based = idx + 1;
+
+            for pair in pts.windows(2) {
+                let (proj, dist, _) = closest_point_on_segment(pt, pair[0], pair[1]);
+                if dist <= tolerance_mm && best.map_or(true, |(_, _, b_dist)| dist < b_dist) {
+                    best = Some((proj, path_index_1based, dist));
+                }
+            }
+        }
+
+        best
     }
 }
 

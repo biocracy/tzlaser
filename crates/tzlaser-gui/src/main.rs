@@ -176,6 +176,8 @@ impl eframe::App for TzlaserApp {
                 .map(|c| c.point_mm)
                 .collect();
             let active_pause_mm = self.panel_state.paused_checkpoint.map(|c| c.point_mm);
+            let can_context_menu =
+                self.panel_state.run_mode == panels::RunMode::Idle || self.panel_state.is_paused;
             render_canvas(
                 ui,
                 &mut self.canvas_state,
@@ -187,7 +189,19 @@ impl eframe::App for TzlaserApp {
                 self.status.laser_on,
                 &paused_points_mm,
                 active_pause_mm,
+                can_context_menu,
             );
+            if let Some(target_pt) = self.canvas_state.pending_continue_from_point.take() {
+                if let Some(msg) = self.panel_state.set_pause_at_path_point(
+                    &self.document,
+                    target_pt,
+                    &self.controller,
+                    &mut self.status,
+                    &self.pulse_config,
+                ) {
+                    self.status_message = msg;
+                }
+            }
         });
 
         // 5. Floating Selection Coordinates & D-Pad Nudge Pop-up Window (hidden during interactive manual sort)
