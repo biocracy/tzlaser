@@ -17,18 +17,18 @@ pub const CONTINUOUS_JOG_PULSES_XY: i32 = 472_000;
 /// Default continuous jog travel distance in pulses on Port 999 (matches SC2000 `±1,000,000`).
 pub const CONTINUOUS_JOG_PULSES_Z: i32 = 1_000_000;
 
-/// Default Z-axis jog speed register value on Port 999 (matches SC2000 capture `100`).
-pub const DEFAULT_Z_JOG_SPEED: u32 = 100;
+/// Default Z-axis jog speed register value on Port 999 (SC2000 `ZFFastJogSpeed = 50`).
+pub const DEFAULT_Z_JOG_SPEED: u32 = 50;
 
 /// Wireless remote control button bitmasks reported by the controller board in `R1042` (`regs[42]`)
-/// and mirrored in `R1043` (`regs[43]`).
+/// (`RegName43` = LCR real-time key value) and mirrored in `R1043` (`regs[43]`, `RegName44` = LCR matched code value).
 pub mod remote_buttons {
     pub const X_MINUS: u32 = 0x0000_0002; // Bit 1 (2): Jog X-
     pub const Y_MINUS: u32 = 0x0000_0100; // Bit 8 (256): Jog Y-
     pub const Y_PLUS: u32 = 0x0000_0400;  // Bit 10 (1024): Jog Y+
-    pub const Z_PLUS: u32 = 0x0001_0000;  // Bit 16 (65536): Jog Z+
+    pub const Z_MINUS: u32 = 0x0001_0000; // Bit 16 (65536): Jog Z- (lower head)
     pub const X_PLUS: u32 = 0x0002_0000;  // Bit 17 (131072): Jog X+
-    pub const Z_MINUS: u32 = 0x0004_0000; // Bit 18 (262144): Jog Z-
+    pub const Z_PLUS: u32 = 0x0004_0000;  // Bit 18 (262144): Jog Z+ (raise head toward upper limit)
 }
 
 /// Decode a wireless remote control button bitmask (`R1042`) into a continuous jog `(Axis, direction)`.
@@ -148,10 +148,12 @@ impl MachineStatus {
         let pos_z = 0;
         let pos_w = regs.get(23).copied().unwrap_or(0) as i32;
 
-        // Wireless remote control button bitmask is reported in R1042 (regs[42]) and mirrored in R1043 (regs[43]).
+        // Wireless remote control button bitmask is reported in R1042 (regs[42], RegName43: LCR real time key value)
+        // and mirrored in R1043 (regs[43], RegName44: LCR matched code value).
+        // Read `r43 | r42` so both matched remote presses and real-time key presses are captured without dropping transition frames.
         let r42 = regs.get(42).copied().unwrap_or(0);
         let r43 = regs.get(43).copied().unwrap_or(0);
-        let remote_button_mask = if r42 == r43 { r42 } else { 0 };
+        let remote_button_mask = r43 | r42;
 
         let laser_on = regs.get(30).copied().unwrap_or(0) & 0x01 != 0;
         let laser_power_pct = (regs.get(31).copied().unwrap_or(0) as f32) / 10.0;
@@ -198,7 +200,7 @@ impl MachineStatus {
         if raw_cap > 0 {
             self.capacitance_pf = (raw_cap as f32) / 10_000.0;
         }
-        self.capacitive_height_mm = ((pos_z as f32).abs() / 10_000.0).clamp(0.0, 100.0);
+        self.capacitive_height_mm = ((pos_z as f32).abs() / 1_000.0).clamp(0.0, 150.0);
         self.follower_active = follower_state == 2;
     }
 }
@@ -355,12 +357,16 @@ pub fn build_z_poll_packet() -> Vec<u8> {
 }
 
 /// Build a Port 999 Z-axis jog packet (Modbus Function 0x10 at register `0x0065`, 6 words).
+/// Note on FTC10 / MCC3721NC_ZF hardware polarity:
+/// - Raising the head toward the upper limit (`Z+`, `pulses > 0`) requires a **negative** hardware pulse target (`-pulses`).
+/// - Lowering the head toward the sheet (`Z-`, `pulses < 0`) requires a **positive** hardware pulse target (`-pulses`).
 /// Matches SC2000 packets:
-/// - Z- (`pulses = -1_000_000`, `speed = 100`): `0110006500060c0009000000640000bdc0fff08f12`
-/// - Z+ (`pulses = +1_000_000`, `speed = 100`): `0110006500060c00090000006400004240000fbf5e`
+/// - Z+ (`pulses = +1_000_000` -> hw `-1_000_000`, `speed = 100`): `0110006500060c0009000000640000bdc0fff08f12`
+/// - Z- (`pulses = -1_000_000` -> hw `+1_000_000`, `speed = 100`): `0110006500060c00090000006400004240000fbf5e`
 pub fn build_z_jog_packet(pulses: i32, speed: u32) -> Vec<u8> {
     let cmd: u32 = 9;
-    let p = pulses as u32;
+    let hw_pulses = pulses.saturating_neg();
+    let p = hw_pulses as u32;
     let words: [u16; 6] = [
         (cmd & 0xFFFF) as u16,
         ((cmd >> 16) & 0xFFFF) as u16,
@@ -389,6 +395,9 @@ pub fn build_z_stop_packet() -> Vec<u8> {
 
 /// Decode a Port 999 64-word status polling response (`01 03 80 <128 bytes> <crc16_le>`).
 /// Returns `Some((pos_z, raw_capacitance, state_code))` if valid.
+/// Note: Hardware `D9` is 0 at the top limit and becomes negative as the head moves down
+/// (or decreases when raw negative pulses raise the head), so we negate `D9` so `pos_z`
+/// increases when `Z+` raises the head and decreases when `Z-` lowers the head.
 pub fn decode_z_poll_response(bytes: &[u8]) -> Option<(i32, u32, u32)> {
     if bytes.len() < 133 || bytes[0] != 0x01 || bytes[1] != 0x03 || bytes[2] != 0x80 {
         return None;
@@ -408,7 +417,8 @@ pub fn decode_z_poll_response(bytes: &[u8]) -> Option<(i32, u32, u32)> {
 
     let state_code = read_dword_ws(6); // D6 (words 12..13): 9 when jogging, 0 when idle
     let raw_cap = read_dword_ws(7);    // D7 (words 14..15): capacitance sensor value
-    let pos_z = read_dword_ws(9) as i32; // D9 (words 18..19): live Z coordinate in pulses
+    let raw_d9 = read_dword_ws(9) as i32; // D9 (words 18..19): raw Z pulse coordinate
+    let pos_z = raw_d9.saturating_neg();
 
     Some((pos_z, raw_cap, state_code))
 }
@@ -423,12 +433,14 @@ mod tests {
             hex::encode(build_z_poll_packet()),
             "010303e80040c44a"
         );
-        assert_eq!(
-            hex::encode(build_z_jog_packet(-1_000_000, 100)),
-            "0110006500060c0009000000640000bdc0fff08f12"
-        );
+        // Z+ (+1_000_000 logical pulses -> -1_000_000 hardware pulses to raise head)
         assert_eq!(
             hex::encode(build_z_jog_packet(1_000_000, 100)),
+            "0110006500060c0009000000640000bdc0fff08f12"
+        );
+        // Z- (-1_000_000 logical pulses -> +1_000_000 hardware pulses to lower head)
+        assert_eq!(
+            hex::encode(build_z_jog_packet(-1_000_000, 100)),
             "0110006500060c00090000006400004240000fbf5e"
         );
         assert_eq!(
@@ -450,7 +462,7 @@ mod tests {
             "0103800eb20000138200010000000000000000000000000000000000000000d862000561a800005170ffff5170ffff523fffff0000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000049f00002d862000500480000000000001c0a"
         ).unwrap();
         let (pos_z, raw_cap, state_code) = decode_z_poll_response(&raw).expect("valid Z poll response");
-        assert_eq!(pos_z, -44688);
+        assert_eq!(pos_z, 44688);
         assert_eq!(raw_cap, 0x0005_D862);
         assert_eq!(state_code, 0);
     }
@@ -462,8 +474,8 @@ mod tests {
         assert_eq!(decode_remote_jog(0x0002_0000), Some((Axis::X, 1)));
         assert_eq!(decode_remote_jog(0x0000_0100), Some((Axis::Y, -1)));
         assert_eq!(decode_remote_jog(0x0000_0400), Some((Axis::Y, 1)));
-        assert_eq!(decode_remote_jog(0x0004_0000), Some((Axis::Z, -1)));
-        assert_eq!(decode_remote_jog(0x0001_0000), Some((Axis::Z, 1)));
+        assert_eq!(decode_remote_jog(0x0001_0000), Some((Axis::Z, -1)));
+        assert_eq!(decode_remote_jog(0x0004_0000), Some((Axis::Z, 1)));
     }
 }
 

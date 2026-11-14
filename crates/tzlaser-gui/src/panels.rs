@@ -951,6 +951,7 @@ pub fn render_right_panels(
                 if is_connected {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("🎮 Remote:").size(11.5).strong());
+                        let lcr_id = status.raw_registers.get(41).copied().unwrap_or(0);
                         if status.remote_button_mask != 0 {
                             ui.label(
                                 RichText::new(format!("● {}", format_remote_button(status.remote_button_mask)))
@@ -958,9 +959,15 @@ pub fn render_right_panels(
                                     .color(Color32::from_rgb(0, 235, 160))
                                     .strong(),
                             );
+                        } else if lcr_id != 0 {
+                            ui.label(
+                                RichText::new(format!("Linked (ID {:08X}) · Ready", lcr_id))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(130, 225, 165)),
+                            );
                         } else {
                             ui.label(
-                                RichText::new("Ready (Listening R1042)")
+                                RichText::new("Ready (Listening R1042/R1043)")
                                     .size(11.0)
                                     .weak(),
                             );

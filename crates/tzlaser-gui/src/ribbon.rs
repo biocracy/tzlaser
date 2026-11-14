@@ -1146,7 +1146,7 @@ fn render_properties_tab(
                     }
 
                     let sc2000_btn = Button::new(
-                        RichText::new("📋 SC2000 (590 pls/mm)")
+                        RichText::new("📋 SC2000 (590 / 1000)")
                             .size(11.0)
                             .color(Color32::from_rgb(255, 220, 110))
                             .strong(),
@@ -1155,16 +1155,18 @@ fn render_properties_tab(
                     .min_size(Vec2::new(135.0, 19.0));
                     if ui
                         .add(sc2000_btn)
-                        .on_hover_text("Apply 590 pulses/mm XY and 10,000 pulses/mm Z scaling observed in SC2000 packet capture")
+                        .on_hover_text("Apply SC2000 BkHardPara.xml scaling (2000×3000 mm, 590 pulses/mm XY, 1,000 pulses/mm Z)")
                         .clicked()
                     {
+                        pulse_config.table_width_mm = 2000.0;
+                        pulse_config.table_height_mm = 3000.0;
                         pulse_config.pulses_per_mm_x = 590.0;
                         pulse_config.pulses_per_mm_y = 590.0;
-                        pulse_config.pulses_per_mm_z = 10_000.0;
-                        pulse_config.jog_start_speed_mm_s = 5.0;
+                        pulse_config.pulses_per_mm_z = 1_000.0;
+                        pulse_config.jog_start_speed_mm_s = 10.0;
                         pulse_config.jog_speed_mm_s = 10.0;
                         pulse_config.jog_accel_mm_s2 = 100.0;
-                        pulse_config.z_jog_speed_reg = 100;
+                        pulse_config.z_jog_speed_reg = 50;
                         changed = true;
                     }
                 });

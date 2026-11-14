@@ -123,24 +123,26 @@ pub fn render_properties_window(
                 if ui
                     .add(
                         Button::new(
-                            RichText::new("📋 SC2000 Capture (590 pls/mm)")
+                            RichText::new("📋 SC2000 Config (590 / 1000 pls/mm)")
                                 .size(11.0)
                                 .color(Color32::from_rgb(255, 220, 100)),
                         )
                         .fill(Color32::from_rgb(48, 42, 24)),
                     )
                     .on_hover_text(
-                        "Apply values observed in the SC2000 Wireshark capture (590 pls/mm XY, 10000 pls/mm Z, 10 mm/s jog)",
+                        "Apply values from SC2000 BkHardPara.xml & capture (2000×3000 mm, 590 pls/mm XY, 1000 pls/mm Z, 10 mm/s jog)",
                     )
                     .clicked()
                 {
+                    pulse_config.table_width_mm = 2000.0;
+                    pulse_config.table_height_mm = 3000.0;
                     pulse_config.pulses_per_mm_x = 590.0;
                     pulse_config.pulses_per_mm_y = 590.0;
-                    pulse_config.pulses_per_mm_z = 10_000.0;
+                    pulse_config.pulses_per_mm_z = 1_000.0;
                     pulse_config.jog_start_speed_mm_s = 10.0;
                     pulse_config.jog_speed_mm_s = 10.0;
                     pulse_config.jog_accel_mm_s2 = 100.0;
-                    pulse_config.z_jog_speed_reg = 100;
+                    pulse_config.z_jog_speed_reg = 50;
                     changed = true;
                 }
 
@@ -154,17 +156,17 @@ pub fn render_properties_window(
                         .fill(Color32::from_rgb(24, 52, 38)),
                     )
                     .on_hover_text(
-                        "Apply conservative low-displacement, low-speed settings for safe initial testing",
+                        "Apply conservative low-displacement, low-speed settings for safe initial testing (200 pls/mm XY, 1000 pls/mm Z)",
                     )
                     .clicked()
                 {
                     pulse_config.pulses_per_mm_x = 200.0;
                     pulse_config.pulses_per_mm_y = 200.0;
-                    pulse_config.pulses_per_mm_z = 10_000.0;
+                    pulse_config.pulses_per_mm_z = 1_000.0;
                     pulse_config.jog_start_speed_mm_s = 5.0;
                     pulse_config.jog_speed_mm_s = 10.0;
                     pulse_config.jog_accel_mm_s2 = 80.0;
-                    pulse_config.z_jog_speed_reg = 100;
+                    pulse_config.z_jog_speed_reg = 50;
                     pulse_config.default_step_mm = 1.0;
                     panel_state.jog_mode = JogMode::Step(1.0);
                     panel_state.step_index = 2;
@@ -273,6 +275,7 @@ pub fn render_properties_window(
                     for (w, h, lbl) in [
                         (4000.0, 2000.0, "4000×2000"),
                         (3000.0, 1500.0, "3000×1500"),
+                        (2000.0, 3000.0, "2000×3000"),
                         (1300.0, 900.0, "1300×900"),
                     ] {
                         if ui.small_button(lbl).clicked() {

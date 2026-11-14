@@ -60,7 +60,7 @@ impl LaserController {
                 }
             };
             socket
-                .set_read_timeout(Some(Duration::from_millis(15)))
+                .set_read_timeout(Some(Duration::from_millis(5)))
                 .ok();
 
             let z_target_addr = SocketAddr::new(target_addr.ip(), 999);
@@ -77,10 +77,10 @@ impl LaserController {
             let mut board_initialized = false;
             let mut z_status_seen = false;
             let mut latest_z: (i32, u32, u32) = (0, 0, 0);
-            let mut xy_needs_reset = false;
             let mut pending_stop_p2_at: Option<Instant> = None;
             let mut auto_stop_at: Option<Instant> = None;
             let mut active_step_watch: Option<(Axis, i32, i32)> = None;
+            let mut active_z_step_watch: Option<(i32, i32, Instant)> = None;
             let mut active_remote_jog: Option<(Axis, i32)> = None;
 
             // Helper to send a Port 502 packet and wait briefly for its ACK during initialization
@@ -177,7 +177,6 @@ impl LaserController {
                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                         let p2 = Packet::write_request(s, registers::REG_COMMAND, vec![2]);
                         let _ = socket.send_to(&p2.encode(), target_addr);
-                        xy_needs_reset = false;
                     }
                 }
 
@@ -197,6 +196,13 @@ impl LaserController {
                     }
                 }
 
+                // Clear expired Z step watch window
+                if let Some((_, _, exp)) = active_z_step_watch {
+                    if Instant::now() >= exp {
+                        active_z_step_watch = None;
+                    }
+                }
+
                 // 1. Process pending commands from UI
                 while let Ok(cmd) = command_rx.try_recv() {
                     match cmd {
@@ -207,7 +213,7 @@ impl LaserController {
                             if axis == Axis::Z {
                                 if let Some(ref zs) = z_socket {
                                     // For a finite Z step jog, `cmd = 9` on Port 999 takes the exact
-                                    // relative pulse target `pulses` and stops automatically at target.
+                                    // relative pulse target (`hw_pulses = -pulses`) and moves to target.
                                     let raw = build_z_jog_packet(pulses, z_jog_speed);
                                     send_z_cmd_with_ack(
                                         zs,
@@ -216,10 +222,15 @@ impl LaserController {
                                         &mut z_status_seen,
                                         &mut latest_z,
                                     );
-                                    last_z_poll = Instant::now();
+                                    active_z_step_watch = Some((
+                                        latest_z.0,
+                                        pulses.unsigned_abs() as i32,
+                                        Instant::now() + Duration::from_millis(2500),
+                                    ));
+                                    last_z_poll = Instant::now() - Duration::from_secs(1);
                                 }
                             } else {
-                                if pending_stop_p2_at.take().is_some() || xy_needs_reset {
+                                if pending_stop_p2_at.take().is_some() {
                                     let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
                                     let p2 = Packet::write_request(
                                         s_rst,
@@ -227,6 +238,7 @@ impl LaserController {
                                         vec![2],
                                     );
                                     let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                    thread::sleep(Duration::from_millis(25));
                                 }
                                 let cur_pos = {
                                     let st = status_clone.lock().unwrap();
@@ -240,7 +252,6 @@ impl LaserController {
                                 let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                                 let pkt = build_jog_packet(s, axis, pulses, &jog_cfg);
                                 let _ = socket.send_to(&pkt.encode(), target_addr);
-                                xy_needs_reset = true;
 
                                 active_step_watch =
                                     Some((axis, cur_pos, pulses.unsigned_abs() as i32));
@@ -268,12 +279,12 @@ impl LaserController {
                                         &mut z_status_seen,
                                         &mut latest_z,
                                     );
-                                    last_z_poll = Instant::now();
+                                    last_z_poll = Instant::now() - Duration::from_secs(1);
                                 }
                             } else {
                                 auto_stop_at = None;
                                 active_step_watch = None;
-                                if pending_stop_p2_at.take().is_some() || xy_needs_reset {
+                                if pending_stop_p2_at.take().is_some() {
                                     let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
                                     let p2 = Packet::write_request(
                                         s_rst,
@@ -281,6 +292,7 @@ impl LaserController {
                                         vec![2],
                                     );
                                     let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                    thread::sleep(Duration::from_millis(25));
                                 }
                                 let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                                 let pkt = build_jog_packet(
@@ -290,12 +302,12 @@ impl LaserController {
                                     &jog_cfg,
                                 );
                                 let _ = socket.send_to(&pkt.encode(), target_addr);
-                                xy_needs_reset = true;
                             }
                         }
                         Command::Stop => {
                             auto_stop_at = None;
                             active_step_watch = None;
+                            active_z_step_watch = None;
                             active_remote_jog = None;
                             let (p1, _p2) = build_stop_packets(|| {
                                 seq_clone.fetch_add(1, Ordering::Relaxed)
@@ -312,7 +324,7 @@ impl LaserController {
                                     &mut z_status_seen,
                                     &mut latest_z,
                                 );
-                                last_z_poll = Instant::now();
+                                last_z_poll = Instant::now() - Duration::from_secs(1);
                             }
                         }
                         Command::UpdateJogConfig { config, z_speed } => {
@@ -378,141 +390,85 @@ impl LaserController {
                     }
                 }
 
-                // 3. Poll Port 502 machine status every 50ms
-                if last_poll.elapsed() >= Duration::from_millis(50) {
+                // 3. Poll Port 502 machine status every 30ms (matching MCCore=30 in SC2000 ipAdd.ini)
+                if last_poll.elapsed() >= Duration::from_millis(30) {
                     last_poll = Instant::now();
                     let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                     let poll_pkt = Packet::read_request(s, registers::REG_STATUS_BASE, 144);
                     let _ = socket.send_to(&poll_pkt.encode(), target_addr);
                 }
 
-                // 4. Poll Port 999 Z-axis & height controller status every 500ms
-                if last_z_poll.elapsed() >= Duration::from_millis(500) {
+                // 4. Poll Port 999 Z-axis & height controller status (80ms during Z motion, 300ms idle)
+                let z_poll_interval = if active_z_step_watch.is_some()
+                    || matches!(active_remote_jog, Some((Axis::Z, _)))
+                {
+                    Duration::from_millis(80)
+                } else {
+                    Duration::from_millis(300)
+                };
+                if last_z_poll.elapsed() >= z_poll_interval {
                     last_z_poll = Instant::now();
                     if let Some(ref zs) = z_socket {
                         let _ = zs.send_to(&build_z_poll_packet(), z_target_addr);
                     }
                 }
 
-                // 5. Receive incoming responses from Port 502
-                match socket.recv_from(&mut buf) {
-                    Ok((n, src)) if src == target_addr => {
-                        if let Ok(pkt) = Packet::decode(&buf[..n]) {
-                            connected_clone.store(true, Ordering::Relaxed);
+                // 5. Receive all queued incoming responses from Port 502
+                while let Ok((n, src)) = socket.recv_from(&mut buf) {
+                    if src != target_addr {
+                        continue;
+                    }
+                    if let Ok(pkt) = Packet::decode(&buf[..n]) {
+                        connected_clone.store(true, Ordering::Relaxed);
 
-                            if !board_initialized {
-                                board_initialized = true;
-                                log::info!(
-                                    "Controller online at {}; running SC2000 board initialization sequence...",
-                                    target_addr
-                                );
-                                for init_pkt in build_init_packets(|| {
-                                    seq_clone.fetch_add(1, Ordering::Relaxed)
-                                }) {
-                                    let _ = send_and_wait_ack(&socket, &init_pkt, &mut buf);
-                                }
-                                log::info!("Controller initialization sequence complete.");
+                        // Re-run board init if never initialized or if R1004 reports uninitialized state (0x00880000)
+                        let r1004_uninit = pkt.opcode == Opcode::ReadRegisters
+                            && pkt.addr == registers::REG_STATUS_BASE
+                            && pkt.data.get(4).copied().unwrap_or(0) == 0x0088_0000;
+                        if !board_initialized || r1004_uninit {
+                            board_initialized = true;
+                            log::info!(
+                                "Controller online at {}; running SC2000 board initialization sequence...",
+                                target_addr
+                            );
+                            for init_pkt in build_init_packets(|| {
+                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                            }) {
+                                let _ = send_and_wait_ack(&socket, &init_pkt, &mut buf);
+                            }
+                            log::info!("Controller initialization sequence complete.");
+                        }
+
+                        if pkt.opcode == Opcode::ReadRegisters
+                            && pkt.addr == registers::REG_STATUS_BASE
+                            && pkt.data.len() >= 24
+                        {
+                            let mut new_st = MachineStatus::from_status_registers(&pkt.data);
+                            if z_status_seen {
+                                new_st.apply_z_status(latest_z.0, latest_z.1, latest_z.2);
                             }
 
-                            if pkt.opcode == Opcode::ReadRegisters
-                                && pkt.addr == registers::REG_STATUS_BASE
-                                && pkt.data.len() >= 24
-                            {
-                                let mut new_st = MachineStatus::from_status_registers(&pkt.data);
-                                if z_status_seen {
-                                    new_st.apply_z_status(latest_z.0, latest_z.1, latest_z.2);
-                                }
-
-                                // 5A. Wireless Remote Control (`R1042` / `regs[42]`) Continuous Jog Dispatch
-                                // The wireless remote is paired to the controller board, which exposes the
-                                // pressed button bitmask in `R1042`. The PC software watches `R1042` and
-                                // sends the corresponding X/Y (Port 502) or Z (Port 999) jog & stop packets.
-                                let remote_jog = decode_remote_jog(new_st.remote_button_mask);
-                                if remote_jog != active_remote_jog {
-                                    // Stop previous remote jog if one was active
-                                    if let Some((prev_axis, _)) = active_remote_jog.take() {
-                                        if prev_axis == Axis::Z {
-                                            if let Some(ref zs) = z_socket {
-                                                let raw_stop = build_z_stop_packet();
-                                                send_z_cmd_with_ack(
-                                                    zs,
-                                                    &raw_stop,
-                                                    &mut z_buf,
-                                                    &mut z_status_seen,
-                                                    &mut latest_z,
-                                                );
-                                                last_z_poll = Instant::now();
-                                            }
-                                        } else {
-                                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                            let p1 = Packet::write_request(
-                                                s,
-                                                registers::REG_JOG_RAMP,
-                                                vec![118_000, 1_180_000],
+                            // 5A. Wireless Remote Control (`R1042` / `R1043`) Continuous Jog Dispatch
+                            // The wireless remote is paired to the controller board, which exposes the
+                            // pressed button bitmask in `R1042` and `R1043`. The PC software watches this
+                            // bitmask and sends the corresponding X/Y (Port 502) or Z (Port 999) jog & stop packets.
+                            let remote_jog = decode_remote_jog(new_st.remote_button_mask);
+                            if remote_jog != active_remote_jog {
+                                // Stop previous remote jog if one was active
+                                if let Some((prev_axis, _)) = active_remote_jog.take() {
+                                    if prev_axis == Axis::Z {
+                                        if let Some(ref zs) = z_socket {
+                                            let raw_stop = build_z_stop_packet();
+                                            send_z_cmd_with_ack(
+                                                zs,
+                                                &raw_stop,
+                                                &mut z_buf,
+                                                &mut z_status_seen,
+                                                &mut latest_z,
                                             );
-                                            let _ = socket.send_to(&p1.encode(), target_addr);
-                                            pending_stop_p2_at =
-                                                Some(Instant::now() + Duration::from_millis(140));
+                                            last_z_poll = Instant::now() - Duration::from_secs(1);
                                         }
-                                    }
-
-                                    // Start new remote jog if a button is now held
-                                    if let Some((axis, dir)) = remote_jog {
-                                        active_remote_jog = Some((axis, dir));
-                                        if axis == Axis::Z {
-                                            if let Some(ref zs) = z_socket {
-                                                let raw = build_z_jog_packet(
-                                                    dir * CONTINUOUS_JOG_PULSES_Z,
-                                                    z_jog_speed,
-                                                );
-                                                send_z_cmd_with_ack(
-                                                    zs,
-                                                    &raw,
-                                                    &mut z_buf,
-                                                    &mut z_status_seen,
-                                                    &mut latest_z,
-                                                );
-                                                last_z_poll = Instant::now();
-                                            }
-                                        } else {
-                                            auto_stop_at = None;
-                                            active_step_watch = None;
-                                            if pending_stop_p2_at.take().is_some() || xy_needs_reset
-                                            {
-                                                let s_rst =
-                                                    seq_clone.fetch_add(1, Ordering::Relaxed);
-                                                let p2 = Packet::write_request(
-                                                    s_rst,
-                                                    registers::REG_COMMAND,
-                                                    vec![2],
-                                                );
-                                                let _ = send_and_wait_ack(&socket, &p2, &mut buf);
-                                            }
-                                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                            let pkt = build_jog_packet(
-                                                s,
-                                                axis,
-                                                dir * CONTINUOUS_JOG_PULSES_XY,
-                                                &jog_cfg,
-                                            );
-                                            let _ = socket.send_to(&pkt.encode(), target_addr);
-                                            xy_needs_reset = true;
-                                        }
-                                    }
-                                }
-
-                                // 5B. Step-mode position delta watch
-                                if let Some((watch_axis, start_pos, target_delta)) = active_step_watch
-                                {
-                                    let cur_pos = match watch_axis {
-                                        Axis::X => new_st.pos_x,
-                                        Axis::Y => new_st.pos_y,
-                                        Axis::Z => new_st.pos_z,
-                                        Axis::W => new_st.pos_w,
-                                    };
-                                    if (cur_pos - start_pos).abs() >= target_delta {
-                                        active_step_watch = None;
-                                        auto_stop_at = None;
+                                    } else {
                                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                                         let p1 = Packet::write_request(
                                             s,
@@ -524,13 +480,78 @@ impl LaserController {
                                             Some(Instant::now() + Duration::from_millis(140));
                                     }
                                 }
-                                let mut st = status_clone.lock().unwrap();
-                                *st = new_st;
+
+                                // Start new remote jog if a button is now held
+                                if let Some((axis, dir)) = remote_jog {
+                                    active_remote_jog = Some((axis, dir));
+                                    if axis == Axis::Z {
+                                        if let Some(ref zs) = z_socket {
+                                            let raw = build_z_jog_packet(
+                                                dir * CONTINUOUS_JOG_PULSES_Z,
+                                                z_jog_speed,
+                                            );
+                                            send_z_cmd_with_ack(
+                                                zs,
+                                                &raw,
+                                                &mut z_buf,
+                                                &mut z_status_seen,
+                                                &mut latest_z,
+                                            );
+                                            last_z_poll = Instant::now() - Duration::from_secs(1);
+                                        }
+                                    } else {
+                                        auto_stop_at = None;
+                                        active_step_watch = None;
+                                        if pending_stop_p2_at.take().is_some() {
+                                            let s_rst =
+                                                seq_clone.fetch_add(1, Ordering::Relaxed);
+                                            let p2 = Packet::write_request(
+                                                s_rst,
+                                                registers::REG_COMMAND,
+                                                vec![2],
+                                            );
+                                            let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                            thread::sleep(Duration::from_millis(25));
+                                        }
+                                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                        let pkt = build_jog_packet(
+                                            s,
+                                            axis,
+                                            dir * CONTINUOUS_JOG_PULSES_XY,
+                                            &jog_cfg,
+                                        );
+                                        let _ = socket.send_to(&pkt.encode(), target_addr);
+                                    }
+                                }
                             }
+
+                            // 5B. Step-mode position delta watch
+                            if let Some((watch_axis, start_pos, target_delta)) = active_step_watch
+                            {
+                                let cur_pos = match watch_axis {
+                                    Axis::X => new_st.pos_x,
+                                    Axis::Y => new_st.pos_y,
+                                    Axis::Z => new_st.pos_z,
+                                    Axis::W => new_st.pos_w,
+                                };
+                                if (cur_pos - start_pos).abs() >= target_delta {
+                                    active_step_watch = None;
+                                    auto_stop_at = None;
+                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let p1 = Packet::write_request(
+                                        s,
+                                        registers::REG_JOG_RAMP,
+                                        vec![118_000, 1_180_000],
+                                    );
+                                    let _ = socket.send_to(&p1.encode(), target_addr);
+                                    pending_stop_p2_at =
+                                        Some(Instant::now() + Duration::from_millis(140));
+                                }
+                            }
+                            let mut st = status_clone.lock().unwrap();
+                            *st = new_st;
                         }
                     }
-                    Ok(_) => {}
-                    Err(_) => {}
                 }
 
                 // 6. Receive incoming responses from Port 999 (Z-axis / Capacitive Follower)

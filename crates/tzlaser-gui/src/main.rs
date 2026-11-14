@@ -66,6 +66,22 @@ impl Default for TzlaserApp {
         }
         panel_state.jog_mode = panels::JogMode::Step(pulse_config.default_step_mm.clamp(0.01, 1000.0));
 
+        let controller = if let Ok(addr) = panel_state.target_ip.parse::<std::net::SocketAddr>() {
+            let c = LaserController::new(addr);
+            let (min_speed, jog_speed, accel) = pulse_config.jog_pulses_params();
+            c.update_jog_config(
+                tzlaser_protocol::JogConfig {
+                    min_speed,
+                    jog_speed,
+                    accel,
+                },
+                pulse_config.z_jog_speed_reg,
+            );
+            Some(c)
+        } else {
+            None
+        };
+
         Self {
             document: doc,
             selection: Vec::new(),
@@ -76,9 +92,9 @@ impl Default for TzlaserApp {
             ribbon_state: RibbonState::default(),
             props_window_state: PropertiesWindowState::default(),
             pulse_config,
-            controller: None,
+            controller,
             status: MachineStatus::default(),
-            status_message: "Ready. Click 'Open DXF' or '⚙ Properties → Table Properties' to calibrate machine.".to_string(),
+            status_message: "Ready. Auto-connecting to controller (10.1.1.168:502 & :999).".to_string(),
         }
     }
 }
