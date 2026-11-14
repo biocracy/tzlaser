@@ -617,13 +617,18 @@ impl PanelState {
         ))
     }
 
-    /// Synchronize updated layer cutting speeds into active and buffered trajectories
+    /// Synchronize updated layer cutting & travel speeds into active and buffered trajectories
     /// so speed edits in Cutting Layers take effect immediately (even while running or paused).
     pub fn sync_layer_speeds(&mut self, doc: &Document) {
         let seq = doc.compute_cut_sequence();
+        let travel_speed = doc.travel_speed_mm_s(200.0);
         for traj in [&mut self.trajectory, &mut self.full_trajectory] {
             for seg in traj.iter_mut() {
-                if seg.is_rapid || seg.path_index_1based == 0 {
+                if seg.is_rapid {
+                    seg.speed_mm_s = travel_speed;
+                    continue;
+                }
+                if seg.path_index_1based == 0 {
                     continue;
                 }
                 if let Some(info) = seq.get(seg.path_index_1based - 1) {
@@ -1292,15 +1297,27 @@ pub fn render_right_panels(
                         .stroke(row_stroke)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut layer.visible, "");
+                                if !layer.is_travel {
+                                    ui.checkbox(&mut layer.visible, "");
+                                } else {
+                                    ui.add_space(20.0);
+                                }
                                 let swatch_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
-                                let summary = format!(
-                                    "{} paths · {:.0} mm/s · {:.0}% · {}",
-                                    layer.entities.len(),
-                                    layer.params.speed_mm_s,
-                                    layer.params.power_percent,
-                                    layer.params.gas_type
-                                );
+                                let summary = if layer.is_travel {
+                                    format!(
+                                        "Travel · {:.0} mm/s · H:{:.1} mm",
+                                        layer.params.speed_mm_s,
+                                        layer.params.cut_height_mm
+                                    )
+                                } else {
+                                    format!(
+                                        "{} paths · {:.0} mm/s · {:.0}% · {}",
+                                        layer.entities.len(),
+                                        layer.params.speed_mm_s,
+                                        layer.params.power_percent,
+                                        layer.params.gas_type
+                                    )
+                                };
                                 let btn = Button::new(
                                     RichText::new(format!("■  {}", layer.name))
                                         .color(swatch_color)

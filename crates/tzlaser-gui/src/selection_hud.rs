@@ -130,6 +130,9 @@ pub fn render_selection_hud(
                     .width(175.0)
                     .show_ui(ui, |ui| {
                         for (l_idx, layer) in doc.layers.iter().enumerate() {
+                            if layer.is_travel {
+                                continue;
+                            }
                             let swatch = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
                             let selected = all_same_layer && first_layer == Some(l_idx);
                             let label = RichText::new(format!("■ {}", layer.name)).color(swatch);

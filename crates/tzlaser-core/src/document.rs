@@ -19,12 +19,24 @@ impl Color {
     pub const WHITE: Self = Self { r: 255, g: 255, b: 255 };
 }
 
+fn default_cut_height_mm() -> f64 {
+    1.0
+}
+
+fn default_frequency_hz() -> u32 {
+    5000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CuttingParams {
     pub speed_mm_s: f64,
     pub power_percent: f64,
     pub pierce_time_ms: u32,
     pub gas_type: String,
+    #[serde(default = "default_cut_height_mm")]
+    pub cut_height_mm: f64,
+    #[serde(default = "default_frequency_hz")]
+    pub frequency_hz: u32,
 }
 
 impl Default for CuttingParams {
@@ -34,6 +46,8 @@ impl Default for CuttingParams {
             power_percent: 80.0,
             pierce_time_ms: 200,
             gas_type: "Air".to_string(),
+            cut_height_mm: default_cut_height_mm(),
+            frequency_hz: default_frequency_hz(),
         }
     }
 }
@@ -421,6 +435,8 @@ pub struct Layer {
     pub entities: Vec<Entity>,
     #[serde(default)]
     pub is_custom: bool,
+    #[serde(default)]
+    pub is_travel: bool,
 }
 
 impl Layer {
@@ -432,6 +448,26 @@ impl Layer {
             params: CuttingParams::default(),
             entities: Vec::new(),
             is_custom: false,
+            is_travel: false,
+        }
+    }
+
+    pub fn new_travel() -> Self {
+        Self {
+            name: "Empty Move / Travel".to_string(),
+            color: Color { r: 130, g: 165, b: 205 },
+            visible: true,
+            params: CuttingParams {
+                speed_mm_s: 200.0,
+                power_percent: 0.0,
+                pierce_time_ms: 0,
+                gas_type: "None".to_string(),
+                cut_height_mm: 5.0,
+                frequency_hz: 0,
+            },
+            entities: Vec::new(),
+            is_custom: false,
+            is_travel: true,
         }
     }
 }
@@ -549,6 +585,7 @@ impl Document {
             layers: vec![
                 Layer::new("Cut 1", Color::RED),
                 Layer::new("Mark / Engrave", Color::BLUE),
+                Layer::new_travel(),
             ],
             sort_mode: SortMode::default(),
             manual_sequence: Vec::new(),
@@ -557,6 +594,22 @@ impl Document {
             saved_cut_order: Vec::new(),
             use_saved_cut_order: false,
         }
+    }
+
+    /// Ensure the dedicated Empty Move / Travel layer exists in `self.layers`.
+    pub fn ensure_travel_layer(&mut self) {
+        if !self.layers.iter().any(|l| l.is_travel) {
+            self.layers.push(Layer::new_travel());
+        }
+    }
+
+    /// Effective rapid/empty-move travel speed from the Empty Move / Travel layer (or fallback).
+    pub fn travel_speed_mm_s(&self, fallback_mm_s: f64) -> f64 {
+        self.layers
+            .iter()
+            .find(|l| l.is_travel)
+            .map(|l| l.params.speed_mm_s.max(1.0))
+            .unwrap_or_else(|| fallback_mm_s.max(10.0))
     }
 
     pub fn bounding_box(&self) -> Option<Rect> {
@@ -966,8 +1019,13 @@ impl Document {
         let color = PALETTE[self.layers.len() % PALETTE.len()];
         let mut layer = Layer::new(name, color);
         layer.is_custom = true;
-        self.layers.push(layer);
-        self.layers.len() - 1
+        if let Some(travel_pos) = self.layers.iter().position(|l| l.is_travel) {
+            self.layers.insert(travel_pos, layer);
+            travel_pos
+        } else {
+            self.layers.push(layer);
+            self.layers.len() - 1
+        }
     }
 
     /// Move all entities in `selection` to `target_layer_idx`, updating `selection` and
@@ -1093,10 +1151,18 @@ impl Document {
 
         let mut all_entities = Vec::new();
         let mut custom_layers = Vec::new();
+        let mut travel_layer: Option<Layer> = None;
+        let mut preserved_settings: HashMap<String, (Color, bool, CuttingParams)> = HashMap::new();
         for layer in self.layers.drain(..) {
-            if layer.is_custom {
+            if layer.is_travel {
+                travel_layer = Some(layer);
+            } else if layer.is_custom {
                 custom_layers.push(layer);
             } else {
+                preserved_settings.insert(
+                    layer.name.to_lowercase(),
+                    (layer.color, layer.visible, layer.params.clone()),
+                );
                 flatten_entities(layer.entities, &mut all_entities);
             }
         }
@@ -1148,30 +1214,35 @@ impl Document {
         }
 
         let mut new_layers = Vec::new();
+        let make_classified_layer = |name: &str, default_color: Color, entities: Vec<Entity>| -> Layer {
+            let mut layer = Layer::new(name, default_color);
+            if let Some((color, visible, params)) = preserved_settings.get(&name.to_lowercase()) {
+                layer.color = *color;
+                layer.visible = *visible;
+                layer.params = params.clone();
+            }
+            layer.entities = entities;
+            layer
+        };
 
         if !outer_shapes.is_empty() {
-            let mut outer_layer = Layer::new("Outer Profiles", Color::GREEN);
-            outer_layer.entities = outer_shapes;
-            new_layers.push(outer_layer);
+            new_layers.push(make_classified_layer("Outer Profiles", Color::GREEN, outer_shapes));
         }
 
         if !interior_shapes.is_empty() {
-            let mut inner_layer = Layer::new("Interior Profiles", Color::YELLOW);
-            inner_layer.entities = interior_shapes;
-            new_layers.push(inner_layer);
+            new_layers.push(make_classified_layer("Interior Profiles", Color::YELLOW, interior_shapes));
         }
 
         if !open_paths.is_empty() {
-            let mut bend_layer = Layer::new("Bend / Open Lines", Color::MAGENTA);
-            bend_layer.entities = open_paths;
-            new_layers.push(bend_layer);
+            new_layers.push(make_classified_layer("Bend / Open Lines", Color::MAGENTA, open_paths));
         }
 
         if new_layers.is_empty() && custom_layers.is_empty() {
-            new_layers.push(Layer::new("Outer Profiles", Color::GREEN));
+            new_layers.push(make_classified_layer("Outer Profiles", Color::GREEN, Vec::new()));
         }
 
         new_layers.extend(custom_layers);
+        new_layers.push(travel_layer.unwrap_or_else(Layer::new_travel));
         self.layers = new_layers;
     }
 
@@ -1234,7 +1305,7 @@ impl Document {
         let mut raw_paths = Vec::new();
 
         for (l_idx, layer) in self.layers.iter().enumerate() {
-            if !layer.visible {
+            if !layer.visible || layer.is_travel {
                 continue;
             }
             let name_lower = layer.name.to_lowercase();
@@ -1737,7 +1808,7 @@ impl Document {
     /// starting from `start_origin` and returning to `start_origin` at the end.
     pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
         let seq = self.compute_cut_sequence();
-        let rapid_speed = rapid_speed_mm_s.max(10.0);
+        let rapid_speed = self.travel_speed_mm_s(rapid_speed_mm_s);
         let mut segments = Vec::new();
         let mut current_pos = start_origin;
 
@@ -2481,6 +2552,26 @@ mod tests {
         assert_eq!(bend.entities.len(), 1);
         assert!(custom.is_custom);
         assert_eq!(custom.entities.len(), 1);
+
+        // User edits default Outer Profiles and Empty Move / Travel parameters, then re-runs auto_classify
+        let outer_idx = doc.layers.iter().position(|l| l.name == "Outer Profiles").unwrap();
+        doc.layers[outer_idx].params.speed_mm_s = 37.5;
+        doc.layers[outer_idx].params.cut_height_mm = 1.8;
+        doc.layers[outer_idx].params.frequency_hz = 3200;
+        let travel_idx = doc.layers.iter().position(|l| l.is_travel).expect("Travel layer must exist");
+        doc.layers[travel_idx].params.speed_mm_s = 350.0;
+
+        doc.auto_classify_profiles();
+        let outer_after = doc.layers.iter().find(|l| l.name == "Outer Profiles").unwrap();
+        assert!((outer_after.params.speed_mm_s - 37.5).abs() < 1e-6);
+        assert!((outer_after.params.cut_height_mm - 1.8).abs() < 1e-6);
+        assert_eq!(outer_after.params.frequency_hz, 3200);
+        let travel_after = doc.layers.iter().find(|l| l.is_travel).unwrap();
+        assert!((travel_after.params.speed_mm_s - 350.0).abs() < 1e-6);
+
+        // Verify travel layer speed drives rapid segments in build_motion_trajectory
+        let traj = doc.build_motion_trajectory(Point::ORIGIN, 200.0);
+        assert!((traj[0].speed_mm_s - 350.0).abs() < 1e-6);
     }
 
     #[test]

@@ -289,6 +289,7 @@ impl DxfImporter {
         if doc.layers.len() <= 1 {
             doc.auto_classify_profiles();
         }
+        doc.ensure_travel_layer();
 
         Ok(doc)
     }
@@ -597,13 +598,14 @@ mod tests {
             assert!((bbox.min_y() - 198.48).abs() < 1.0, "Expected min_y ~198.48, got {}", bbox.min_y());
             assert!((bbox.max_y() - 937.35).abs() < 1.0, "Expected max_y ~937.35, got {}", bbox.max_y());
             
-            // Single-layer DXF is automatically chained and classified into 10 outer panels + 174 interior holes
+            // Single-layer DXF is automatically chained and classified into 10 outer panels + 174 interior holes + Empty Move / Travel
             assert_eq!(doc.entity_count(), 184);
-            assert_eq!(doc.layers.len(), 2);
+            assert_eq!(doc.layers.len(), 3);
             assert_eq!(doc.layers[0].name, "Outer Profiles");
             assert_eq!(doc.layers[0].entities.len(), 10);
             assert_eq!(doc.layers[1].name, "Interior Profiles");
             assert_eq!(doc.layers[1].entities.len(), 174);
+            assert!(doc.layers[2].is_travel);
         }
     }
 

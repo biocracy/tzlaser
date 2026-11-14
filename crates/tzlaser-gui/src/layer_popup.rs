@@ -43,14 +43,17 @@ pub fn render_layer_popup(
                 "■",
             );
             ui.label(RichText::new(&layer_title).strong());
-            ui.label(
-                RichText::new(format!("({} profiles)", profile_count))
-                    .size(11.5)
-                    .weak(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut doc.layers[layer_idx].visible, "Visible");
-            });
+            let count_text = if doc.layers[layer_idx].is_travel {
+                "(Empty Move / Travel)".to_string()
+            } else {
+                format!("({} profiles)", profile_count)
+            };
+            ui.label(RichText::new(count_text).size(11.5).weak());
+            if !doc.layers[layer_idx].is_travel {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(&mut doc.layers[layer_idx].visible, "Visible");
+                });
+            }
         });
 
         ui.separator();
@@ -78,8 +81,10 @@ pub fn render_layer_popup(
                     .width(175.0)
                     .show_ui(ui, |ui| {
                         for (i, preset) in panel_state.material_db.materials.iter().enumerate() {
+                            let prefix = if preset.is_builtin { "" } else { "★ " };
                             let label = format!(
-                                "{} ({:.0} mm/s, {:.0}%)",
+                                "{}{} ({:.0} mm/s, {:.0}%)",
+                                prefix,
                                 preset.name,
                                 preset.params.speed_mm_s,
                                 preset.params.power_percent
@@ -168,6 +173,24 @@ pub fn render_layer_popup(
                 );
                 ui.end_row();
 
+                ui.label(RichText::new("Cut Height:").strong());
+                ui.add(
+                    DragValue::new(&mut params.cut_height_mm)
+                        .range(0.1..=50.0)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Frequency:").strong());
+                ui.add(
+                    DragValue::new(&mut params.frequency_hz)
+                        .range(0..=50000)
+                        .speed(50.0)
+                        .suffix(" Hz"),
+                );
+                ui.end_row();
+
                 ui.label(RichText::new("Assist Gas:").strong());
                 ComboBox::from_id_salt("layer_popup_gas")
                     .selected_text(&params.gas_type)
@@ -234,6 +257,7 @@ pub fn render_layer_popup(
                         thickness_mm: panel_state.new_mat_thickness,
                         params: doc.layers[layer_idx].params.clone(),
                         notes: String::new(),
+                        is_builtin: false,
                     };
                     match panel_state.material_db.upsert_material(preset) {
                         Ok(updated) => {
@@ -300,3 +324,4 @@ pub fn render_layer_popup(
         panel_state.sync_layer_speeds(doc);
     }
 }
+

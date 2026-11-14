@@ -10,6 +10,8 @@ pub struct MaterialPreset {
     pub params: CuttingParams,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub is_builtin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,8 +69,11 @@ impl MaterialLibrary {
                         power_percent: 85.0,
                         pierce_time_ms: 150,
                         gas_type: "Air".to_string(),
+                        cut_height_mm: 1.0,
+                        frequency_hz: 5000,
                     },
                     notes: "Fast thin-sheet air cut".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Mild Steel 2mm (O2)".to_string(),
@@ -79,8 +84,11 @@ impl MaterialLibrary {
                         power_percent: 95.0,
                         pierce_time_ms: 250,
                         gas_type: "O2".to_string(),
+                        cut_height_mm: 1.2,
+                        frequency_hz: 4000,
                     },
                     notes: "Clean oxygen-assisted cut".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Mild Steel 3mm (O2)".to_string(),
@@ -91,8 +99,11 @@ impl MaterialLibrary {
                         power_percent: 100.0,
                         pierce_time_ms: 350,
                         gas_type: "O2".to_string(),
+                        cut_height_mm: 1.2,
+                        frequency_hz: 3000,
                     },
                     notes: "Standard 3mm mild steel".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Mild Steel 5mm (O2)".to_string(),
@@ -103,8 +114,11 @@ impl MaterialLibrary {
                         power_percent: 100.0,
                         pierce_time_ms: 500,
                         gas_type: "O2".to_string(),
+                        cut_height_mm: 1.5,
+                        frequency_hz: 2000,
                     },
                     notes: "Heavy plate pierce & slow feed".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Stainless 1mm (N2)".to_string(),
@@ -115,8 +129,11 @@ impl MaterialLibrary {
                         power_percent: 90.0,
                         pierce_time_ms: 150,
                         gas_type: "N2".to_string(),
+                        cut_height_mm: 0.8,
+                        frequency_hz: 6000,
                     },
                     notes: "Oxide-free nitrogen cut".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Stainless 2mm (N2)".to_string(),
@@ -127,8 +144,11 @@ impl MaterialLibrary {
                         power_percent: 100.0,
                         pierce_time_ms: 250,
                         gas_type: "N2".to_string(),
+                        cut_height_mm: 0.8,
+                        frequency_hz: 5000,
                     },
                     notes: "High-pressure nitrogen".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Aluminum 1.5mm (N2)".to_string(),
@@ -139,8 +159,11 @@ impl MaterialLibrary {
                         power_percent: 95.0,
                         pierce_time_ms: 200,
                         gas_type: "N2".to_string(),
+                        cut_height_mm: 0.8,
+                        frequency_hz: 6000,
                     },
                     notes: "Reflective alloy cut".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Aluminum 3mm (N2)".to_string(),
@@ -151,8 +174,11 @@ impl MaterialLibrary {
                         power_percent: 100.0,
                         pierce_time_ms: 350,
                         gas_type: "N2".to_string(),
+                        cut_height_mm: 1.0,
+                        frequency_hz: 5000,
                     },
                     notes: "3mm aluminum plate".to_string(),
+                    is_builtin: true,
                 },
                 MaterialPreset {
                     name: "Engrave / Mark".to_string(),
@@ -163,8 +189,11 @@ impl MaterialLibrary {
                         power_percent: 25.0,
                         pierce_time_ms: 0,
                         gas_type: "Air".to_string(),
+                        cut_height_mm: 2.0,
+                        frequency_hz: 20000,
                     },
                     notes: "Surface marking / etch pass".to_string(),
+                    is_builtin: true,
                 },
             ],
             layer_configs: Vec::new(),
@@ -194,6 +223,16 @@ impl MaterialLibrary {
                 if let Ok(raw) = std::fs::read_to_string(p) {
                     if let Ok(mut parsed) = serde_json::from_str::<MaterialLibrary>(&raw) {
                         parsed.db_path = Some(p.clone());
+                        // Migrate legacy DB entries that didn't store `is_builtin`
+                        if parsed.materials.iter().all(|m| !m.is_builtin) {
+                            let defaults = Self::with_default_presets();
+                            for m in &mut parsed.materials {
+                                if defaults.materials.iter().any(|d| d.name == m.name) {
+                                    m.is_builtin = true;
+                                }
+                            }
+                        }
+                        parsed.sort_user_before_defaults();
                         return parsed;
                     }
                 }
@@ -203,6 +242,21 @@ impl MaterialLibrary {
         db.db_path = path;
         let _ = db.save_db();
         db
+    }
+
+    /// Keep all user-saved profiles (`!is_builtin`) before built-in default profiles (`is_builtin`).
+    pub fn sort_user_before_defaults(&mut self) {
+        let mut user = Vec::with_capacity(self.materials.len());
+        let mut builtins = Vec::with_capacity(self.materials.len());
+        for m in self.materials.drain(..) {
+            if m.is_builtin {
+                builtins.push(m);
+            } else {
+                user.push(m);
+            }
+        }
+        self.materials.extend(user);
+        self.materials.extend(builtins);
     }
 
     pub fn db_path(&self) -> Option<&PathBuf> {
@@ -223,8 +277,10 @@ impl MaterialLibrary {
         std::fs::write(path, json).map_err(|e| format!("Failed to write material DB: {}", e))
     }
 
-    /// Insert or update a material preset by name (case-insensitive) and persist.
-    pub fn upsert_material(&mut self, preset: MaterialPreset) -> Result<bool, String> {
+    /// Insert or update a user-saved material preset by name (case-insensitive) and persist.
+    /// User-saved presets are always placed before built-in default presets.
+    pub fn upsert_material(&mut self, mut preset: MaterialPreset) -> Result<bool, String> {
+        preset.is_builtin = false;
         let updated = if let Some(existing) = self
             .materials
             .iter_mut()
@@ -233,9 +289,15 @@ impl MaterialLibrary {
             *existing = preset;
             true
         } else {
-            self.materials.push(preset);
+            let insert_pos = self
+                .materials
+                .iter()
+                .position(|m| m.is_builtin)
+                .unwrap_or(self.materials.len());
+            self.materials.insert(insert_pos, preset);
             false
         };
+        self.sort_user_before_defaults();
         self.save_db()?;
         Ok(updated)
     }
@@ -352,7 +414,7 @@ mod tests {
         assert!(!db.materials.is_empty());
         assert!(db_file.exists());
 
-        // Upsert a custom material preset
+        // Upsert a custom material preset (must appear before built-in defaults)
         let custom = MaterialPreset {
             name: "Brass 1mm (N2)".to_string(),
             material: "Brass".to_string(),
@@ -362,10 +424,16 @@ mod tests {
                 power_percent: 95.0,
                 pierce_time_ms: 280,
                 gas_type: "N2".to_string(),
+                cut_height_mm: 1.1,
+                frequency_hz: 4500,
             },
             notes: "Test brass".to_string(),
+            is_builtin: false,
         };
         assert!(!db.upsert_material(custom.clone()).unwrap());
+        assert_eq!(db.materials[0].name, "Brass 1mm (N2)");
+        assert!(!db.materials[0].is_builtin);
+        assert!(db.materials[1].is_builtin);
 
         // Save current document layers into DB while preserving entities on apply
         let mut doc = Document::new();
@@ -402,3 +470,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
+
