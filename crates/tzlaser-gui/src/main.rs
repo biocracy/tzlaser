@@ -58,6 +58,8 @@ impl Default for TzlaserApp {
         canvas_state.bed_width_mm = pulse_config.table_width_mm as f32;
         canvas_state.bed_height_mm = pulse_config.table_height_mm as f32;
         canvas_state.origin_corner = pulse_config.origin_corner.clone();
+        canvas_state.home_retract_x_mm = pulse_config.home_retract_x_mm.max(0.0);
+        canvas_state.home_retract_y_mm = pulse_config.home_retract_y_mm.max(0.0);
 
         let mut panel_state = PanelState::default();
         panel_state.material_db =

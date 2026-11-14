@@ -46,6 +46,12 @@ fn default_controller_ip() -> String {
 fn default_z_follower_port() -> u16 {
     999
 }
+fn default_retract_xy_mm() -> f64 {
+    10.0
+}
+fn default_retract_z_mm() -> f64 {
+    5.0
+}
 
 /// Persistent Table & Machine Properties configuration (pulses/mm, table dimensions,
 /// jog speeds/accelerations, axis polarity, and controller network endpoints).
@@ -63,6 +69,12 @@ pub struct PulseConfig {
     pub origin_corner: String,
     #[serde(default = "default_true")]
     pub soft_limits_enabled: bool,
+    #[serde(default = "default_retract_xy_mm")]
+    pub home_retract_x_mm: f64,
+    #[serde(default = "default_retract_xy_mm")]
+    pub home_retract_y_mm: f64,
+    #[serde(default = "default_retract_z_mm")]
+    pub home_retract_z_mm: f64,
 
     // 2. Axis Calibration (Pulses per mm / deg & Direction Polarity)
     #[serde(default = "default_pulses_per_mm")]
@@ -110,6 +122,9 @@ impl Default for PulseConfig {
             z_max_travel_mm: default_z_max_travel_mm(),
             origin_corner: default_origin_corner(),
             soft_limits_enabled: true,
+            home_retract_x_mm: default_retract_xy_mm(),
+            home_retract_y_mm: default_retract_xy_mm(),
+            home_retract_z_mm: default_retract_z_mm(),
             pulses_per_mm_x: default_pulses_per_mm(),
             pulses_per_mm_y: default_pulses_per_mm(),
             pulses_per_mm_z: default_pulses_per_mm_z(),
@@ -243,6 +258,9 @@ mod tests {
         cfg.pulses_per_mm_y = 590.0;
         cfg.pulses_per_mm_z = 1000.0;
         cfg.jog_speed_mm_s = 12.0;
+        cfg.home_retract_x_mm = 15.0;
+        cfg.home_retract_y_mm = 12.5;
+        cfg.home_retract_z_mm = 7.5;
         cfg.save().expect("should save machine properties");
 
         let reloaded = PulseConfig::load_or_init(Some(path.clone()));
@@ -252,6 +270,9 @@ mod tests {
         assert!((reloaded.pulses_per_mm_y - 590.0).abs() < 1e-6);
         assert!((reloaded.pulses_per_mm_z - 1000.0).abs() < 1e-6);
         assert!((reloaded.jog_speed_mm_s - 12.0).abs() < 1e-6);
+        assert!((reloaded.home_retract_x_mm - 15.0).abs() < 1e-6);
+        assert!((reloaded.home_retract_y_mm - 12.5).abs() < 1e-6);
+        assert!((reloaded.home_retract_z_mm - 7.5).abs() < 1e-6);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -169,7 +169,9 @@ pub struct CanvasState {
     pub show_cut_direction: bool,
     pub show_grid: bool,
     pub show_rulers: bool,
-    pub home_retraction_mm: f64,
+    pub show_retraction_zone: bool,
+    pub home_retract_x_mm: f64,
+    pub home_retract_y_mm: f64,
     pub color_by_cut_index: bool,
     pub color_palette: ColorPalette,
     pub manual_sort_active: bool,
@@ -202,7 +204,9 @@ impl Default for CanvasState {
             show_cut_direction: true,
             show_grid: true,
             show_rulers: true,
-            home_retraction_mm: 10.0,
+            show_retraction_zone: true,
+            home_retract_x_mm: 10.0,
+            home_retract_y_mm: 10.0,
             color_by_cut_index: false,
             color_palette: ColorPalette::Rainbow,
             manual_sort_active: false,
@@ -1167,8 +1171,9 @@ pub fn render_canvas(
 
     // 5b. Render Homing Retraction Exclusion Zone in the negative machine-coordinate realm
     // (0,0 origin remains 0,0; the retraction zone sits behind the origin toward the sensors)
-    if state.home_retraction_mm > 0.01 {
-        let r = state.home_retraction_mm;
+    let rx = state.home_retract_x_mm.max(0.0);
+    let ry = state.home_retract_y_mm.max(0.0);
+    if state.show_retraction_zone && (rx > 0.01 || ry > 0.01) {
         let x_sign = x_screen_dir.x as f64;
         let y_world_sign = -y_screen_dir.y as f64;
         let w = state.bed_width_mm as f64;
@@ -1180,38 +1185,47 @@ pub fn render_canvas(
         let fill_col = Color32::from_rgba_unmultiplied(220, 58, 58, 42);
         let stroke_col = Color32::from_rgba_unmultiplied(240, 88, 78, 175);
 
-        // X-negative strip: mx in [-r, 0], my in [-r, H]
-        let x_strip = Rect::from_two_pos(
-            state.world_to_screen(to_world(-r, -r), origin_screen),
-            state.world_to_screen(to_world(0.0, h), origin_screen),
-        );
-        // Y-negative strip: mx in [0, W], my in [-r, 0]
-        let y_strip = Rect::from_two_pos(
-            state.world_to_screen(to_world(0.0, -r), origin_screen),
-            state.world_to_screen(to_world(w, 0.0), origin_screen),
-        );
-        painter.rect_filled(x_strip, 0.0, fill_col);
-        painter.rect_filled(y_strip, 0.0, fill_col);
+        // X-negative strip: mx in [-rx, 0], my in [-ry, H]
+        if rx > 0.01 {
+            let x_strip = Rect::from_two_pos(
+                state.world_to_screen(to_world(-rx, -ry), origin_screen),
+                state.world_to_screen(to_world(0.0, h), origin_screen),
+            );
+            painter.rect_filled(x_strip, 0.0, fill_col);
+        }
+        // Y-negative strip: mx in [0, W], my in [-ry, 0]
+        if ry > 0.01 {
+            let y_strip = Rect::from_two_pos(
+                state.world_to_screen(to_world(0.0, -ry), origin_screen),
+                state.world_to_screen(to_world(w, 0.0), origin_screen),
+            );
+            painter.rect_filled(y_strip, 0.0, fill_col);
+        }
 
         let l_outline: Vec<Pos2> = [
-            to_world(-r, -r),
-            to_world(w, -r),
+            to_world(-rx, -ry),
+            to_world(w, -ry),
             to_world(w, 0.0),
             to_world(0.0, 0.0),
             to_world(0.0, h),
-            to_world(-r, h),
+            to_world(-rx, h),
         ]
         .into_iter()
         .map(|p| state.world_to_screen(p, origin_screen))
         .collect();
         draw_dashed_closed_poly(&painter, &l_outline, Stroke::new(1.3_f32, stroke_col));
 
-        if (r as f32) * state.zoom >= 7.0 {
-            let lbl_pos = state.world_to_screen(to_world(w * 0.5, -r * 0.5), origin_screen);
+        let max_r = rx.max(ry);
+        if (max_r as f32) * state.zoom >= 7.0 {
+            let lbl_pos = if ry > 0.01 {
+                state.world_to_screen(to_world(w * 0.5, -ry * 0.5), origin_screen)
+            } else {
+                state.world_to_screen(to_world(-rx * 0.5, h * 0.5), origin_screen)
+            };
             painter.text(
                 lbl_pos,
                 egui::Align2::CENTER_CENTER,
-                format!("Homing Retraction Exclusion (-{:.0} mm)", r),
+                format!("Homing Retraction Exclusion (X: -{:.0} mm, Y: -{:.0} mm)", rx, ry),
                 egui::FontId::proportional(10.0),
                 Color32::from_rgba_unmultiplied(245, 130, 120, 210),
             );

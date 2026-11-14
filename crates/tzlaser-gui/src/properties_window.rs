@@ -45,6 +45,8 @@ pub fn sync_and_save_properties(
     canvas_state.bed_width_mm = pulse_config.table_width_mm.max(10.0) as f32;
     canvas_state.bed_height_mm = pulse_config.table_height_mm.max(10.0) as f32;
     canvas_state.origin_corner = pulse_config.origin_corner.clone();
+    canvas_state.home_retract_x_mm = pulse_config.home_retract_x_mm.max(0.0);
+    canvas_state.home_retract_y_mm = pulse_config.home_retract_y_mm.max(0.0);
     panel_state.target_ip = pulse_config.controller_ip.clone();
 
     if let Some(ref c) = controller {
@@ -229,6 +231,50 @@ pub fn render_properties_window(
                                 .speed(1.0)
                                 .suffix(" mm"),
                         )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("X Home Retract:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.home_retract_x_mm)
+                                .range(0.0..=500.0)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text("Homing retraction distance on X axis after sensor trigger (exclusion zone in negative realm)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    ui.label("Y Home Retract:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.home_retract_y_mm)
+                                .range(0.0..=500.0)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text("Homing retraction distance on Y axis after sensor trigger (exclusion zone in negative realm)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Z Home Retract:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.home_retract_z_mm)
+                                .range(0.0..=500.0)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text("Homing retraction distance on Z axis after upper sensor trigger")
                         .changed()
                     {
                         changed = true;

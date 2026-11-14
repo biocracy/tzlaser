@@ -744,6 +744,19 @@ fn render_view_tab(
                 {
                     canvas_state.show_rulers = !canvas_state.show_rulers;
                 }
+
+                let (ret_text, ret_color, ret_bg) = if canvas_state.show_retraction_zone {
+                    ("🛡 Retract: ON", Color32::from_rgb(245, 130, 120), Color32::from_rgb(78, 28, 28))
+                } else {
+                    ("🛡 Retract: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                if ui
+                    .add(Button::new(RichText::new(ret_text).size(11.0).color(ret_color).strong()).fill(ret_bg).min_size(Vec2::new(102.0, 19.0)))
+                    .on_hover_text("Toggle homing retraction exclusion zone overlay in negative coordinates")
+                    .clicked()
+                {
+                    canvas_state.show_retraction_zone = !canvas_state.show_retraction_zone;
+                }
             });
         });
 
