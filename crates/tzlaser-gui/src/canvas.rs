@@ -897,6 +897,7 @@ pub fn render_canvas(
                     selection.clear();
                     selection.push(hit);
                 }
+                doc.expand_selection_with_groups(selection);
                 state.is_dragging_selection = true;
                 state.box_select_start = None;
             } else {
@@ -964,6 +965,9 @@ pub fn render_canvas(
                             }
                         }
                     }
+                }
+                if !state.manual_sort_active {
+                    doc.expand_selection_with_groups(selection);
                 }
             }
         }

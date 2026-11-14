@@ -648,6 +648,10 @@ pub struct Document {
     pub use_saved_cut_order: bool,
     #[serde(default, with = "tuple_map_serde")]
     pub obstacle_exclusion_mm: HashMap<(usize, usize), f64>,
+    #[serde(default, with = "tuple_map_serde")]
+    pub entity_groups: HashMap<(usize, usize), u64>,
+    #[serde(default)]
+    pub next_group_id: u64,
 }
 
 impl Default for Document {
@@ -671,6 +675,8 @@ impl Document {
             saved_cut_order: Vec::new(),
             use_saved_cut_order: false,
             obstacle_exclusion_mm: HashMap::new(),
+            entity_groups: HashMap::new(),
+            next_group_id: 0,
         }
     }
 
@@ -951,18 +957,81 @@ impl Document {
             if let Some(layer) = self.layers.get_mut(l_idx) {
                 e_indices.sort_unstable_by(|a, b| b.cmp(a)); // remove in reverse order
                 e_indices.dedup();
-                for e in e_indices {
-                    if e < layer.entities.len() {
-                        layer.entities.remove(e);
+                for e in &e_indices {
+                    if *e < layer.entities.len() {
+                        layer.entities.remove(*e);
                     }
+                }
+                // Remap entity_groups and obstacle_exclusion_mm after removals in l_idx
+                let remap_index = |old_e: usize| -> Option<usize> {
+                    if e_indices.contains(&old_e) {
+                        None
+                    } else {
+                        let removed_below = e_indices.iter().filter(|&&r| r < old_e).count();
+                        Some(old_e - removed_below)
+                    }
+                };
+                if !self.entity_groups.is_empty() {
+                    let mut next = HashMap::with_capacity(self.entity_groups.len());
+                    for ((gl, ge), gid) in self.entity_groups.drain() {
+                        if gl == l_idx {
+                            if let Some(ne) = remap_index(ge) {
+                                next.insert((gl, ne), gid);
+                            }
+                        } else {
+                            next.insert((gl, ge), gid);
+                        }
+                    }
+                    self.entity_groups = next;
+                }
+                if !self.obstacle_exclusion_mm.is_empty() {
+                    let mut next = HashMap::with_capacity(self.obstacle_exclusion_mm.len());
+                    for ((ol, oe), r) in self.obstacle_exclusion_mm.drain() {
+                        if ol == l_idx {
+                            if let Some(ne) = remap_index(oe) {
+                                next.insert((ol, ne), r);
+                            }
+                        } else {
+                            next.insert((ol, oe), r);
+                        }
+                    }
+                    self.obstacle_exclusion_mm = next;
+                }
+            }
+        }
+    }
+
+    /// Expand `selection` to include all members of any cross-layer logical group
+    /// (`entity_groups`) that overlaps `selection`.
+    pub fn expand_selection_with_groups(&self, selection: &mut Vec<(usize, usize)>) {
+        if self.entity_groups.is_empty() || selection.is_empty() {
+            return;
+        }
+        let gids: std::collections::HashSet<u64> = selection
+            .iter()
+            .filter_map(|pair| self.entity_groups.get(pair).copied())
+            .collect();
+        if gids.is_empty() {
+            return;
+        }
+        for (&pair, &gid) in &self.entity_groups {
+            if gids.contains(&gid) && !selection.contains(&pair) {
+                if self
+                    .layers
+                    .get(pair.0)
+                    .and_then(|l| l.entities.get(pair.1))
+                    .is_some()
+                {
+                    selection.push(pair);
                 }
             }
         }
     }
 
     /// Group selected entities into a single compound object.
-    /// All relative positions and cut sequence order of the profiles stay strictly fixed.
-    /// Updates selection to point to the new single grouped entity.
+    /// When entities span multiple layers (e.g. cutting paths + obstacles), each entity
+    /// retains its own layer and identity via a cross-layer logical group ID.
+    /// Single-layer selections are combined into `Entity::Group` with cut order preserved.
     pub fn group_selection(&mut self, selection: &mut Vec<(usize, usize)>) -> Option<(usize, usize)> {
         if selection.len() <= 1 {
             return selection.first().copied();
@@ -975,6 +1044,22 @@ impl Document {
             if seen_sel.insert((l, e)) {
                 selected_list.push((l, e));
             }
+        }
+
+        let has_obstacle = selected_list
+            .iter()
+            .any(|&(l, _)| self.layers.get(l).map_or(false, |ly| ly.is_obstacle));
+        let has_non_obstacle = selected_list
+            .iter()
+            .any(|&(l, _)| self.layers.get(l).map_or(false, |ly| !ly.is_obstacle));
+        if has_obstacle && has_non_obstacle {
+            self.expand_selection_with_groups(selection);
+            self.next_group_id += 1;
+            let gid = self.next_group_id;
+            for &pair in selection.iter() {
+                self.entity_groups.insert(pair, gid);
+            }
+            return selection.first().copied();
         }
 
         let current_seq = self.compute_cut_sequence();
@@ -1061,11 +1146,21 @@ impl Document {
         Some((target_layer_idx, new_idx))
     }
 
-    /// Ungroup any selected Group entities back into individual entities.
+    /// Ungroup any selected Group entities or cross-layer logical groups back into individual entities.
     pub fn ungroup_selection(&mut self, selection: &mut Vec<(usize, usize)>) {
         self.pasted_origins.clear();
         self.saved_cut_order.clear();
         self.use_saved_cut_order = false;
+
+        let gids_to_dissolve: std::collections::HashSet<u64> = selection
+            .iter()
+            .filter_map(|pair| self.entity_groups.get(pair).copied())
+            .collect();
+        if !gids_to_dissolve.is_empty() {
+            self.entity_groups
+                .retain(|_, gid| !gids_to_dissolve.contains(gid));
+        }
+
         let mut new_selection = Vec::new();
 
         let mut to_unpack: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1100,9 +1195,12 @@ impl Document {
         }
     }
 
-    /// Check if the selection contains any Group entity
+    /// Check if the selection contains any Group entity or cross-layer logical group member.
     pub fn selection_has_group(&self, selection: &[(usize, usize)]) -> bool {
         for &(l, e) in selection {
+            if self.entity_groups.contains_key(&(l, e)) {
+                return true;
+            }
             if let Some(layer) = self.layers.get(l) {
                 if let Some(Entity::Group { .. }) = layer.entities.get(e) {
                     return true;
@@ -1254,6 +1352,15 @@ impl Document {
                 remapped.insert((nl, ne), r);
             }
             self.obstacle_exclusion_mm = remapped;
+        }
+
+        if !self.entity_groups.is_empty() {
+            let mut remapped = HashMap::with_capacity(self.entity_groups.len());
+            for ((old_l, old_e), gid) in self.entity_groups.drain() {
+                let (nl, ne) = old_to_new.get(&(old_l, old_e)).copied().unwrap_or((old_l, old_e));
+                remapped.insert((nl, ne), gid);
+            }
+            self.entity_groups = remapped;
         }
 
         true
@@ -3007,6 +3114,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_group_mixed_paths_and_obstacles_preserves_identity() {
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(10.0, 0.0),
+        });
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(90.0, 0.0),
+            end: Point::new(100.0, 0.0),
+        });
+        let obs_layer = doc.ensure_obstacle_layer();
+        doc.layers[obs_layer].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(40.0, -10.0),
+                Point::new(60.0, -10.0),
+                Point::new(60.0, 10.0),
+                Point::new(40.0, 10.0),
+            ],
+            closed: true,
+        });
+        doc.set_obstacle_exclusion_radius(obs_layer, 0, 2.0);
+
+        // Group path 0 (layer 0) and the obstacle (obs_layer)
+        let mut sel = vec![(0, 0), (obs_layer, 0)];
+        doc.group_selection(&mut sel);
+
+        // Obstacle must remain on its obstacle layer and NOT be cut
+        assert!(doc.layers[obs_layer].is_obstacle);
+        assert_eq!(doc.layers[obs_layer].entities.len(), 1);
+        assert_eq!(doc.compute_cut_sequence().len(), 2);
+        assert!(doc.selection_has_group(&sel));
+        assert_eq!(doc.obstacle_exclusion_radius(obs_layer, 0), 2.0);
+
+        // Rapid routing must still detour around the obstacle
+        let polys = doc.all_obstacle_exclusion_polygons();
+        let detoured = Document::route_rapid_between(Point::new(10.0, 0.0), Point::new(90.0, 0.0), &polys);
+        assert!(detoured.len() > 2);
+
+        // Clicking just the path expands selection to include the grouped obstacle
+        let mut click_sel = vec![(0, 0)];
+        doc.expand_selection_with_groups(&mut click_sel);
+        assert!(click_sel.contains(&(0, 0)));
+        assert!(click_sel.contains(&(obs_layer, 0)));
+
+        // Ungrouping dissolves the cross-layer group while keeping both in their layers
+        doc.ungroup_selection(&mut click_sel);
+        assert!(!doc.selection_has_group(&click_sel));
+        assert_eq!(doc.layers[obs_layer].entities.len(), 1);
     }
 }
 
