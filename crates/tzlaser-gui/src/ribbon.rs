@@ -11,6 +11,7 @@ use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 pub enum RibbonTab {
     File,
     Profiles,
+    View,
     Laser,
     Properties,
 }
@@ -111,8 +112,9 @@ pub fn render_ribbon(
         let tabs = [
             (RibbonTab::File, "📁 File & Project"),
             (RibbonTab::Profiles, "📐 Profile CAM"),
+            (RibbonTab::View, "👁 View & Overlays"),
             (RibbonTab::Laser, "⚡ Laser & Hardware"),
-            (RibbonTab::Properties, "⚙ Properties"),
+            (RibbonTab::Properties, "⚙ Machine & Table"),
         ];
 
         for (tab, label) in tabs {
@@ -200,8 +202,9 @@ pub fn render_ribbon(
         .stroke(Stroke::new(1.0_f32, ribbon_body_stroke))
         .show(ui, |ui| {
             match state.active_tab {
-                RibbonTab::File => render_file_tab(ui, doc, selection, history, canvas_state, pulse_config, controller, status_message),
+                RibbonTab::File => render_file_tab(ui, doc, selection, history, status_message),
                 RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
+                RibbonTab::View => render_view_tab(ui, doc, canvas_state),
                 RibbonTab::Laser => render_laser_tab(ui, state, controller, status, status_message),
                 RibbonTab::Properties => render_properties_tab(
                     ui,
@@ -364,13 +367,10 @@ fn render_file_tab(
     doc: &mut Document,
     selection: &mut Vec<(usize, usize)>,
     history: &mut HistoryManager,
-    canvas_state: &mut crate::canvas::CanvasState,
-    pulse_config: &mut PulseConfig,
-    controller: &Option<LaserController>,
     status_message: &mut String,
 ) {
     ui.horizontal(|ui| {
-        ribbon_group(ui, "DXF & Projects", |ui| {
+        ribbon_group(ui, "Project & Files", |ui| {
             let open_btn = Button::new(RichText::new("📂 Open DXF").size(12.0).strong())
                 .fill(Color32::from_rgb(35, 65, 95));
             if ui.add(open_btn).on_hover_text("Open AutoCAD DXF file (2D lines, arcs, circles, polylines, splines)").clicked() {
@@ -428,7 +428,7 @@ fn render_file_tab(
 
         ui.add_space(4.0);
 
-        ribbon_group(ui, "History & Undo", |ui| {
+        ribbon_group(ui, "History", |ui| {
             let can_undo = history.can_undo();
             let undo_label = format!("↩ Undo\n{}", history.undo_description().unwrap_or(""));
             let undo_btn = Button::new(RichText::new(undo_label).size(11.0))
@@ -449,61 +449,88 @@ fn render_file_tab(
                 }
             }
         });
+    });
+}
 
-        ui.add_space(4.0);
+fn render_view_tab(
+    ui: &mut Ui,
+    doc: &Document,
+    canvas_state: &mut crate::canvas::CanvasState,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
 
-        ribbon_group(ui, "Bed & Viewport", |ui| {
-            if ui.add(Button::new(RichText::new("🔍 Fit View").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).on_hover_text("Frame all objects on the cutting bed").clicked() {
+        ribbon_group(ui, "Viewport", |ui| {
+            let fit_btn = Button::new(RichText::new("🔍 Fit View").size(12.0).strong())
+                .fill(Color32::from_rgb(35, 65, 95))
+                .min_size(Vec2::new(88.0, 36.0));
+            if ui.add(fit_btn).on_hover_text("Frame all objects on the cutting bed").clicked() {
                 canvas_state.fit_view_to_doc(doc);
             }
 
-            if ui.add(Button::new(RichText::new("1:1").size(12.0)).fill(Color32::from_rgb(40, 45, 55))).clicked() {
+            let reset_zoom_btn = Button::new(RichText::new("1:1 Zoom").size(12.0))
+                .fill(Color32::from_rgb(40, 45, 55))
+                .min_size(Vec2::new(72.0, 36.0));
+            if ui.add(reset_zoom_btn).on_hover_text("Reset viewport zoom to 1:1 (1 px/mm)").clicked() {
                 canvas_state.zoom = 1.0;
             }
+        });
 
-            ui.menu_button("📐 Bed Size", |ui| {
-                if ui.button("1300 x 900 mm (Standard)").clicked() {
-                    pulse_config.table_width_mm = 1300.0;
-                    pulse_config.table_height_mm = 900.0;
-                    let mut dummy_panel = crate::panels::PanelState::default();
-                    dummy_panel.target_ip = pulse_config.controller_ip.clone();
-                    crate::properties_window::sync_and_save_properties(
-                        pulse_config,
-                        canvas_state,
-                        &mut dummy_panel,
-                        controller,
-                        status_message,
-                    );
-                    ui.close_menu();
+        ribbon_group(ui, "Toolpath Overlays", |ui| {
+            ui.vertical(|ui| {
+                let order_active = canvas_state.show_cut_order;
+                let (order_text, order_color, order_bg) = if order_active {
+                    ("🔢 Index: ON", Color32::from_rgb(0, 230, 255), Color32::from_rgb(20, 65, 95))
+                } else {
+                    ("🔢 Index: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                let btn_order = Button::new(RichText::new(order_text).size(11.0).color(order_color).strong())
+                    .fill(order_bg)
+                    .min_size(Vec2::new(112.0, 19.0));
+                if ui.add(btn_order).on_hover_text("Toggle cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
+                    canvas_state.show_cut_order = !canvas_state.show_cut_order;
                 }
-                if ui.button("1500 x 3000 mm (Sheet Metal)").clicked() {
-                    pulse_config.table_width_mm = 3000.0;
-                    pulse_config.table_height_mm = 1500.0;
-                    let mut dummy_panel = crate::panels::PanelState::default();
-                    dummy_panel.target_ip = pulse_config.controller_ip.clone();
-                    crate::properties_window::sync_and_save_properties(
-                        pulse_config,
-                        canvas_state,
-                        &mut dummy_panel,
-                        controller,
-                        status_message,
-                    );
-                    ui.close_menu();
+
+                let dir_active = canvas_state.show_cut_direction;
+                let (dir_text, dir_color, dir_bg) = if dir_active {
+                    ("🧭 Direction: ON", Color32::from_rgb(0, 255, 120), Color32::from_rgb(20, 65, 45))
+                } else {
+                    ("🧭 Direction: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                let btn_dir = Button::new(RichText::new(dir_text).size(11.0).color(dir_color).strong())
+                    .fill(dir_bg)
+                    .min_size(Vec2::new(112.0, 19.0));
+                if ui.add(btn_dir).on_hover_text("Toggle cut direction arrowheads along profile toolpaths").clicked() {
+                    canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
                 }
-                if ui.button("2000 x 4000 mm (Heavy Plate)").clicked() {
-                    pulse_config.table_width_mm = 4000.0;
-                    pulse_config.table_height_mm = 2000.0;
-                    let mut dummy_panel = crate::panels::PanelState::default();
-                    dummy_panel.target_ip = pulse_config.controller_ip.clone();
-                    crate::properties_window::sync_and_save_properties(
-                        pulse_config,
-                        canvas_state,
-                        &mut dummy_panel,
-                        controller,
-                        status_message,
-                    );
-                    ui.close_menu();
+            });
+        });
+
+        ribbon_group(ui, "Cut Order Coloring", |ui| {
+            ui.vertical(|ui| {
+                let (col_text, col_fg, col_bg) = if canvas_state.color_by_cut_index {
+                    ("🎨 Color: ON", Color32::from_rgb(0, 255, 180), Color32::from_rgb(20, 68, 60))
+                } else {
+                    ("🎨 Color: OFF", Color32::from_rgb(170, 175, 185), Color32::from_rgb(38, 42, 50))
+                };
+                if ui.add(Button::new(RichText::new(col_text).size(11.0).color(col_fg).strong()).fill(col_bg).min_size(Vec2::new(105.0, 19.0)))
+                    .on_hover_text("Color toolpaths according to their cut index using the selected palette")
+                    .clicked()
+                {
+                    canvas_state.color_by_cut_index = !canvas_state.color_by_cut_index;
                 }
+
+                egui::ComboBox::from_id_salt("cut_color_palette_combo")
+                    .selected_text(RichText::new(canvas_state.color_palette.label()).size(11.0))
+                    .width(105.0)
+                    .show_ui(ui, |ui| {
+                        use crate::canvas::ColorPalette;
+                        ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Rainbow, "🌈 Rainbow");
+                        ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Thermal, "🔥 Thermal");
+                        ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::HighContrast, "🎯 High Contrast");
+                        ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::OceanDepth, "🌊 Ocean");
+                        ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::MonochromeFade, "💎 Cyan Fade");
+                    });
             });
         });
     });
@@ -521,40 +548,68 @@ fn render_profiles_tab(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
 
-        // 1. Cut Overlays Group (Two compact stacked rows)
-        ribbon_group(ui, "Cut Overlays", |ui| {
+        // 1. Selection Group (Compact 2x2 grid)
+        ribbon_group(ui, "Selection", |ui| {
             ui.vertical(|ui| {
-                let order_active = canvas_state.show_cut_order;
-                let (order_text, order_color, order_bg) = if order_active {
-                    ("🔢 Index: ON", Color32::from_rgb(0, 230, 255), Color32::from_rgb(20, 65, 95))
-                } else {
-                    ("🔢 Index: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
-                };
-                let btn_order = Button::new(RichText::new(order_text).size(11.0).color(order_color).strong())
-                    .fill(order_bg)
-                    .min_size(Vec2::new(105.0, 19.0));
-                if ui.add(btn_order).on_hover_text("Toggle cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
-                    canvas_state.show_cut_order = !canvas_state.show_cut_order;
-                }
+                ui.horizontal(|ui| {
+                    if ui.add(Button::new(RichText::new("⬚ All").size(11.0)).fill(Color32::from_rgb(40, 45, 55)).min_size(Vec2::new(48.0, 19.0))).on_hover_text("Select all profiles on visible layers").clicked() {
+                        selection.clear();
+                        for (l_idx, layer) in doc.layers.iter().enumerate() {
+                            if !layer.visible { continue; }
+                            for e_idx in 0..layer.entities.len() {
+                                selection.push((l_idx, e_idx));
+                            }
+                        }
+                    }
 
-                let dir_active = canvas_state.show_cut_direction;
-                let (dir_text, dir_color, dir_bg) = if dir_active {
-                    ("🧭 Direction: ON", Color32::from_rgb(0, 255, 120), Color32::from_rgb(20, 65, 45))
-                } else {
-                    ("🧭 Direction: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
-                };
-                let btn_dir = Button::new(RichText::new(dir_text).size(11.0).color(dir_color).strong())
-                    .fill(dir_bg)
-                    .min_size(Vec2::new(105.0, 19.0));
-                if ui.add(btn_dir).on_hover_text("Toggle cut direction arrowheads along profile toolpaths").clicked() {
-                    canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
+                    if ui.add(Button::new(RichText::new("🔄 Inv").size(11.0)).fill(Color32::from_rgb(40, 45, 55)).min_size(Vec2::new(48.0, 19.0))).on_hover_text("Invert selection").clicked() {
+                        let mut new_sel = Vec::new();
+                        for (l_idx, layer) in doc.layers.iter().enumerate() {
+                            if !layer.visible { continue; }
+                            for e_idx in 0..layer.entities.len() {
+                                if !selection.contains(&(l_idx, e_idx)) {
+                                    new_sel.push((l_idx, e_idx));
+                                }
+                            }
+                        }
+                        *selection = new_sel;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    let has_sel = !selection.is_empty();
+                    if ui.add_enabled(has_sel, Button::new(RichText::new("✕ Clear").size(11.0)).fill(Color32::from_rgb(45, 40, 42)).min_size(Vec2::new(48.0, 19.0))).clicked() {
+                        selection.clear();
+                    }
+                    if ui.add_enabled(has_sel, Button::new(RichText::new("🗑 Del").size(11.0).color(if has_sel { Color32::from_rgb(255, 90, 90) } else { Color32::GRAY })).fill(Color32::from_rgb(52, 30, 32)).min_size(Vec2::new(48.0, 19.0))).clicked() {
+                        history.record(doc, selection, "Delete Selection");
+                        doc.delete_selection(selection);
+                        selection.clear();
+                    }
+                });
+            });
+        });
+
+        ui.add_space(2.0);
+
+        // 2. Transforms (Mirror)
+        ribbon_group(ui, "Transform", |ui| {
+            let has_sel = !selection.is_empty();
+            ui.vertical(|ui| {
+                if ui.add_enabled(has_sel, Button::new(RichText::new("🪞 Flip X").size(11.0)).fill(Color32::from_rgb(38, 42, 50)).min_size(Vec2::new(70.0, 19.0))).on_hover_text("Mirror selection horizontally").clicked() {
+                    history.record(doc, selection, "Mirror X");
+                    doc.mirror_selection_horizontal(selection);
+                }
+                if ui.add_enabled(has_sel, Button::new(RichText::new("🪞 Flip Y").size(11.0)).fill(Color32::from_rgb(38, 42, 50)).min_size(Vec2::new(70.0, 19.0))).on_hover_text("Mirror selection vertically").clicked() {
+                    history.record(doc, selection, "Mirror Y");
+                    doc.mirror_selection_vertical(selection);
                 }
             });
         });
 
         ui.add_space(2.0);
 
-        // 2. Layer Auto-Classification (Large prominent button)
+        // 3. Layer Auto-Classification (Large prominent button)
         ribbon_group(ui, "Classification", |ui| {
             let classify_btn = Button::new(
                 RichText::new("⚡ Auto-Classify\nOuter / Inner / Bend")
@@ -574,15 +629,48 @@ fn render_profiles_tab(
 
         ui.add_space(2.0);
 
-        // 3. Toolpath Sorting (Multiple Sorting Methods + Index Coloring + Interactive Manual Sort + Save/Restore)
+        // 4. Lead Lines Group (2 stacked rows)
+        ribbon_group(ui, "Lead Lines", |ui| {
+            ui.vertical(|ui| {
+                let lead_btn = Button::new(RichText::new("📍 Add Leads").size(11.0).color(Color32::from_rgb(255, 215, 0)))
+                    .fill(Color32::from_rgb(45, 40, 25))
+                    .min_size(Vec2::new(95.0, 19.0));
+                if ui.add(lead_btn).on_hover_text(format!("Attach pierce lead-in lines ({:.1} mm at {:.0}°) to contours", state.lead_config.length_mm, state.lead_config.angle_deg)).clicked() {
+                    history.record(doc, selection, "Add Lead Lines");
+                    let count = apply_lead_lines(doc, selection, &state.lead_config);
+                    *status_message = format!("Added lead-in lines to {} contours.", count);
+                }
+
+                ui.menu_button(RichText::new(format!("⚙ {:.1}mm / {:.0}°", state.lead_config.length_mm, state.lead_config.angle_deg)).size(10.0), |ui| {
+                    ui.label(RichText::new("Lead-In Parameters").strong());
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Length:");
+                        ui.add(egui::DragValue::new(&mut state.lead_config.length_mm).speed(0.2).range(0.5..=20.0).suffix(" mm"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Angle:");
+                        ui.add(egui::DragValue::new(&mut state.lead_config.angle_deg).speed(5.0).range(15.0..=90.0).suffix("°"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut state.lead_config.lead_type, LeadType::Line, "Straight");
+                        ui.radio_value(&mut state.lead_config.lead_type, LeadType::Arc, "Arc");
+                    });
+                });
+            });
+        });
+
+        ui.add_space(2.0);
+
+        // 5. Toolpath Sorting (Sort Method + Interactive Manual Sort + Save/Restore)
         ribbon_group(ui, "Toolpath Sorting", |ui| {
             ui.vertical(|ui| {
-                // Row 1: Sort Method + Index Coloring Toggle + Palette Selector
+                // Row 1: Sort Method
                 ui.horizontal(|ui| {
                     let mut current_mode = doc.sort_mode;
                     egui::ComboBox::from_id_salt("cut_sort_mode_combo")
                         .selected_text(RichText::new(current_mode.label()).size(11.0).strong().color(Color32::from_rgb(255, 220, 100)))
-                        .width(145.0)
+                        .width(165.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut current_mode, SortMode::OpenFirst, "⚡ Open / Bend First");
                             ui.selectable_value(&mut current_mode, SortMode::InnerFirst, "🔘 Inner Holes First");
@@ -607,32 +695,6 @@ fn render_profiles_tab(
                             );
                         }
                     }
-
-                    // Index Coloring Toggle
-                    let (col_text, col_fg, col_bg) = if canvas_state.color_by_cut_index {
-                        ("🎨 Color: ON", Color32::from_rgb(0, 255, 180), Color32::from_rgb(20, 68, 60))
-                    } else {
-                        ("🎨 Color: OFF", Color32::from_rgb(170, 175, 185), Color32::from_rgb(38, 42, 50))
-                    };
-                    if ui.add(Button::new(RichText::new(col_text).size(11.0).color(col_fg).strong()).fill(col_bg).min_size(Vec2::new(80.0, 19.0)))
-                        .on_hover_text("Color toolpaths according to their cut index using the selected palette")
-                        .clicked()
-                    {
-                        canvas_state.color_by_cut_index = !canvas_state.color_by_cut_index;
-                    }
-
-                    // Color Palette Selector
-                    egui::ComboBox::from_id_salt("cut_color_palette_combo")
-                        .selected_text(RichText::new(canvas_state.color_palette.label()).size(11.0))
-                        .width(92.0)
-                        .show_ui(ui, |ui| {
-                            use crate::canvas::ColorPalette;
-                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Rainbow, "🌈 Rainbow");
-                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::Thermal, "🔥 Thermal");
-                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::HighContrast, "🎯 High Contrast");
-                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::OceanDepth, "🌊 Ocean");
-                            ui.selectable_value(&mut canvas_state.color_palette, ColorPalette::MonochromeFade, "💎 Cyan Fade");
-                        });
                 });
 
                 // Row 2: Sort Action / Interactive Manual Sort + Save/Restore Order
@@ -729,100 +791,6 @@ fn render_profiles_tab(
                 });
             });
         });
-
-        ui.add_space(2.0);
-
-        // 4. Selection Group (Compact 2x2 grid)
-        ribbon_group(ui, "Select", |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    if ui.add(Button::new(RichText::new("⬚ All").size(11.0)).fill(Color32::from_rgb(40, 45, 55)).min_size(Vec2::new(48.0, 19.0))).on_hover_text("Select all profiles on visible layers").clicked() {
-                        selection.clear();
-                        for (l_idx, layer) in doc.layers.iter().enumerate() {
-                            if !layer.visible { continue; }
-                            for e_idx in 0..layer.entities.len() {
-                                selection.push((l_idx, e_idx));
-                            }
-                        }
-                    }
-
-                    if ui.add(Button::new(RichText::new("🔄 Inv").size(11.0)).fill(Color32::from_rgb(40, 45, 55)).min_size(Vec2::new(48.0, 19.0))).on_hover_text("Invert selection").clicked() {
-                        let mut new_sel = Vec::new();
-                        for (l_idx, layer) in doc.layers.iter().enumerate() {
-                            if !layer.visible { continue; }
-                            for e_idx in 0..layer.entities.len() {
-                                if !selection.contains(&(l_idx, e_idx)) {
-                                    new_sel.push((l_idx, e_idx));
-                                }
-                            }
-                        }
-                        *selection = new_sel;
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    let has_sel = !selection.is_empty();
-                    if ui.add_enabled(has_sel, Button::new(RichText::new("✕ Clear").size(11.0)).fill(Color32::from_rgb(45, 40, 42)).min_size(Vec2::new(48.0, 19.0))).clicked() {
-                        selection.clear();
-                    }
-                    if ui.add_enabled(has_sel, Button::new(RichText::new("🗑 Del").size(11.0).color(if has_sel { Color32::from_rgb(255, 90, 90) } else { Color32::GRAY })).fill(Color32::from_rgb(52, 30, 32)).min_size(Vec2::new(48.0, 19.0))).clicked() {
-                        history.record(doc, selection, "Delete Selection");
-                        doc.delete_selection(selection);
-                        selection.clear();
-                    }
-                });
-            });
-        });
-
-        ui.add_space(2.0);
-
-        // 5. Lead Lines Group (2 stacked rows)
-        ribbon_group(ui, "Lead Lines", |ui| {
-            ui.vertical(|ui| {
-                let lead_btn = Button::new(RichText::new("📍 Add Leads").size(11.0).color(Color32::from_rgb(255, 215, 0)))
-                    .fill(Color32::from_rgb(45, 40, 25))
-                    .min_size(Vec2::new(95.0, 19.0));
-                if ui.add(lead_btn).on_hover_text(format!("Attach pierce lead-in lines ({:.1} mm at {:.0}°) to contours", state.lead_config.length_mm, state.lead_config.angle_deg)).clicked() {
-                    history.record(doc, selection, "Add Lead Lines");
-                    let count = apply_lead_lines(doc, selection, &state.lead_config);
-                    *status_message = format!("Added lead-in lines to {} contours.", count);
-                }
-
-                ui.menu_button(RichText::new(format!("⚙ {:.1}mm / {:.0}°", state.lead_config.length_mm, state.lead_config.angle_deg)).size(10.0), |ui| {
-                    ui.label(RichText::new("Lead-In Parameters").strong());
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Length:");
-                        ui.add(egui::DragValue::new(&mut state.lead_config.length_mm).speed(0.2).range(0.5..=20.0).suffix(" mm"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Angle:");
-                        ui.add(egui::DragValue::new(&mut state.lead_config.angle_deg).speed(5.0).range(15.0..=90.0).suffix("°"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut state.lead_config.lead_type, LeadType::Line, "Straight");
-                        ui.radio_value(&mut state.lead_config.lead_type, LeadType::Arc, "Arc");
-                    });
-                });
-            });
-        });
-
-        // 6. Transforms (Mirror)
-        if !selection.is_empty() {
-            ui.add_space(2.0);
-            ribbon_group(ui, "Transforms", |ui| {
-                ui.vertical(|ui| {
-                    if ui.add(Button::new(RichText::new("🪞 Flip X").size(11.0)).fill(Color32::from_rgb(38, 42, 50)).min_size(Vec2::new(70.0, 19.0))).on_hover_text("Mirror selection horizontally").clicked() {
-                        history.record(doc, selection, "Mirror X");
-                        doc.mirror_selection_horizontal(selection);
-                    }
-                    if ui.add(Button::new(RichText::new("🪞 Flip Y").size(11.0)).fill(Color32::from_rgb(38, 42, 50)).min_size(Vec2::new(70.0, 19.0))).on_hover_text("Mirror selection vertically").clicked() {
-                        history.record(doc, selection, "Mirror Y");
-                        doc.mirror_selection_vertical(selection);
-                    }
-                });
-            });
-        }
     });
 }
 
@@ -942,7 +910,12 @@ fn render_laser_tab(
             if ui.add(frame_btn).on_hover_text("Dry-run trace the bounding box with red pointer (laser off) to verify sheet positioning").clicked() {
                 *status_message = "Framing boundary rectangle with red guide pointer...".to_string();
             }
+        });
 
+        ui.add_space(4.0);
+
+        // 4. Safety
+        ribbon_group(ui, "Safety", |ui| {
             let estop_btn = Button::new(RichText::new("🛑 E-STOP").size(12.0).color(Color32::WHITE).strong())
                 .fill(Color32::from_rgb(180, 30, 30));
             if ui.add(estop_btn).on_hover_text("IMMEDIATE EMERGENCY STOP - Halts all motion and turns laser OFF").clicked() {
@@ -1011,11 +984,33 @@ fn render_properties_tab(
                     .size(11.0)
                     .strong(),
                 );
-                ui.label(
-                    RichText::new(format!("Z Travel: {:.0} mm", pulse_config.z_max_travel_mm))
-                        .size(10.5)
-                        .weak(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Z: {:.0} mm", pulse_config.z_max_travel_mm))
+                            .size(10.5)
+                            .weak(),
+                    );
+                    ui.menu_button("📐 Bed Size", |ui| {
+                        if ui.button("1300 × 900 mm (Standard)").clicked() {
+                            pulse_config.table_width_mm = 1300.0;
+                            pulse_config.table_height_mm = 900.0;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("3000 × 1500 mm (Sheet Metal)").clicked() {
+                            pulse_config.table_width_mm = 3000.0;
+                            pulse_config.table_height_mm = 1500.0;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("4000 × 2000 mm (Heavy Plate)").clicked() {
+                            pulse_config.table_width_mm = 4000.0;
+                            pulse_config.table_height_mm = 2000.0;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+                });
             });
         });
 

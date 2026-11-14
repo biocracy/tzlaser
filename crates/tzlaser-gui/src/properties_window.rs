@@ -44,6 +44,7 @@ pub fn sync_and_save_properties(
 ) {
     canvas_state.bed_width_mm = pulse_config.table_width_mm.max(10.0) as f32;
     canvas_state.bed_height_mm = pulse_config.table_height_mm.max(10.0) as f32;
+    canvas_state.origin_corner = pulse_config.origin_corner.clone();
     panel_state.target_ip = pulse_config.controller_ip.clone();
 
     if let Some(ref c) = controller {

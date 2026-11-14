@@ -140,6 +140,7 @@ pub struct CanvasState {
     pub zoom: f32,          // Pixels per millimeter
     pub bed_width_mm: f32,  // Machine bed width
     pub bed_height_mm: f32, // Machine bed height
+    pub origin_corner: String,
     pub active_step_mm: f64,// Step distance for nudge buttons
     pub is_dragging_selection: bool,
     pub box_select_start: Option<Point>,
@@ -162,6 +163,7 @@ impl Default for CanvasState {
             zoom: 0.8,
             bed_width_mm: 1300.0,
             bed_height_mm: 900.0,
+            origin_corner: "Bottom-Left (X0, Y0)".to_string(),
             active_step_mm: 10.0,
             is_dragging_selection: false,
             box_select_start: None,
@@ -214,6 +216,26 @@ impl CanvasState {
             ((pt.x - origin_screen.x - self.pan.x) / self.zoom) as f64,
             ((origin_screen.y + self.pan.y - pt.y) / self.zoom) as f64,
         )
+    }
+
+    /// Return the selected bed origin in world coordinates (mm) and unit screen-space directions
+    /// for the X and Y axes pointing inward across the cutting bed.
+    pub fn origin_world_and_axes(&self) -> (Point, Vec2, Vec2) {
+        let w = self.bed_width_mm as f64;
+        let h = self.bed_height_mm as f64;
+        if self.origin_corner.contains("Top-Left") {
+            // World (0, H): +X right (+1, 0), Y down into bed (+1 screen Y)
+            (Point::new(0.0, h), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0))
+        } else if self.origin_corner.contains("Bottom-Right") {
+            // World (W, 0): X left into bed (-1, 0), +Y up (-1 screen Y)
+            (Point::new(w, 0.0), Vec2::new(-1.0, 0.0), Vec2::new(0.0, -1.0))
+        } else if self.origin_corner.contains("Top-Right") {
+            // World (W, H): X left into bed (-1, 0), Y down into bed (+1 screen Y)
+            (Point::new(w, h), Vec2::new(-1.0, 0.0), Vec2::new(0.0, 1.0))
+        } else {
+            // Default: Bottom-Left (0, 0): +X right (+1, 0), +Y up (-1 screen Y)
+            (Point::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0))
+        }
     }
 }
 
@@ -658,8 +680,49 @@ pub fn render_canvas(
         y += 100.0;
     }
 
-    let origin_pt = state.world_to_screen(Point::new(0.0, 0.0), origin_screen);
-    painter.circle_filled(origin_pt, 4.0, Color32::from_rgb(255, 70, 70));
+    // Origin marker & X/Y axes stemming from the selected table origin corner
+    let (origin_world, x_screen_dir, y_screen_dir) = state.origin_world_and_axes();
+    let origin_pt = state.world_to_screen(origin_world, origin_screen);
+    let axis_len = 64.0_f32;
+
+    let x_color = Color32::from_rgb(240, 80, 80);
+    let y_color = Color32::from_rgb(75, 225, 115);
+    let x_end = origin_pt + x_screen_dir * axis_len;
+    let y_end = origin_pt + y_screen_dir * axis_len;
+
+    painter.line_segment([origin_pt, x_end], Stroke::new(2.2, x_color));
+    draw_arrowhead(&painter, x_end, x_screen_dir.y.atan2(x_screen_dir.x), x_color, 8.5);
+    let x_label_pos = x_end + x_screen_dir * 10.0 + Vec2::new(0.0, y_screen_dir.y * 8.0);
+    painter.text(
+        x_label_pos,
+        egui::Align2::CENTER_CENTER,
+        "X",
+        egui::FontId::proportional(13.0),
+        x_color,
+    );
+
+    painter.line_segment([origin_pt, y_end], Stroke::new(2.2, y_color));
+    draw_arrowhead(&painter, y_end, y_screen_dir.y.atan2(y_screen_dir.x), y_color, 8.5);
+    let y_label_pos = y_end + y_screen_dir * 10.0 + Vec2::new(x_screen_dir.x * 10.0, 0.0);
+    painter.text(
+        y_label_pos,
+        egui::Align2::CENTER_CENTER,
+        "Y",
+        egui::FontId::proportional(13.0),
+        y_color,
+    );
+
+    // Origin target ring & center dot + "O" label
+    painter.circle_stroke(origin_pt, 6.5, Stroke::new(1.5, Color32::from_rgb(255, 215, 70)));
+    painter.circle_filled(origin_pt, 3.5, Color32::from_rgb(255, 80, 70));
+    let origin_label_pos = origin_pt - x_screen_dir * 14.0 - y_screen_dir * 12.0;
+    painter.text(
+        origin_label_pos,
+        egui::Align2::CENTER_CENTER,
+        "Origin",
+        egui::FontId::proportional(10.5),
+        Color32::from_rgb(255, 215, 90),
+    );
 
     // 6. Render Document Layers & Entities with High-Visibility Glow
     let has_selection = !selection.is_empty();
@@ -1012,4 +1075,40 @@ pub fn render_canvas(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_origin_world_and_axes_corners() {
+        let mut cs = CanvasState::default();
+        cs.bed_width_mm = 2000.0;
+        cs.bed_height_mm = 1000.0;
+
+        cs.origin_corner = "Bottom-Left (X0, Y0)".to_string();
+        let (o, x, y) = cs.origin_world_and_axes();
+        assert_eq!(o, Point::new(0.0, 0.0));
+        assert_eq!(x, Vec2::new(1.0, 0.0));
+        assert_eq!(y, Vec2::new(0.0, -1.0));
+
+        cs.origin_corner = "Top-Left (X0, Ymax)".to_string();
+        let (o, x, y) = cs.origin_world_and_axes();
+        assert_eq!(o, Point::new(0.0, 1000.0));
+        assert_eq!(x, Vec2::new(1.0, 0.0));
+        assert_eq!(y, Vec2::new(0.0, 1.0));
+
+        cs.origin_corner = "Bottom-Right (Xmax, Y0)".to_string();
+        let (o, x, y) = cs.origin_world_and_axes();
+        assert_eq!(o, Point::new(2000.0, 0.0));
+        assert_eq!(x, Vec2::new(-1.0, 0.0));
+        assert_eq!(y, Vec2::new(0.0, -1.0));
+
+        cs.origin_corner = "Top-Right (Xmax, Ymax)".to_string();
+        let (o, x, y) = cs.origin_world_and_axes();
+        assert_eq!(o, Point::new(2000.0, 1000.0));
+        assert_eq!(x, Vec2::new(-1.0, 0.0));
+        assert_eq!(y, Vec2::new(0.0, 1.0));
+    }
 }
