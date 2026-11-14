@@ -71,13 +71,15 @@ pub fn render_selection_hud(
         };
 
     // Determine current position in machine coordinates relative to table origin
+    let sel_center = (
+        (bounds.min_x() + bounds.max_x()) / 2.0,
+        (bounds.min_y() + bounds.max_y()) / 2.0,
+    );
     let anchor_world = match state.anchor {
         AnchorPoint::TableOrigin => sel_origin_corner,
-        AnchorPoint::Center => (
-            (bounds.min_x() + bounds.max_x()) / 2.0,
-            (bounds.min_y() + bounds.max_y()) / 2.0,
-        ),
+        AnchorPoint::Center => sel_center,
     };
+    let scale_pivot = kurbo::Point::new(anchor_world.0, anchor_world.1);
     let current_x = (anchor_world.0 - origin_world.0) * x_sign;
     let current_y = (anchor_world.1 - origin_world.1) * y_world_sign;
 
@@ -101,8 +103,23 @@ pub fn render_selection_hud(
                 };
                 ui.label(RichText::new(label_text).italics().color(Color32::from_rgb(255, 220, 50)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut state.anchor, AnchorPoint::Center, "Center");
-                    ui.selectable_value(&mut state.anchor, AnchorPoint::TableOrigin, origin_label);
+                    let prev_anchor = state.anchor;
+                    ui.add_enabled_ui(!is_locked, |ui| {
+                        ui.selectable_value(&mut state.anchor, AnchorPoint::Center, "Center");
+                        ui.selectable_value(&mut state.anchor, AnchorPoint::TableOrigin, origin_label);
+                    });
+                    if state.anchor != prev_anchor && !is_locked {
+                        let new_world = match state.anchor {
+                            AnchorPoint::TableOrigin => sel_origin_corner,
+                            AnchorPoint::Center => sel_center,
+                        };
+                        let dx = anchor_world.0 - new_world.0;
+                        let dy = anchor_world.1 - new_world.1;
+                        if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                            history.record(doc, selection, "Change Selection Origin");
+                            doc.translate_selection(selection, dx, dy);
+                        }
+                    }
                 });
             });
 
@@ -310,7 +327,7 @@ pub fn render_selection_hud(
                         }
                         let sx = (edit_w / width).max(1e-4);
                         let sy = if state.lock_aspect { sx } else { 1.0 };
-                        doc.scale_selection(selection, sx, sy);
+                        doc.scale_selection_around(selection, scale_pivot, sx, sy);
                     }
                     ui.end_row();
 
@@ -345,7 +362,7 @@ pub fn render_selection_hud(
                         }
                         let sy = (edit_h / height).max(1e-4);
                         let sx = if state.lock_aspect { sy } else { 1.0 };
-                        doc.scale_selection(selection, sx, sy);
+                        doc.scale_selection_around(selection, scale_pivot, sx, sy);
                     }
                     ui.end_row();
                 });
@@ -362,11 +379,11 @@ pub fn render_selection_hud(
                         .max_decimals(1)
                         .suffix(" %"),
                 );
-                if ui.button("Apply").on_hover_text("Scale selection by percentage around its center").clicked() {
+                if ui.button("Apply").on_hover_text("Scale selection by percentage around the selected origin").clicked() {
                     let s = (state.scale_pct / 100.0).max(1e-4);
                     if (s - 1.0).abs() > 1e-6 {
                         history.record(doc, selection, "Scale Selection");
-                        doc.scale_selection(selection, s, s);
+                        doc.scale_selection_around(selection, scale_pivot, s, s);
                     }
                 }
             });

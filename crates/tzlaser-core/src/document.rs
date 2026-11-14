@@ -940,6 +940,26 @@ impl Document {
         }
     }
 
+    /// Scale selected entities around `pivot` (no-op if locked).
+    pub fn scale_selection_around(
+        &mut self,
+        selection: &[(usize, usize)],
+        pivot: Point,
+        sx: f64,
+        sy: f64,
+    ) {
+        if self.is_selection_locked(selection) {
+            return;
+        }
+        for &(l_idx, e_idx) in selection {
+            if let Some(layer) = self.layers.get_mut(l_idx) {
+                if let Some(entity) = layer.entities.get_mut(e_idx) {
+                    entity.scale_around(pivot, sx, sy);
+                }
+            }
+        }
+    }
+
     /// Scale selected entities around their combined bounding-box center (no-op if locked).
     pub fn scale_selection(&mut self, selection: &[(usize, usize)], sx: f64, sy: f64) {
         if self.is_selection_locked(selection) {
@@ -950,13 +970,7 @@ impl Document {
             (bounds.min_x() + bounds.max_x()) * 0.5,
             (bounds.min_y() + bounds.max_y()) * 0.5,
         );
-        for &(l_idx, e_idx) in selection {
-            if let Some(layer) = self.layers.get_mut(l_idx) {
-                if let Some(entity) = layer.entities.get_mut(e_idx) {
-                    entity.scale_around(center, sx, sy);
-                }
-            }
-        }
+        self.scale_selection_around(selection, center, sx, sy);
     }
 
     /// Rotate selected entities counter-clockwise around their combined bounding-box center by `angle_deg` degrees (no-op if locked).
