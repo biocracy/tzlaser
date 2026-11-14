@@ -2965,6 +2965,49 @@ mod tests {
             assert!(!segment_intersects_polygon(pair[0], pair[1], inner_excl));
         }
     }
+
+    #[test]
+    fn test_concave_zigzag_obstacle_routing() {
+        // Thin M-shaped / zigzag closed polygon similar to a hand-drawn spline obstacle
+        let zigzag = Entity::Polyline {
+            points: vec![
+                Point::new(100.0, 200.0),
+                Point::new(140.0, 200.0),
+                Point::new(160.0, 140.0),
+                Point::new(190.0, 200.0),
+                Point::new(220.0, 140.0),
+                Point::new(250.0, 200.0),
+                Point::new(250.0, 205.0),
+                Point::new(215.0, 150.0),
+                Point::new(190.0, 208.0),
+                Point::new(160.0, 150.0),
+                Point::new(135.0, 205.0),
+                Point::new(100.0, 205.0),
+            ],
+            closed: true,
+        };
+        let excl = offset_entity_outwards(&zigzag, 1.0);
+        let inner_excl = &offset_entity_outwards(&zigzag, 0.9)[0];
+
+        let test_pairs = [
+            (Point::new(50.0, 175.0), Point::new(300.0, 175.0)),
+            (Point::new(120.0, 100.0), Point::new(230.0, 260.0)),
+            (Point::new(80.0, 250.0), Point::new(270.0, 120.0)),
+            (Point::new(175.0, 100.0), Point::new(175.0, 260.0)),
+        ];
+        for (a, b) in test_pairs {
+            let route = Document::route_rapid_between(a, b, &excl);
+            assert!(route.len() > 2, "Expected detour around zigzag for {:?} -> {:?}", a, b);
+            for pair in route.windows(2) {
+                assert!(
+                    !segment_intersects_polygon(pair[0], pair[1], inner_excl),
+                    "Route segment {:?} -> {:?} crossed zigzag obstacle!",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
 }
 
 /// Compute outward-offset closed polygons for an entity at constant perpendicular distance `radius_mm`.
@@ -3128,6 +3171,104 @@ pub fn segment_intersects_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
     false
 }
 
+fn convex_hull(pts: &[Point]) -> Vec<Point> {
+    if pts.len() <= 3 {
+        return pts.to_vec();
+    }
+    let mut sorted = pts.to_vec();
+    sorted.sort_by(|a, b| {
+        a.x.partial_cmp(&b.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let cross = |o: Point, a: Point, b: Point| -> f64 {
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    };
+    let mut lower = Vec::with_capacity(sorted.len());
+    for &p in &sorted {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 1e-9 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper = Vec::with_capacity(sorted.len());
+    for &p in sorted.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 1e-9 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+fn push_nudged_vertices(poly: &[Point], nudge: f64, obstacles: &[Vec<Point>], nodes: &mut Vec<Point>) {
+    let m = poly.len();
+    if m < 3 {
+        return;
+    }
+    let mut signed_area = 0.0;
+    for i in 0..m {
+        let j = (i + 1) % m;
+        signed_area += poly[i].x * poly[j].y - poly[j].x * poly[i].y;
+    }
+    let ccw_sign = if signed_area >= 0.0 { 1.0 } else { -1.0 };
+    let step = (m / 64).max(1);
+
+    for idx in 0..m {
+        let prev = poly[(idx + m - 1) % m];
+        let v = poly[idx];
+        let next = poly[(idx + 1) % m];
+
+        let e1x = v.x - prev.x;
+        let e1y = v.y - prev.y;
+        let l1 = e1x.hypot(e1y);
+        let e2x = next.x - v.x;
+        let e2y = next.y - v.y;
+        let l2 = e2x.hypot(e2y);
+        if l1 < 1e-9 || l2 < 1e-9 {
+            continue;
+        }
+
+        // Outward unit normals of adjacent edges
+        let n1x = ccw_sign * (e1y / l1);
+        let n1y = ccw_sign * (-e1x / l1);
+        let n2x = ccw_sign * (e2y / l2);
+        let n2y = ccw_sign * (-e2x / l2);
+
+        // Preserve sharp corners even on dense polygons; only subsample smooth arcs
+        let dot = n1x * n2x + n1y * n2y;
+        let is_corner = dot < 0.96;
+        if !is_corner && idx % step != 0 {
+            continue;
+        }
+
+        let bx = n1x + n2x;
+        let by = n1y + n2y;
+        let blen = bx.hypot(by);
+        let dirs: [(f64, f64); 4] = if blen > 1e-6 {
+            [
+                (bx / blen, by / blen),
+                (-bx / blen, -by / blen),
+                (n1x, n1y),
+                (n2x, n2y),
+            ]
+        } else {
+            [(n1x, n1y), (n2x, n2y), (-n1x, -n1y), (-n2x, -n2y)]
+        };
+
+        for (dx, dy) in dirs {
+            let candidate = Point::new(v.x + dx * nudge, v.y + dy * nudge);
+            if !obstacles.iter().any(|p| point_in_polygon(candidate, p)) {
+                nodes.push(candidate);
+                break;
+            }
+        }
+    }
+}
+
 fn route_around_obstacles(start: Point, goal: Point, obstacles: &[Vec<Point>]) -> Vec<Point> {
     let blocks_any = |a: Point, b: Point| -> bool {
         obstacles
@@ -3139,7 +3280,9 @@ fn route_around_obstacles(start: Point, goal: Point, obstacles: &[Vec<Point>]) -
         return vec![start, goal];
     }
 
-    // Build visibility graph nodes: start (0), goal (1), and slightly outward-nudged vertices of obstacles
+    // Build visibility graph nodes: start (0), goal (1), outward-nudged polygon corners,
+    // and outward-nudged convex hull vertices of each obstacle (guarantees outer connectivity
+    // even for thin concave/zigzag shapes).
     let mut nodes: Vec<Point> = Vec::new();
     nodes.push(start);
     nodes.push(goal);
@@ -3148,23 +3291,9 @@ fn route_around_obstacles(start: Point, goal: Point, obstacles: &[Vec<Point>]) -
         if poly.len() < 3 {
             continue;
         }
-        let cx: f64 = poly.iter().map(|p| p.x).sum::<f64>() / (poly.len() as f64);
-        let cy: f64 = poly.iter().map(|p| p.y).sum::<f64>() / (poly.len() as f64);
-        // Subsample dense polygons (e.g. circles/rounded corners) to keep visibility graph fast
-        let step = (poly.len() / 24).max(1);
-        for (idx, &v) in poly.iter().enumerate() {
-            if idx % step != 0 {
-                continue;
-            }
-            let dx = v.x - cx;
-            let dy = v.y - cy;
-            let len = dx.hypot(dy).max(1e-6);
-            // Nudge 0.05mm outward from centroid so visibility edges don't graze-collide
-            let candidate = Point::new(v.x + (dx / len) * 0.05, v.y + (dy / len) * 0.05);
-            if !obstacles.iter().any(|p| point_in_polygon(candidate, p)) {
-                nodes.push(candidate);
-            }
-        }
+        push_nudged_vertices(poly, 0.08, obstacles, &mut nodes);
+        let hull = convex_hull(poly);
+        push_nudged_vertices(&hull, 0.15, obstacles, &mut nodes);
     }
 
     let n = nodes.len();
