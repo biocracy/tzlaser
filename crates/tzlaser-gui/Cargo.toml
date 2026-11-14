@@ -8,7 +8,8 @@ description = "Desktop UI and 2D CAD canvas for Ţlaser cutting system"
 tzlaser-protocol = { path = "../tzlaser-protocol" }
 tzlaser-core = { path = "../tzlaser-core" }
 
-eframe = "0.31"
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"] }
+wgpu = { version = "24.0", features = ["dx12", "metal"] }
 egui = "0.31"
 rfd = "0.15"
 kurbo = "0.13"

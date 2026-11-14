@@ -7,11 +7,13 @@ use tzlaser_protocol::{LaserController, MachineStatus};
 mod canvas;
 mod layer_popup;
 mod panels;
+mod properties_window;
 mod ribbon;
 mod selection_hud;
 
 use canvas::{render_canvas, CanvasState};
 use panels::{render_right_panels, PanelState};
+use properties_window::PropertiesWindowState;
 use ribbon::{render_ribbon, RibbonState};
 use selection_hud::{render_selection_hud, SelectionHudState};
 
@@ -23,6 +25,7 @@ struct TzlaserApp {
     panel_state: PanelState,
     hud_state: SelectionHudState,
     ribbon_state: RibbonState,
+    props_window_state: PropertiesWindowState,
     pulse_config: PulseConfig,
     controller: Option<LaserController>,
     status: MachineStatus,
@@ -49,28 +52,151 @@ impl Default for TzlaserApp {
             });
         }
 
+        let pulse_config = PulseConfig::load_or_init(PulseConfig::default_config_path());
+
+        let mut canvas_state = CanvasState::default();
+        canvas_state.bed_width_mm = pulse_config.table_width_mm as f32;
+        canvas_state.bed_height_mm = pulse_config.table_height_mm as f32;
+
         let mut panel_state = PanelState::default();
         panel_state.material_db =
             tzlaser_core::MaterialLibrary::load_or_init(tzlaser_core::MaterialLibrary::default_db_path());
+        if !pulse_config.controller_ip.trim().is_empty() {
+            panel_state.target_ip = pulse_config.controller_ip.clone();
+        }
+        panel_state.jog_mode = panels::JogMode::Step(pulse_config.default_step_mm.clamp(0.01, 1000.0));
 
         Self {
             document: doc,
             selection: Vec::new(),
             history: HistoryManager::default(),
-            canvas_state: CanvasState::default(),
+            canvas_state,
             panel_state,
             hud_state: SelectionHudState::default(),
             ribbon_state: RibbonState::default(),
-            pulse_config: PulseConfig::default(),
+            props_window_state: PropertiesWindowState::default(),
+            pulse_config,
             controller: None,
             status: MachineStatus::default(),
-            status_message: "Ready. Click 'Open DXF' or select profiles to position on bed.".to_string(),
+            status_message: "Ready. Click 'Open DXF' or '⚙ Properties → Table Properties' to calibrate machine.".to_string(),
         }
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_dark_visuals() -> egui::Visuals {
+    use egui::{epaint::Shadow, Stroke};
+
+    let mut visuals = egui::Visuals::dark();
+    visuals.dark_mode = true;
+    visuals.override_text_color = None;
+
+    // Distinct dark slate surfaces tuned for Windows gamma (2.2) contrast
+    visuals.panel_fill = Color32::from_rgb(30, 34, 42);
+    visuals.window_fill = Color32::from_rgb(34, 39, 49);
+    visuals.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(78, 88, 110));
+    visuals.window_shadow = Shadow {
+        offset: [0, 4],
+        blur: 12,
+        spread: 0,
+        color: Color32::from_black_alpha(120),
+    };
+    visuals.extreme_bg_color = Color32::from_rgb(18, 21, 27);
+    visuals.faint_bg_color = Color32::from_rgb(38, 43, 54);
+    visuals.code_bg_color = Color32::from_rgb(22, 26, 34);
+
+    // Non-interactive widgets (labels, group frames, separators)
+    // Note: `weak_bg_fill` on noninteractive is used by egui's `gray_out()` for `.weak()` text and disabled items
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(34, 39, 49);
+    visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(125, 136, 156);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(68, 77, 96));
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(232, 238, 248));
+
+    // Interactive widgets at rest (buttons, combo boxes, drag values, checkboxes)
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(48, 55, 68);
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(48, 55, 68);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(82, 92, 114));
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.2_f32, Color32::from_rgb(242, 246, 255));
+
+    // Hovered widgets
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(62, 72, 90);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(62, 72, 90);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.2_f32, Color32::from_rgb(0, 210, 255));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+
+    // Active / pressed widgets
+    visuals.widgets.active.bg_fill = Color32::from_rgb(38, 100, 155);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(38, 100, 155);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.2_f32, Color32::from_rgb(80, 230, 255));
+    visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+
+    // Open combo-box / menu widgets
+    visuals.widgets.open.bg_fill = Color32::from_rgb(44, 68, 102);
+    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(44, 68, 102);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0, 210, 255));
+    visuals.widgets.open.fg_stroke = Stroke::new(1.2_f32, Color32::WHITE);
+
+    // Selected items (selectable_label, text selection)
+    visuals.selection.bg_fill = Color32::from_rgb(28, 115, 185);
+    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+
+    visuals
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_theme_and_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+
+    let mut fonts = egui::FontDefinitions::default();
+
+    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
+        fonts.font_data.insert(
+            "segoeui".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            vec.insert(0, "segoeui".to_owned());
+        }
+    }
+
+    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\consola.ttf") {
+        fonts.font_data.insert(
+            "consola".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            vec.insert(0, "consola".to_owned());
+        }
+    }
+
+    // Load Segoe UI Symbol so geometric arrows (▲ ▼ ◄ ►) and UI symbols render instead of □ boxes
+    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
+        fonts.font_data.insert(
+            "seguisym".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            let insert_pos = if vec.first().map(|s| s.as_str()) == Some("segoeui") { 1 } else { 0 };
+            vec.insert(insert_pos, "seguisym".to_owned());
+        }
+        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            vec.push("seguisym".to_owned());
+        }
+    }
+
+    ctx.set_fonts(fonts);
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_visuals(windows_dark_visuals());
+}
+
 impl eframe::App for TzlaserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        if !ctx.style().visuals.dark_mode {
+            ctx.set_theme(egui::Theme::Dark);
+            ctx.set_visuals(windows_dark_visuals());
+        }
+
         // Poll status from background thread if connected
         if let Some(ref c) = self.controller {
             if c.is_connected() {
@@ -111,8 +237,13 @@ impl eframe::App for TzlaserApp {
         self.canvas_state.active_step_mm = self.hud_state.step_mm;
 
         // 1. Industrial CAD/CAM Ribbon Menu
+        let top_bar_fill = if cfg!(target_os = "windows") {
+            Color32::from_rgb(26, 30, 38)
+        } else {
+            Color32::from_rgb(22, 24, 28)
+        };
         egui::TopBottomPanel::top("top_panel")
-            .frame(Frame::new().fill(Color32::from_rgb(22, 24, 28)).inner_margin(Margin::symmetric(10, 6)))
+            .frame(Frame::new().fill(top_bar_fill).inner_margin(Margin::symmetric(10, 6)))
             .show(ctx, |ui| {
                 render_ribbon(
                     ui,
@@ -122,6 +253,8 @@ impl eframe::App for TzlaserApp {
                     &mut self.history,
                     &mut self.canvas_state,
                     &mut self.panel_state,
+                    &mut self.pulse_config,
+                    &mut self.props_window_state,
                     &mut self.controller,
                     &self.status,
                     &mut self.status_message,
@@ -129,11 +262,21 @@ impl eframe::App for TzlaserApp {
             });
 
         // 2. Bottom Status Bar
+        let status_bar_fill = if cfg!(target_os = "windows") {
+            Color32::from_rgb(24, 28, 36)
+        } else {
+            Color32::from_rgb(20, 21, 24)
+        };
+        let status_text_color = if cfg!(target_os = "windows") {
+            Color32::from_rgb(220, 228, 242)
+        } else {
+            Color32::from_rgb(180, 185, 195)
+        };
         egui::TopBottomPanel::bottom("status_bar")
-            .frame(Frame::new().fill(Color32::from_rgb(20, 21, 24)).inner_margin(Margin::symmetric(10, 4)))
+            .frame(Frame::new().fill(status_bar_fill).inner_margin(Margin::symmetric(10, 4)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status_message).size(12.0).color(Color32::from_rgb(180, 185, 195)));
+                    ui.label(RichText::new(&self.status_message).size(12.0).color(status_text_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!("Bed: {:.0} x {:.0} mm", self.canvas_state.bed_width_mm, self.canvas_state.bed_height_mm)).size(11.0).weak());
                         ui.separator();
@@ -152,10 +295,15 @@ impl eframe::App for TzlaserApp {
             });
 
         // 3. Right Control Panel
+        let right_panel_fill = if cfg!(target_os = "windows") {
+            Color32::from_rgb(30, 34, 42)
+        } else {
+            Color32::from_rgb(24, 25, 29)
+        };
         egui::SidePanel::right("right_panel")
             .min_width(280.0)
             .default_width(320.0)
-            .frame(Frame::new().fill(Color32::from_rgb(24, 25, 29)).inner_margin(Margin::same(10)))
+            .frame(Frame::new().fill(right_panel_fill).inner_margin(Margin::same(10)))
             .show(ctx, |ui| {
                 render_right_panels(
                     ui,
@@ -229,6 +377,17 @@ impl eframe::App for TzlaserApp {
             &mut self.document,
             &mut self.status_message,
         );
+
+        // 7. Table & Machine Properties Pop-up Window (opened from Ribbon → ⚙ Properties → 📐 Table Properties)
+        properties_window::render_properties_window(
+            ctx,
+            &mut self.props_window_state,
+            &mut self.pulse_config,
+            &mut self.canvas_state,
+            &mut self.panel_state,
+            &self.controller,
+            &mut self.status_message,
+        );
     }
 }
 
@@ -246,6 +405,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Ţlaser",
         native_options,
-        Box::new(|_cc| Ok(Box::new(TzlaserApp::default()))),
+        Box::new(|cc| {
+            #[cfg(target_os = "windows")]
+            configure_windows_theme_and_fonts(&cc.egui_ctx);
+            #[cfg(not(target_os = "windows"))]
+            let _ = cc;
+            Ok(Box::new(TzlaserApp::default()))
+        }),
     )
 }

@@ -617,25 +617,44 @@ pub fn render_canvas(
     }
 
     // 5. Render Machine Bed Outline & Grid
+    #[cfg(target_os = "windows")]
+    painter.rect_filled(response.rect, 0.0, Color32::from_rgb(34, 38, 48));
+
     let bed_top_left = state.world_to_screen(Point::new(0.0, state.bed_height_mm as f64), origin_screen);
     let bed_bottom_right = state.world_to_screen(Point::new(state.bed_width_mm as f64, 0.0), origin_screen);
     let bed_rect = Rect::from_two_pos(bed_top_left, bed_bottom_right);
 
-    painter.rect_filled(bed_rect, 0.0, Color32::from_rgb(18, 19, 22));
-    painter.rect_stroke(bed_rect, 0.0, Stroke::new(1.5, Color32::from_rgb(60, 65, 75)), StrokeKind::Outside);
+    let bed_fill = if cfg!(target_os = "windows") {
+        Color32::from_rgb(16, 18, 23)
+    } else {
+        Color32::from_rgb(18, 19, 22)
+    };
+    let bed_border = if cfg!(target_os = "windows") {
+        Color32::from_rgb(95, 108, 132)
+    } else {
+        Color32::from_rgb(60, 65, 75)
+    };
+    let grid_color = if cfg!(target_os = "windows") {
+        Color32::from_rgb(44, 50, 62)
+    } else {
+        Color32::from_rgb(32, 34, 40)
+    };
+
+    painter.rect_filled(bed_rect, 0.0, bed_fill);
+    painter.rect_stroke(bed_rect, 0.0, Stroke::new(1.5_f32, bed_border), StrokeKind::Outside);
 
     let mut x = 0.0;
     while x <= state.bed_width_mm {
         let p1 = state.world_to_screen(Point::new(x as f64, 0.0), origin_screen);
         let p2 = state.world_to_screen(Point::new(x as f64, state.bed_height_mm as f64), origin_screen);
-        painter.line_segment([p1, p2], Stroke::new(0.5, Color32::from_rgb(32, 34, 40)));
+        painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
         x += 100.0;
     }
     let mut y = 0.0;
     while y <= state.bed_height_mm {
         let p1 = state.world_to_screen(Point::new(0.0, y as f64), origin_screen);
         let p2 = state.world_to_screen(Point::new(state.bed_width_mm as f64, y as f64), origin_screen);
-        painter.line_segment([p1, p2], Stroke::new(0.5, Color32::from_rgb(32, 34, 40)));
+        painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
         y += 100.0;
     }
 
@@ -666,8 +685,8 @@ pub fn render_canvas(
         let unsel_alpha = if has_selection { 180 } else { 255 };
 
         // Selection highlight styles: electric bright gold-yellow with prominent glow
-        let sel_glow_stroke = Stroke::new(6.0, Color32::from_rgba_unmultiplied(255, 230, 0, 90));
-        let sel_core_stroke = Stroke::new(2.8, Color32::from_rgb(255, 235, 10));
+        let sel_glow_stroke = Stroke::new(6.0_f32, Color32::from_rgba_unmultiplied(255, 230, 0, 90));
+        let sel_core_stroke = Stroke::new(2.8_f32, Color32::from_rgb(255, 235, 10));
 
         let layer_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
         for (e_idx, entity) in layer.entities.iter().enumerate() {
@@ -680,7 +699,7 @@ pub fn render_canvas(
                             .copied()
                             .unwrap_or(layer_color);
                         let base_stroke = Stroke::new(
-                            if state.color_by_cut_index { 2.0 } else { 1.5 },
+                            if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
                             Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
                         );
                         render_entity(
@@ -702,7 +721,7 @@ pub fn render_canvas(
                         .copied()
                         .unwrap_or(layer_color);
                     let base_stroke = Stroke::new(
-                        if state.color_by_cut_index { 2.0 } else { 1.5 },
+                        if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
                         Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
                     );
                     render_entity(
@@ -730,7 +749,7 @@ pub fn render_canvas(
 
         // Selection perimeter box
         painter.rect_filled(sel_rect, 2.0, Color32::from_rgba_unmultiplied(0, 210, 255, 18));
-        painter.rect_stroke(sel_rect, 2.0, Stroke::new(1.8, Color32::from_rgb(0, 225, 255)), StrokeKind::Outside);
+        painter.rect_stroke(sel_rect, 2.0, Stroke::new(1.8_f32, Color32::from_rgb(0, 225, 255)), StrokeKind::Outside);
 
         // 8 Sturdy Transform Grab Handles
         let handle_size = 7.0;
@@ -748,7 +767,7 @@ pub fn render_canvas(
         for c in corners {
             let h_rect = Rect::from_center_size(c, Vec2::splat(handle_size));
             painter.rect_filled(h_rect, 1.0, Color32::WHITE);
-            painter.rect_stroke(h_rect, 1.0, Stroke::new(1.2, Color32::from_rgb(20, 20, 25)), StrokeKind::Outside);
+            painter.rect_stroke(h_rect, 1.0, Stroke::new(1.2_f32, Color32::from_rgb(20, 20, 25)), StrokeKind::Outside);
             // Center indicator dot
             painter.circle_filled(c, 1.5, Color32::from_rgb(0, 180, 255));
         }
@@ -761,7 +780,7 @@ pub fn render_canvas(
         let sp2 = state.world_to_screen(p2, origin_screen);
         let m_rect = Rect::from_two_pos(sp1, sp2);
         painter.rect_filled(m_rect, 1.0, Color32::from_rgba_unmultiplied(0, 180, 255, 30));
-        painter.rect_stroke(m_rect, 1.0, Stroke::new(1.5, Color32::from_rgb(0, 220, 255)), StrokeKind::Outside);
+        painter.rect_stroke(m_rect, 1.0, Stroke::new(1.5_f32, Color32::from_rgb(0, 220, 255)), StrokeKind::Outside);
     }
 
     // 9. Render Cut Order Sequence Badges and Starting Pierce Points
@@ -776,7 +795,7 @@ pub fn render_canvas(
                 if prev_end.distance(sc_start) > 8.0 {
                     painter.line_segment(
                         [prev_end, sc_start],
-                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 200, 255, 45)),
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 200, 255, 45)),
                     );
                 }
             }
@@ -785,7 +804,7 @@ pub fn render_canvas(
             painter.circle_stroke(
                 sc_start,
                 4.5,
-                Stroke::new(1.5, Color32::from_rgb(0, 255, 100)),
+                Stroke::new(1.5_f32, Color32::from_rgb(0, 255, 100)),
             );
             painter.circle_filled(sc_start, 2.0, Color32::from_rgb(0, 255, 100));
 
@@ -807,7 +826,7 @@ pub fn render_canvas(
             painter.rect_stroke(
                 badge_rect,
                 3.0,
-                Stroke::new(1.2, border_color),
+                Stroke::new(1.2_f32, border_color),
                 StrokeKind::Outside,
             );
 
@@ -839,7 +858,7 @@ pub fn render_canvas(
         painter.add(egui::Shape::convex_polygon(
             diamond,
             Color32::from_rgba_unmultiplied(245, 165, 35, 130),
-            Stroke::new(1.2, Color32::from_rgb(255, 200, 70)),
+            Stroke::new(1.2_f32, Color32::from_rgb(255, 200, 70)),
         ));
     }
 
@@ -858,7 +877,7 @@ pub fn render_canvas(
                     let t_end = (t + dash).min(dist);
                     painter.line_segment(
                         [head_pos + dir * t, head_pos + dir * t_end],
-                        Stroke::new(1.8, Color32::from_rgba_unmultiplied(255, 185, 50, 215)),
+                        Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(255, 185, 50, 215)),
                     );
                     t += dash + gap;
                 }
@@ -868,7 +887,7 @@ pub fn render_canvas(
         painter.circle_stroke(
             pause_screen,
             13.0,
-            Stroke::new(2.0, Color32::from_rgb(255, 185, 40)),
+            Stroke::new(2.0_f32, Color32::from_rgb(255, 185, 40)),
         );
         let r = 7.0;
         let diamond = vec![
@@ -880,7 +899,7 @@ pub fn render_canvas(
         painter.add(egui::Shape::convex_polygon(
             diamond,
             Color32::from_rgb(255, 175, 30),
-            Stroke::new(1.5, Color32::from_rgb(255, 240, 170)),
+            Stroke::new(1.5_f32, Color32::from_rgb(255, 240, 170)),
         ));
 
         let badge_rect = egui::Rect::from_min_size(
@@ -895,7 +914,7 @@ pub fn render_canvas(
         painter.rect_stroke(
             badge_rect,
             3.0,
-            Stroke::new(1.0, Color32::from_rgb(255, 185, 40)),
+            Stroke::new(1.0_f32, Color32::from_rgb(255, 185, 40)),
             egui::StrokeKind::Outside,
         );
         painter.text(
@@ -918,24 +937,24 @@ pub fn render_canvas(
 
     if laser_on {
         painter.circle_filled(head_pos, 5.5, Color32::from_rgba_unmultiplied(255, 190, 60, 140));
-        painter.circle_stroke(head_pos, 12.0, Stroke::new(2.0, Color32::from_rgb(255, 110, 40)));
+        painter.circle_stroke(head_pos, 12.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 110, 40)));
     } else if is_dry_cut {
-        painter.circle_stroke(head_pos, 11.0, Stroke::new(2.0, Color32::from_rgb(0, 235, 255)));
+        painter.circle_stroke(head_pos, 11.0, Stroke::new(2.0_f32, Color32::from_rgb(0, 235, 255)));
         painter.circle_filled(head_pos, 3.0, Color32::from_rgb(0, 255, 160));
     }
 
     painter.line_segment(
         [Pos2::new(head_pos.x - cross_len, head_pos.y), Pos2::new(head_pos.x + cross_len, head_pos.y)],
-        Stroke::new(2.0, cross_color),
+        Stroke::new(2.0_f32, cross_color),
     );
     painter.line_segment(
         [Pos2::new(head_pos.x, head_pos.y - cross_len), Pos2::new(head_pos.x, head_pos.y + cross_len)],
-        Stroke::new(2.0, cross_color),
+        Stroke::new(2.0_f32, cross_color),
     );
     painter.circle_stroke(
         head_pos,
         8.0,
-        Stroke::new(1.2, cross_color.linear_multiply(0.75)),
+        Stroke::new(1.2_f32, cross_color.linear_multiply(0.75)),
     );
 
     // 11. Render Right-Click Path Context Menu (when paused or stopped)
@@ -944,7 +963,7 @@ pub fn render_canvas(
         painter.circle_stroke(
             menu_screen,
             9.0,
-            Stroke::new(2.0, Color32::from_rgb(90, 220, 255)),
+            Stroke::new(2.0_f32, Color32::from_rgb(90, 220, 255)),
         );
         painter.circle_filled(menu_screen, 3.5, Color32::from_rgb(90, 220, 255));
 
@@ -955,7 +974,7 @@ pub fn render_canvas(
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style())
                     .fill(Color32::from_rgb(28, 31, 38))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(85, 150, 210)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(85, 150, 210)))
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(format!(

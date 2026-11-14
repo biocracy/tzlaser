@@ -3,15 +3,16 @@ use eframe::egui::{
 };
 use std::net::SocketAddr;
 use tzlaser_core::{
-    apply_lead_lines, Document, DxfImporter, HistoryManager, LeadConfig, LeadType, SortMode,
+    apply_lead_lines, Document, DxfImporter, HistoryManager, LeadConfig, LeadType, PulseConfig, SortMode,
 };
-use tzlaser_protocol::{LaserController, MachineStatus};
+use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RibbonTab {
     File,
     Profiles,
     Laser,
+    Properties,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,8 @@ pub fn render_ribbon(
     history: &mut HistoryManager,
     canvas_state: &mut crate::canvas::CanvasState,
     panel_state: &mut crate::panels::PanelState,
+    pulse_config: &mut PulseConfig,
+    props_window_state: &mut crate::properties_window::PropertiesWindowState,
     controller: &mut Option<LaserController>,
     status: &MachineStatus,
     status_message: &mut String,
@@ -72,10 +75,20 @@ pub fn render_ribbon(
         ui.add_space(6.0);
 
         // Quick Access Undo / Redo
+        let disabled_icon_fg = if cfg!(target_os = "windows") {
+            Color32::from_rgb(155, 165, 182)
+        } else {
+            Color32::from_rgb(100, 100, 110)
+        };
+        let quick_btn_bg = if cfg!(target_os = "windows") {
+            Color32::from_rgb(42, 48, 58)
+        } else {
+            Color32::from_rgb(32, 34, 40)
+        };
         let can_undo = history.can_undo();
         let undo_desc = history.undo_description().unwrap_or("Undo");
-        let undo_btn = Button::new(RichText::new("↩").size(13.0).color(if can_undo { Color32::WHITE } else { Color32::from_rgb(100, 100, 110) }))
-            .fill(Color32::from_rgb(32, 34, 40));
+        let undo_btn = Button::new(RichText::new("↩").size(13.0).color(if can_undo { Color32::WHITE } else { disabled_icon_fg }))
+            .fill(quick_btn_bg);
         if ui.add_enabled(can_undo, undo_btn).on_hover_text(format!("Undo {} (Cmd+Z)", undo_desc)).clicked() {
             if let Some(desc) = history.undo(doc, selection) {
                 *status_message = format!("Undo: {}", desc);
@@ -84,8 +97,8 @@ pub fn render_ribbon(
 
         let can_redo = history.can_redo();
         let redo_desc = history.redo_description().unwrap_or("Redo");
-        let redo_btn = Button::new(RichText::new("↪").size(13.0).color(if can_redo { Color32::WHITE } else { Color32::from_rgb(100, 100, 110) }))
-            .fill(Color32::from_rgb(32, 34, 40));
+        let redo_btn = Button::new(RichText::new("↪").size(13.0).color(if can_redo { Color32::WHITE } else { disabled_icon_fg }))
+            .fill(quick_btn_bg);
         if ui.add_enabled(can_redo, redo_btn).on_hover_text(format!("Redo {} (Cmd+Shift+Z / Cmd+Y)", redo_desc)).clicked() {
             if let Some(desc) = history.redo(doc, selection) {
                 *status_message = format!("Redo: {}", desc);
@@ -99,24 +112,29 @@ pub fn render_ribbon(
             (RibbonTab::File, "📁 File & Project"),
             (RibbonTab::Profiles, "📐 Profile CAM"),
             (RibbonTab::Laser, "⚡ Laser & Hardware"),
+            (RibbonTab::Properties, "⚙ Properties"),
         ];
 
         for (tab, label) in tabs {
             let is_active = state.active_tab == tab;
             let bg = if is_active {
                 Color32::from_rgb(45, 52, 68)
+            } else if cfg!(target_os = "windows") {
+                Color32::from_rgb(36, 41, 52)
             } else {
                 Color32::from_rgb(26, 28, 34)
             };
             let text_color = if is_active {
                 Color32::from_rgb(0, 225, 255)
+            } else if cfg!(target_os = "windows") {
+                Color32::from_rgb(218, 226, 240)
             } else {
                 Color32::from_rgb(180, 185, 195)
             };
 
             let btn = Button::new(RichText::new(label).size(12.5).color(text_color).strong())
                 .fill(bg)
-                .stroke(if is_active { Stroke::new(1.0, Color32::from_rgb(0, 180, 240)) } else { Stroke::NONE });
+                .stroke(if is_active { Stroke::new(1.0_f32, Color32::from_rgb(0, 180, 240)) } else { Stroke::NONE });
 
             if ui.add(btn).clicked() {
                 state.active_tab = tab;
@@ -143,7 +161,17 @@ pub fn render_ribbon(
                     .fill(Color32::from_rgb(30, 85, 150));
                 if ui.add(connect_btn).clicked() {
                     if let Ok(addr) = panel_state.target_ip.parse::<SocketAddr>() {
-                        *controller = Some(LaserController::new(addr));
+                        let c = LaserController::new(addr);
+                        let (min_speed, jog_speed, accel) = pulse_config.jog_pulses_params();
+                        c.update_jog_config(
+                            JogConfig {
+                                min_speed,
+                                jog_speed,
+                                accel,
+                            },
+                            pulse_config.z_jog_speed_reg,
+                        );
+                        *controller = Some(c);
                         *status_message = format!("Connecting to controller board at {}...", addr);
                     } else {
                         *status_message = "Invalid IP address format".to_string();
@@ -156,15 +184,34 @@ pub fn render_ribbon(
     ui.add_space(3.0);
 
     // 2. Ribbon Content Area (Rendered directly without horizontal scrollbar)
+    let ribbon_body_fill = if cfg!(target_os = "windows") {
+        Color32::from_rgb(34, 39, 49)
+    } else {
+        Color32::from_rgb(28, 30, 36)
+    };
+    let ribbon_body_stroke = if cfg!(target_os = "windows") {
+        Color32::from_rgb(64, 73, 92)
+    } else {
+        Color32::from_rgb(42, 45, 54)
+    };
     Frame::new()
-        .fill(Color32::from_rgb(28, 30, 36))
+        .fill(ribbon_body_fill)
         .inner_margin(Margin::symmetric(6, 4))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 54)))
+        .stroke(Stroke::new(1.0_f32, ribbon_body_stroke))
         .show(ui, |ui| {
             match state.active_tab {
-                RibbonTab::File => render_file_tab(ui, doc, selection, history, canvas_state, status_message),
+                RibbonTab::File => render_file_tab(ui, doc, selection, history, canvas_state, pulse_config, controller, status_message),
                 RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
                 RibbonTab::Laser => render_laser_tab(ui, state, controller, status, status_message),
+                RibbonTab::Properties => render_properties_tab(
+                    ui,
+                    pulse_config,
+                    props_window_state,
+                    canvas_state,
+                    panel_state,
+                    controller,
+                    status_message,
+                ),
             }
         });
 
@@ -296,13 +343,18 @@ fn render_sort_overwrite_modal(
 }
 
 fn ribbon_group(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
+    let title_color = if cfg!(target_os = "windows") {
+        Color32::from_rgb(182, 194, 214)
+    } else {
+        Color32::from_rgb(130, 135, 150)
+    };
     ui.group(|ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 content(ui);
             });
             ui.add_space(2.0);
-            ui.label(RichText::new(title).size(9.0).color(Color32::from_rgb(130, 135, 150)).strong());
+            ui.label(RichText::new(title).size(9.0).color(title_color).strong());
         });
     });
 }
@@ -313,6 +365,8 @@ fn render_file_tab(
     selection: &mut Vec<(usize, usize)>,
     history: &mut HistoryManager,
     canvas_state: &mut crate::canvas::CanvasState,
+    pulse_config: &mut PulseConfig,
+    controller: &Option<LaserController>,
     status_message: &mut String,
 ) {
     ui.horizontal(|ui| {
@@ -409,18 +463,45 @@ fn render_file_tab(
 
             ui.menu_button("📐 Bed Size", |ui| {
                 if ui.button("1300 x 900 mm (Standard)").clicked() {
-                    canvas_state.bed_width_mm = 1300.0;
-                    canvas_state.bed_height_mm = 900.0;
+                    pulse_config.table_width_mm = 1300.0;
+                    pulse_config.table_height_mm = 900.0;
+                    let mut dummy_panel = crate::panels::PanelState::default();
+                    dummy_panel.target_ip = pulse_config.controller_ip.clone();
+                    crate::properties_window::sync_and_save_properties(
+                        pulse_config,
+                        canvas_state,
+                        &mut dummy_panel,
+                        controller,
+                        status_message,
+                    );
                     ui.close_menu();
                 }
                 if ui.button("1500 x 3000 mm (Sheet Metal)").clicked() {
-                    canvas_state.bed_width_mm = 3000.0;
-                    canvas_state.bed_height_mm = 1500.0;
+                    pulse_config.table_width_mm = 3000.0;
+                    pulse_config.table_height_mm = 1500.0;
+                    let mut dummy_panel = crate::panels::PanelState::default();
+                    dummy_panel.target_ip = pulse_config.controller_ip.clone();
+                    crate::properties_window::sync_and_save_properties(
+                        pulse_config,
+                        canvas_state,
+                        &mut dummy_panel,
+                        controller,
+                        status_message,
+                    );
                     ui.close_menu();
                 }
                 if ui.button("2000 x 4000 mm (Heavy Plate)").clicked() {
-                    canvas_state.bed_width_mm = 4000.0;
-                    canvas_state.bed_height_mm = 2000.0;
+                    pulse_config.table_width_mm = 4000.0;
+                    pulse_config.table_height_mm = 2000.0;
+                    let mut dummy_panel = crate::panels::PanelState::default();
+                    dummy_panel.target_ip = pulse_config.controller_ip.clone();
+                    crate::properties_window::sync_and_save_properties(
+                        pulse_config,
+                        canvas_state,
+                        &mut dummy_panel,
+                        controller,
+                        status_message,
+                    );
                     ui.close_menu();
                 }
             });
@@ -872,4 +953,232 @@ fn render_laser_tab(
             }
         });
     });
+}
+
+fn render_properties_tab(
+    ui: &mut Ui,
+    pulse_config: &mut PulseConfig,
+    props_window_state: &mut crate::properties_window::PropertiesWindowState,
+    canvas_state: &mut crate::canvas::CanvasState,
+    panel_state: &mut crate::panels::PanelState,
+    controller: &Option<LaserController>,
+    status_message: &mut String,
+) {
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
+
+        // 1. Table Properties Modal Launcher
+        ribbon_group(ui, "Table & Machine Setup", |ui| {
+            let is_open = props_window_state.open;
+            let btn_fill = if is_open {
+                Color32::from_rgb(28, 95, 145)
+            } else {
+                Color32::from_rgb(32, 65, 105)
+            };
+            let btn_stroke = if is_open {
+                Stroke::new(1.2_f32, Color32::from_rgb(0, 220, 255))
+            } else {
+                Stroke::new(1.0_f32, Color32::from_rgb(70, 120, 175))
+            };
+            let table_props_btn = Button::new(
+                RichText::new("📐 Table Properties")
+                    .size(12.5)
+                    .color(Color32::from_rgb(140, 235, 255))
+                    .strong(),
+            )
+            .fill(btn_fill)
+            .stroke(btn_stroke)
+            .min_size(Vec2::new(142.0, 36.0));
+
+            if ui
+                .add(table_props_btn)
+                .on_hover_text(
+                    "Open Table & Machine Properties window (bed size, pulses/mm, axis direction, jog speeds, and step calibration)",
+                )
+                .clicked()
+            {
+                props_window_state.open = !props_window_state.open;
+            }
+
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Table: {:.0} × {:.0} mm",
+                        pulse_config.table_width_mm, pulse_config.table_height_mm
+                    ))
+                    .size(11.0)
+                    .strong(),
+                );
+                ui.label(
+                    RichText::new(format!("Z Travel: {:.0} mm", pulse_config.z_max_travel_mm))
+                        .size(10.5)
+                        .weak(),
+                );
+            });
+        });
+
+        ui.add_space(2.0);
+
+        // 2. Quick Axis Calibration (Pulses / mm)
+        ribbon_group(ui, "Axis Scaling (Pulses / mm)", |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("X:").color(Color32::from_rgb(255, 100, 100)).strong().size(11.5));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pulse_config.pulses_per_mm_x)
+                                .range(1.0..=100_000.0)
+                                .speed(1.0)
+                                .suffix(" pls/mm"),
+                        )
+                        .on_hover_text("X-axis pulses per millimeter (auto-saved immediately)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    ui.add_space(4.0);
+
+                    ui.label(RichText::new("Y:").color(Color32::from_rgb(100, 230, 100)).strong().size(11.5));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pulse_config.pulses_per_mm_y)
+                                .range(1.0..=100_000.0)
+                                .speed(1.0)
+                                .suffix(" pls/mm"),
+                        )
+                        .on_hover_text("Y-axis pulses per millimeter (auto-saved immediately)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Z:").color(Color32::from_rgb(100, 175, 255)).strong().size(11.5));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pulse_config.pulses_per_mm_z)
+                                .range(1.0..=100_000.0)
+                                .speed(1.0)
+                                .suffix(" pls/mm"),
+                        )
+                        .on_hover_text("Z-axis pulses per millimeter on Port 999 (auto-saved immediately)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    ui.add_space(6.0);
+                    if ui.checkbox(&mut pulse_config.invert_x, "Inv X").changed() {
+                        changed = true;
+                    }
+                    if ui.checkbox(&mut pulse_config.invert_y, "Inv Y").changed() {
+                        changed = true;
+                    }
+                    if ui.checkbox(&mut pulse_config.invert_z, "Inv Z").changed() {
+                        changed = true;
+                    }
+                });
+            });
+        });
+
+        ui.add_space(2.0);
+
+        // 3. Quick Jog Speed & Presets
+        ribbon_group(ui, "Jog Speed & Presets (Auto-Saved)", |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("XY Speed:").size(11.0));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pulse_config.jog_speed_mm_s)
+                                .range(0.5..=500.0)
+                                .speed(0.5)
+                                .suffix(" mm/s"),
+                        )
+                        .on_hover_text("Conservative XY jog speed in mm/s")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    ui.label(RichText::new("Z Reg:").size(11.0));
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pulse_config.z_jog_speed_reg)
+                                .range(1..=1000)
+                                .speed(1.0),
+                        )
+                        .on_hover_text("Z-axis Modbus speed register (conservative: 25, SC2000 capture: 100)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    let safe_btn = Button::new(
+                        RichText::new("🛡 Conservative Safe")
+                            .size(11.0)
+                            .color(Color32::from_rgb(130, 240, 175))
+                            .strong(),
+                    )
+                    .fill(Color32::from_rgb(24, 52, 38))
+                    .min_size(Vec2::new(125.0, 19.0));
+                    if ui
+                        .add(safe_btn)
+                        .on_hover_text("Reset to slow, conservative safe defaults (200 pls/mm, 10 mm/s jog, 1 mm step)")
+                        .clicked()
+                    {
+                        let ip = pulse_config.controller_ip.clone();
+                        let w = pulse_config.table_width_mm;
+                        let h = pulse_config.table_height_mm;
+                        *pulse_config = PulseConfig::default();
+                        pulse_config.controller_ip = ip;
+                        pulse_config.table_width_mm = w;
+                        pulse_config.table_height_mm = h;
+                        panel_state.jog_mode = crate::panels::JogMode::Step(pulse_config.default_step_mm);
+                        panel_state.step_index = 1;
+                        changed = true;
+                    }
+
+                    let sc2000_btn = Button::new(
+                        RichText::new("📋 SC2000 (590 pls/mm)")
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 220, 110))
+                            .strong(),
+                    )
+                    .fill(Color32::from_rgb(48, 42, 22))
+                    .min_size(Vec2::new(135.0, 19.0));
+                    if ui
+                        .add(sc2000_btn)
+                        .on_hover_text("Apply 590 pulses/mm scaling observed in SC2000 packet capture with gentle 10 mm/s jog speed")
+                        .clicked()
+                    {
+                        pulse_config.pulses_per_mm_x = 590.0;
+                        pulse_config.pulses_per_mm_y = 590.0;
+                        pulse_config.pulses_per_mm_z = 200.0;
+                        pulse_config.jog_start_speed_mm_s = 5.0;
+                        pulse_config.jog_speed_mm_s = 10.0;
+                        pulse_config.jog_accel_mm_s2 = 100.0;
+                        pulse_config.z_jog_speed_reg = 25;
+                        changed = true;
+                    }
+                });
+            });
+        });
+    });
+
+    if changed {
+        crate::properties_window::sync_and_save_properties(
+            pulse_config,
+            canvas_state,
+            panel_state,
+            controller,
+            status_message,
+        );
+    }
 }
