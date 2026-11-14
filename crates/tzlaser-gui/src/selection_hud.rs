@@ -10,6 +10,9 @@ pub enum AnchorPoint {
 pub struct SelectionHudState {
     pub anchor: AnchorPoint,
     pub step_mm: f64,
+    pub lock_aspect: bool,
+    pub scale_pct: f64,
+    pub rotate_deg: f64,
     pub array_cols: usize,
     pub array_rows: usize,
     pub array_gap_x: f64,
@@ -21,6 +24,9 @@ impl Default for SelectionHudState {
         Self {
             anchor: AnchorPoint::BottomLeft,
             step_mm: 10.0,
+            lock_aspect: true,
+            scale_pct: 100.0,
+            rotate_deg: 15.0,
             array_cols: 2,
             array_rows: 2,
             array_gap_x: 5.0,
@@ -235,39 +241,129 @@ pub fn render_selection_hud(
 
             ui.add_space(4.0);
 
-            // 1. Position & Dimensions Numeric Grid
+            // 1. Position & Dimensions Numeric Grid (editable X, Y, W, H)
+            let mut edit_w = width;
+            let mut edit_h = height;
             Grid::new("selection_coords_grid")
                 .num_columns(4)
-                .spacing([12.0, 6.0])
+                .spacing([10.0, 6.0])
                 .show(ui, |ui| {
                     ui.label(RichText::new("X:").strong());
-                    let x_resp = ui.add(DragValue::new(&mut edit_x).speed(0.5).suffix(" mm"));
+                    let x_resp = ui.add(DragValue::new(&mut edit_x).speed(0.5).max_decimals(2).suffix(" mm"));
                     if x_resp.drag_started() {
                         history.record(doc, selection, "Edit X Position");
                     }
                     if x_resp.changed() {
+                        if !x_resp.dragged() {
+                            history.record(doc, selection, "Edit X Position");
+                        }
                         let dx = edit_x - current_x;
                         doc.translate_selection(selection, dx, 0.0);
                     }
 
-                    ui.label(RichText::new("W:").weak());
-                    ui.monospace(format!("{:.2} mm", width));
+                    ui.label(RichText::new("Width:").strong());
+                    let w_resp = ui.add_enabled(
+                        width > 1e-4,
+                        DragValue::new(&mut edit_w)
+                            .range(0.05..=20000.0)
+                            .speed(0.5)
+                            .max_decimals(2)
+                            .suffix(" mm"),
+                    );
+                    if w_resp.drag_started() {
+                        history.record(doc, selection, "Scale Width");
+                    }
+                    if w_resp.changed() && width > 1e-4 {
+                        if !w_resp.dragged() {
+                            history.record(doc, selection, "Scale Width");
+                        }
+                        let sx = (edit_w / width).max(1e-4);
+                        let sy = if state.lock_aspect { sx } else { 1.0 };
+                        doc.scale_selection(selection, sx, sy);
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("Y:").strong());
-                    let y_resp = ui.add(DragValue::new(&mut edit_y).speed(0.5).suffix(" mm"));
+                    let y_resp = ui.add(DragValue::new(&mut edit_y).speed(0.5).max_decimals(2).suffix(" mm"));
                     if y_resp.drag_started() {
                         history.record(doc, selection, "Edit Y Position");
                     }
                     if y_resp.changed() {
+                        if !y_resp.dragged() {
+                            history.record(doc, selection, "Edit Y Position");
+                        }
                         let dy = edit_y - current_y;
                         doc.translate_selection(selection, 0.0, dy);
                     }
 
-                    ui.label(RichText::new("H:").weak());
-                    ui.monospace(format!("{:.2} mm", height));
+                    ui.label(RichText::new("Height:").strong());
+                    let h_resp = ui.add_enabled(
+                        height > 1e-4,
+                        DragValue::new(&mut edit_h)
+                            .range(0.05..=20000.0)
+                            .speed(0.5)
+                            .max_decimals(2)
+                            .suffix(" mm"),
+                    );
+                    if h_resp.drag_started() {
+                        history.record(doc, selection, "Scale Height");
+                    }
+                    if h_resp.changed() && height > 1e-4 {
+                        if !h_resp.dragged() {
+                            history.record(doc, selection, "Scale Height");
+                        }
+                        let sy = (edit_h / height).max(1e-4);
+                        let sx = if state.lock_aspect { sy } else { 1.0 };
+                        doc.scale_selection(selection, sx, sy);
+                    }
                     ui.end_row();
                 });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut state.lock_aspect, "🔒 Lock Ratio");
+                ui.separator();
+                ui.label(RichText::new("Scale:").strong());
+                ui.add(
+                    DragValue::new(&mut state.scale_pct)
+                        .range(1.0..=5000.0)
+                        .speed(1.0)
+                        .max_decimals(1)
+                        .suffix(" %"),
+                );
+                if ui.button("Apply").on_hover_text("Scale selection by percentage around its center").clicked() {
+                    let s = (state.scale_pct / 100.0).max(1e-4);
+                    if (s - 1.0).abs() > 1e-6 {
+                        history.record(doc, selection, "Scale Selection");
+                        doc.scale_selection(selection, s, s);
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Rotate:").strong());
+                ui.add(
+                    DragValue::new(&mut state.rotate_deg)
+                        .range(-360.0..=360.0)
+                        .speed(1.0)
+                        .max_decimals(1)
+                        .suffix("°"),
+                );
+                if ui.button("↻ Rotate").on_hover_text("Rotate CCW by Angle around selection center").clicked() {
+                    if state.rotate_deg.abs() > 1e-6 {
+                        history.record(doc, selection, "Rotate Selection");
+                        doc.rotate_selection(selection, state.rotate_deg);
+                    }
+                }
+                if ui.button("↺ -90°").clicked() {
+                    history.record(doc, selection, "Rotate -90°");
+                    doc.rotate_selection(selection, -90.0);
+                }
+                if ui.button("↻ +90°").clicked() {
+                    history.record(doc, selection, "Rotate +90°");
+                    doc.rotate_selection(selection, 90.0);
+                }
+            });
 
             ui.add_space(6.0);
             ui.separator();

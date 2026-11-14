@@ -716,6 +716,36 @@ fn render_view_tab(
             });
         });
 
+        ribbon_group(ui, "Bed & Guides", |ui| {
+            ui.vertical(|ui| {
+                let (grid_text, grid_color, grid_bg) = if canvas_state.show_grid {
+                    ("⊞ Grid: ON", Color32::from_rgb(120, 210, 255), Color32::from_rgb(24, 58, 82))
+                } else {
+                    ("⊞ Grid: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                if ui
+                    .add(Button::new(RichText::new(grid_text).size(11.0).color(grid_color).strong()).fill(grid_bg).min_size(Vec2::new(102.0, 19.0)))
+                    .on_hover_text("Toggle 100 mm machine bed grid")
+                    .clicked()
+                {
+                    canvas_state.show_grid = !canvas_state.show_grid;
+                }
+
+                let (ruler_text, ruler_color, ruler_bg) = if canvas_state.show_rulers {
+                    ("📏 Ruler: ON", Color32::from_rgb(255, 220, 110), Color32::from_rgb(72, 58, 22))
+                } else {
+                    ("📏 Ruler: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                };
+                if ui
+                    .add(Button::new(RichText::new(ruler_text).size(11.0).color(ruler_color).strong()).fill(ruler_bg).min_size(Vec2::new(102.0, 19.0)))
+                    .on_hover_text("Toggle millimeter coordinate rulers along the top and left canvas edges")
+                    .clicked()
+                {
+                    canvas_state.show_rulers = !canvas_state.show_rulers;
+                }
+            });
+        });
+
         ribbon_group(ui, "Cut Order Coloring", |ui| {
             ui.vertical(|ui| {
                 let (col_text, col_fg, col_bg) = if canvas_state.color_by_cut_index {

@@ -127,6 +127,93 @@ impl Entity {
         self.transform(Affine::translate((dx, dy)));
     }
 
+    /// Scale entity around `center` by `(sx, sy)`.
+    /// Non-uniform scaling of a `Circle` converts it into a 64-segment closed ellipse polyline.
+    pub fn scale_around(&mut self, center: Point, sx: f64, sy: f64) {
+        let sx = if sx.abs() < 1e-6 { 1e-6_f64.copysign(sx) } else { sx };
+        let sy = if sy.abs() < 1e-6 { 1e-6_f64.copysign(sy) } else { sy };
+        let scale_pt = |p: Point| -> Point {
+            Point::new(
+                center.x + (p.x - center.x) * sx,
+                center.y + (p.y - center.y) * sy,
+            )
+        };
+        match self {
+            Entity::Line { start, end } => {
+                *start = scale_pt(*start);
+                *end = scale_pt(*end);
+            }
+            Entity::Polyline { points, .. } => {
+                for p in points.iter_mut() {
+                    *p = scale_pt(*p);
+                }
+            }
+            Entity::Circle { center: c, radius } => {
+                let new_center = scale_pt(*c);
+                if (sx.abs() - sy.abs()).abs() < 1e-6 {
+                    *c = new_center;
+                    *radius = (*radius * sx.abs()).max(1e-4);
+                } else {
+                    let segs = 64usize;
+                    let rx = (*radius * sx.abs()).max(1e-4);
+                    let ry = (*radius * sy.abs()).max(1e-4);
+                    let pts = (0..segs)
+                        .map(|i| {
+                            let ang = std::f64::consts::TAU * (i as f64) / (segs as f64);
+                            Point::new(new_center.x + rx * ang.cos(), new_center.y + ry * ang.sin())
+                        })
+                        .collect();
+                    *self = Entity::Polyline { points: pts, closed: true };
+                }
+            }
+            Entity::Arc { center: c, radius, .. } => {
+                *c = scale_pt(*c);
+                *radius = (*radius * ((sx.abs() + sy.abs()) * 0.5)).max(1e-4);
+            }
+            Entity::Group { children } => {
+                for c in children.iter_mut() {
+                    c.scale_around(center, sx, sy);
+                }
+            }
+        }
+    }
+
+    /// Rotate entity counter-clockwise around `center` by `angle_rad` radians.
+    pub fn rotate_around(&mut self, center: Point, angle_rad: f64) {
+        let (sin_a, cos_a) = angle_rad.sin_cos();
+        let rot_pt = |p: Point| -> Point {
+            let dx = p.x - center.x;
+            let dy = p.y - center.y;
+            Point::new(
+                center.x + dx * cos_a - dy * sin_a,
+                center.y + dx * sin_a + dy * cos_a,
+            )
+        };
+        match self {
+            Entity::Line { start, end } => {
+                *start = rot_pt(*start);
+                *end = rot_pt(*end);
+            }
+            Entity::Polyline { points, .. } => {
+                for p in points.iter_mut() {
+                    *p = rot_pt(*p);
+                }
+            }
+            Entity::Circle { center: c, .. } => {
+                *c = rot_pt(*c);
+            }
+            Entity::Arc { center: c, start_angle, .. } => {
+                *c = rot_pt(*c);
+                *start_angle += angle_rad;
+            }
+            Entity::Group { children } => {
+                for c in children.iter_mut() {
+                    c.rotate_around(center, angle_rad);
+                }
+            }
+        }
+    }
+
     /// Starting pierce point for cutting path
     pub fn start_point(&self) -> Point {
         match self {
@@ -801,6 +888,42 @@ impl Document {
             if let Some(layer) = self.layers.get_mut(l_idx) {
                 if let Some(entity) = layer.entities.get_mut(e_idx) {
                     entity.translate(dx, dy);
+                }
+            }
+        }
+    }
+
+    /// Scale selected entities around their combined bounding-box center.
+    pub fn scale_selection(&mut self, selection: &[(usize, usize)], sx: f64, sy: f64) {
+        let Some(bounds) = self.selection_bounding_box(selection) else { return; };
+        let center = Point::new(
+            (bounds.min_x() + bounds.max_x()) * 0.5,
+            (bounds.min_y() + bounds.max_y()) * 0.5,
+        );
+        for &(l_idx, e_idx) in selection {
+            if let Some(layer) = self.layers.get_mut(l_idx) {
+                if let Some(entity) = layer.entities.get_mut(e_idx) {
+                    entity.scale_around(center, sx, sy);
+                }
+            }
+        }
+    }
+
+    /// Rotate selected entities counter-clockwise around their combined bounding-box center by `angle_deg` degrees.
+    pub fn rotate_selection(&mut self, selection: &[(usize, usize)], angle_deg: f64) {
+        if angle_deg.abs() < 1e-9 {
+            return;
+        }
+        let Some(bounds) = self.selection_bounding_box(selection) else { return; };
+        let center = Point::new(
+            (bounds.min_x() + bounds.max_x()) * 0.5,
+            (bounds.min_y() + bounds.max_y()) * 0.5,
+        );
+        let rad = angle_deg.to_radians();
+        for &(l_idx, e_idx) in selection {
+            if let Some(layer) = self.layers.get_mut(l_idx) {
+                if let Some(entity) = layer.entities.get_mut(e_idx) {
+                    entity.rotate_around(center, rad);
                 }
             }
         }
@@ -3165,6 +3288,50 @@ mod tests {
         doc.ungroup_selection(&mut click_sel);
         assert!(!doc.selection_has_group(&click_sel));
         assert_eq!(doc.layers[obs_layer].entities.len(), 1);
+    }
+
+    #[test]
+    fn test_scale_and_rotate_selection() {
+        let mut doc = Document::new();
+        // 40x20 rectangle centered at (50, 50)
+        doc.layers[0].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(30.0, 40.0),
+                Point::new(70.0, 40.0),
+                Point::new(70.0, 60.0),
+                Point::new(30.0, 60.0),
+            ],
+            closed: true,
+        });
+        // Circle of radius 10 at (50, 50)
+        doc.layers[0].entities.push(Entity::Circle {
+            center: Point::new(50.0, 50.0),
+            radius: 10.0,
+        });
+
+        let sel_rect = vec![(0, 0)];
+        doc.scale_selection(&sel_rect, 2.0, 1.5);
+        let b1 = doc.selection_bounding_box(&sel_rect).unwrap();
+        assert!((b1.width() - 80.0).abs() < 1e-6);
+        assert!((b1.height() - 30.0).abs() < 1e-6);
+
+        // Rotate 90 degrees -> width and height swap
+        doc.rotate_selection(&sel_rect, 90.0);
+        let b2 = doc.selection_bounding_box(&sel_rect).unwrap();
+        assert!((b2.width() - 30.0).abs() < 1e-6);
+        assert!((b2.height() - 80.0).abs() < 1e-6);
+
+        // Uniform scale on Circle scales radius; non-uniform converts to closed polyline
+        let sel_circ = vec![(0, 1)];
+        doc.scale_selection(&sel_circ, 2.0, 2.0);
+        match doc.layers[0].entities[1] {
+            Entity::Circle { radius, .. } => assert!((radius - 20.0).abs() < 1e-6),
+            _ => panic!("Uniform scale should keep Circle"),
+        }
+        doc.scale_selection(&sel_circ, 1.0, 0.5);
+        let bc = doc.selection_bounding_box(&sel_circ).unwrap();
+        assert!((bc.width() - 40.0).abs() < 0.2);
+        assert!((bc.height() - 20.0).abs() < 0.2);
     }
 }
 

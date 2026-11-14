@@ -158,6 +158,8 @@ pub struct CanvasState {
     pub box_select_current: Option<Point>,
     pub show_cut_order: bool,
     pub show_cut_direction: bool,
+    pub show_grid: bool,
+    pub show_rulers: bool,
     pub color_by_cut_index: bool,
     pub color_palette: ColorPalette,
     pub manual_sort_active: bool,
@@ -187,6 +189,8 @@ impl Default for CanvasState {
             box_select_current: None,
             show_cut_order: true,
             show_cut_direction: true,
+            show_grid: true,
+            show_rulers: true,
             color_by_cut_index: false,
             color_palette: ColorPalette::Rainbow,
             manual_sort_active: false,
@@ -1046,19 +1050,21 @@ pub fn render_canvas(
     painter.rect_filled(bed_rect, 0.0, bed_fill);
     painter.rect_stroke(bed_rect, 0.0, Stroke::new(1.5_f32, bed_border), StrokeKind::Outside);
 
-    let mut x = 0.0;
-    while x <= state.bed_width_mm {
-        let p1 = state.world_to_screen(Point::new(x as f64, 0.0), origin_screen);
-        let p2 = state.world_to_screen(Point::new(x as f64, state.bed_height_mm as f64), origin_screen);
-        painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
-        x += 100.0;
-    }
-    let mut y = 0.0;
-    while y <= state.bed_height_mm {
-        let p1 = state.world_to_screen(Point::new(0.0, y as f64), origin_screen);
-        let p2 = state.world_to_screen(Point::new(state.bed_width_mm as f64, y as f64), origin_screen);
-        painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
-        y += 100.0;
+    if state.show_grid {
+        let mut x = 0.0;
+        while x <= state.bed_width_mm {
+            let p1 = state.world_to_screen(Point::new(x as f64, 0.0), origin_screen);
+            let p2 = state.world_to_screen(Point::new(x as f64, state.bed_height_mm as f64), origin_screen);
+            painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
+            x += 100.0;
+        }
+        let mut y = 0.0;
+        while y <= state.bed_height_mm {
+            let p1 = state.world_to_screen(Point::new(0.0, y as f64), origin_screen);
+            let p2 = state.world_to_screen(Point::new(state.bed_width_mm as f64, y as f64), origin_screen);
+            painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
+            y += 100.0;
+        }
     }
 
     // Origin marker & X/Y axes stemming from the selected table origin corner
@@ -1591,6 +1597,108 @@ pub fn render_canvas(
         8.0,
         Stroke::new(1.2_f32, cross_color.linear_multiply(0.75)),
     );
+
+    // 10b. Render Millimeter Coordinate Rulers along Top & Left edges
+    if state.show_rulers {
+        let r_thick = 22.0_f32;
+        let vr = response.rect;
+        let ruler_bg = Color32::from_rgba_unmultiplied(18, 22, 30, 230);
+        let ruler_border = Color32::from_rgb(55, 65, 82);
+        let tick_color = Color32::from_rgb(130, 145, 168);
+        let label_color = Color32::from_rgb(190, 204, 224);
+
+        let top_rect = Rect::from_min_max(vr.min, Pos2::new(vr.max.x, vr.min.y + r_thick));
+        let left_rect = Rect::from_min_max(Pos2::new(vr.min.x, vr.min.y + r_thick), Pos2::new(vr.min.x + r_thick, vr.max.y));
+        let corner_rect = Rect::from_min_max(vr.min, Pos2::new(vr.min.x + r_thick, vr.min.y + r_thick));
+
+        painter.rect_filled(top_rect, 0.0, ruler_bg);
+        painter.rect_filled(left_rect, 0.0, ruler_bg);
+        painter.line_segment(
+            [Pos2::new(vr.min.x + r_thick, vr.min.y + r_thick), Pos2::new(vr.max.x, vr.min.y + r_thick)],
+            Stroke::new(1.0_f32, ruler_border),
+        );
+        painter.line_segment(
+            [Pos2::new(vr.min.x + r_thick, vr.min.y + r_thick), Pos2::new(vr.min.x + r_thick, vr.max.y)],
+            Stroke::new(1.0_f32, ruler_border),
+        );
+
+        // Choose adaptive major tick step in mm so labels are ~65-120 px apart
+        let target_mm = (80.0_f32 / state.zoom.max(0.01)) as f64;
+        let candidates = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+        let major_step = candidates
+            .iter()
+            .copied()
+            .find(|&c| c >= target_mm)
+            .unwrap_or(1000.0);
+        let minor_step = major_step / 5.0;
+
+        // Horizontal (X) ruler
+        let w_left = state.screen_to_world(Pos2::new(vr.min.x + r_thick, vr.min.y), origin_screen).x;
+        let w_right = state.screen_to_world(Pos2::new(vr.max.x, vr.min.y), origin_screen).x;
+        let (x_min, x_max) = (w_left.min(w_right), w_left.max(w_right));
+        let k_start = (x_min / minor_step).floor() as i64;
+        let k_end = (x_max / minor_step).ceil() as i64;
+        for k in k_start..=k_end {
+            let wx = (k as f64) * minor_step;
+            let sx = state.world_to_screen(Point::new(wx, 0.0), origin_screen).x;
+            if sx < vr.min.x + r_thick || sx > vr.max.x {
+                continue;
+            }
+            let is_major = k.rem_euclid(5) == 0;
+            let tick_h = if is_major { 9.0 } else { 4.5 };
+            painter.line_segment(
+                [Pos2::new(sx, vr.min.y + r_thick - tick_h), Pos2::new(sx, vr.min.y + r_thick)],
+                Stroke::new(1.0_f32, tick_color),
+            );
+            if is_major {
+                painter.text(
+                    Pos2::new(sx + 3.0, vr.min.y + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:.0}", wx),
+                    egui::FontId::monospace(9.5),
+                    label_color,
+                );
+            }
+        }
+
+        // Vertical (Y) ruler
+        let w_top = state.screen_to_world(Pos2::new(vr.min.x, vr.min.y + r_thick), origin_screen).y;
+        let w_bot = state.screen_to_world(Pos2::new(vr.min.x, vr.max.y), origin_screen).y;
+        let (y_min, y_max) = (w_top.min(w_bot), w_top.max(w_bot));
+        let ky_start = (y_min / minor_step).floor() as i64;
+        let ky_end = (y_max / minor_step).ceil() as i64;
+        for k in ky_start..=ky_end {
+            let wy = (k as f64) * minor_step;
+            let sy = state.world_to_screen(Point::new(0.0, wy), origin_screen).y;
+            if sy < vr.min.y + r_thick || sy > vr.max.y {
+                continue;
+            }
+            let is_major = k.rem_euclid(5) == 0;
+            let tick_w = if is_major { 9.0 } else { 4.5 };
+            painter.line_segment(
+                [Pos2::new(vr.min.x + r_thick - tick_w, sy), Pos2::new(vr.min.x + r_thick, sy)],
+                Stroke::new(1.0_f32, tick_color),
+            );
+            if is_major {
+                painter.text(
+                    Pos2::new(vr.min.x + 2.0, sy + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:.0}", wy),
+                    egui::FontId::monospace(9.0),
+                    label_color,
+                );
+            }
+        }
+
+        painter.rect_filled(corner_rect, 0.0, Color32::from_rgb(24, 30, 40));
+        painter.text(
+            corner_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "mm",
+            egui::FontId::monospace(8.5),
+            Color32::from_rgb(150, 165, 190),
+        );
+    }
 
     // 11. Render Right-Click Path Context Menu (when paused or stopped)
     if let Some(menu) = state.context_menu.clone() {
