@@ -1932,16 +1932,8 @@ impl Document {
         }
     }
 
-    /// Build ordered rapid and cutting motion segments across the document's active cut sequence,
-    /// starting from `start_origin` and returning to `start_origin` at the end.
-    /// Rapid travel moves automatically route around any `Obstacle` layer exclusion zones.
-    pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
-        let seq = self.compute_cut_sequence();
-        let rapid_speed = self.travel_speed_mm_s(rapid_speed_mm_s);
-        let mut segments = Vec::new();
-        let mut current_pos = start_origin;
-
-        // Collect all obstacle exclusion polygons
+    /// Collect all outward-offset exclusion polygons for every entity on any `Obstacle` layer.
+    pub fn all_obstacle_exclusion_polygons(&self) -> Vec<Vec<Point>> {
         let mut exclusion_polys: Vec<Vec<Point>> = Vec::new();
         for (l_idx, layer) in self.layers.iter().enumerate() {
             if !layer.is_obstacle {
@@ -1951,6 +1943,32 @@ impl Document {
                 exclusion_polys.extend(self.obstacle_exclusion_polygons(l_idx, e_idx));
             }
         }
+        exclusion_polys
+    }
+
+    /// Route a rapid travel move from `start` to `goal` avoiding all `exclusion_polys`.
+    pub fn route_rapid_between(
+        start: Point,
+        goal: Point,
+        exclusion_polys: &[Vec<Point>],
+    ) -> Vec<Point> {
+        let direct_len = (goal.x - start.x).hypot(goal.y - start.y);
+        if direct_len <= 1e-4 || exclusion_polys.is_empty() {
+            return vec![start, goal];
+        }
+        route_around_obstacles(start, goal, exclusion_polys)
+    }
+
+    /// Build ordered rapid and cutting motion segments across the document's active cut sequence,
+    /// starting from `start_origin` and returning to `start_origin` at the end.
+    /// Rapid travel moves automatically route around any `Obstacle` layer exclusion zones.
+    pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
+        let seq = self.compute_cut_sequence();
+        let rapid_speed = self.travel_speed_mm_s(rapid_speed_mm_s);
+        let mut segments = Vec::new();
+        let mut current_pos = start_origin;
+
+        let exclusion_polys = self.all_obstacle_exclusion_polygons();
 
         let push_rapid_routed = |from: Point,
                                  to: Point,
@@ -1960,11 +1978,7 @@ impl Document {
             if direct_len <= 1e-4 {
                 return;
             }
-            let waypoints = if exclusion_polys.is_empty() {
-                vec![from, to]
-            } else {
-                route_around_obstacles(from, to, &exclusion_polys)
-            };
+            let waypoints = Self::route_rapid_between(from, to, &exclusion_polys);
             for pair in waypoints.windows(2) {
                 let len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
                 if len > 1e-4 {
@@ -2911,6 +2925,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_obstacle_positional_change_retriggers_routing() {
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(10.0, 0.0),
+        });
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(90.0, 0.0),
+            end: Point::new(100.0, 0.0),
+        });
+        let obs_layer = doc.ensure_obstacle_layer();
+        // Start obstacle well above the rapid line (y = 50..70) -> direct path
+        doc.layers[obs_layer].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(40.0, 50.0),
+                Point::new(60.0, 50.0),
+                Point::new(60.0, 70.0),
+                Point::new(40.0, 70.0),
+            ],
+            closed: true,
+        });
+        doc.set_obstacle_exclusion_radius(obs_layer, 0, 2.0);
+
+        let polys_clear = doc.all_obstacle_exclusion_polygons();
+        let direct = Document::route_rapid_between(Point::new(10.0, 0.0), Point::new(90.0, 0.0), &polys_clear);
+        assert_eq!(direct.len(), 2);
+
+        // Move obstacle down by -60mm so it blocks y = -10..10 (exclusion y = -12..12)
+        doc.translate_selection(&[(obs_layer, 0)], 0.0, -60.0);
+        let polys_blocked = doc.all_obstacle_exclusion_polygons();
+        let detoured = Document::route_rapid_between(Point::new(10.0, 0.0), Point::new(90.0, 0.0), &polys_blocked);
+        assert!(detoured.len() > 2, "Moving obstacle into path must re-route around exclusion zone");
+
+        let inner_excl = &offset_entity_outwards(&doc.layers[obs_layer].entities[0], 1.9)[0];
+        for pair in detoured.windows(2) {
+            assert!(!segment_intersects_polygon(pair[0], pair[1], inner_excl));
+        }
+    }
 }
 
 /// Compute outward-offset closed polygons for an entity at constant perpendicular distance `radius_mm`.
@@ -3057,9 +3111,11 @@ pub fn segment_intersects_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
     if poly.len() < 3 {
         return false;
     }
-    let mid = Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
-    if point_in_polygon(mid, poly) {
-        return true;
+    for &t in &[0.25, 0.5, 0.75] {
+        let pt = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+        if point_in_polygon(pt, poly) {
+            return true;
+        }
     }
     let n = poly.len();
     for i in 0..n {

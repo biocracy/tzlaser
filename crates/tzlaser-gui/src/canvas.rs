@@ -169,6 +169,8 @@ pub struct CanvasState {
     pub draw_anchor: Option<Point>,
     pub draw_spline_pts: Vec<Point>,
     pub draw_spline_closed: bool,
+    /// Cached obstacle-avoiding rapid travel polylines keyed by scene geometry + obstacle hash.
+    pub cached_rapid_routes: (Option<u64>, Vec<Vec<Point>>),
 }
 
 impl Default for CanvasState {
@@ -196,6 +198,7 @@ impl Default for CanvasState {
             draw_anchor: None,
             draw_spline_pts: Vec::new(),
             draw_spline_closed: false,
+            cached_rapid_routes: (None, Vec::new()),
         }
     }
 }
@@ -1274,17 +1277,56 @@ pub fn render_canvas(
     // 9. Render Cut Order Sequence Badges and Starting Pierce Points
     if state.show_cut_order {
         let cut_sequence = doc.compute_cut_sequence();
+        let exclusion_polys = doc.all_obstacle_exclusion_polygons();
+
+        // Retrigger obstacle-avoidance routing whenever any cut endpoint or obstacle position/radius changes
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cut_sequence.len().hash(&mut hasher);
+        for info in &cut_sequence {
+            info.start_point.x.to_bits().hash(&mut hasher);
+            info.start_point.y.to_bits().hash(&mut hasher);
+            info.end_point.x.to_bits().hash(&mut hasher);
+            info.end_point.y.to_bits().hash(&mut hasher);
+        }
+        exclusion_polys.len().hash(&mut hasher);
+        for poly in &exclusion_polys {
+            poly.len().hash(&mut hasher);
+            for pt in poly {
+                pt.x.to_bits().hash(&mut hasher);
+                pt.y.to_bits().hash(&mut hasher);
+            }
+        }
+        let scene_hash = hasher.finish();
+
+        if state.cached_rapid_routes.0 != Some(scene_hash) {
+            let mut routes = Vec::with_capacity(cut_sequence.len().saturating_sub(1));
+            for order_idx in 1..cut_sequence.len() {
+                let from = cut_sequence[order_idx - 1].end_point;
+                let to = cut_sequence[order_idx].start_point;
+                routes.push(Document::route_rapid_between(from, to, &exclusion_polys));
+            }
+            state.cached_rapid_routes = (Some(scene_hash), routes);
+        }
+
         for (order_idx, info) in cut_sequence.iter().enumerate() {
             let sc_start = state.world_to_screen(info.start_point, origin_screen);
 
-            // Subtle rapid travel dashed line from previous cut end
+            // Rapid travel line from previous cut end (routed around any obstacle exclusion zones)
             if order_idx > 0 {
-                let prev_end = state.world_to_screen(cut_sequence[order_idx - 1].end_point, origin_screen);
-                if prev_end.distance(sc_start) > 8.0 {
-                    painter.line_segment(
-                        [prev_end, sc_start],
-                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 200, 255, 45)),
-                    );
+                if let Some(waypoints) = state.cached_rapid_routes.1.get(order_idx - 1) {
+                    let rapid_color = if waypoints.len() > 2 {
+                        Color32::from_rgba_unmultiplied(255, 165, 70, 140)
+                    } else {
+                        Color32::from_rgba_unmultiplied(0, 200, 255, 45)
+                    };
+                    for pair in waypoints.windows(2) {
+                        let p1 = state.world_to_screen(pair[0], origin_screen);
+                        let p2 = state.world_to_screen(pair[1], origin_screen);
+                        if p1.distance(p2) > 2.0 {
+                            painter.line_segment([p1, p2], Stroke::new(1.2_f32, rapid_color));
+                        }
+                    }
                 }
             }
 

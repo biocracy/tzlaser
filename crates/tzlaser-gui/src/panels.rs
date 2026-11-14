@@ -483,39 +483,105 @@ impl PanelState {
     /// continuing the interrupted segment and all remaining paths.
     pub fn continue_run(
         &mut self,
+        doc: &Document,
         current_head: kurbo::Point,
         controller: &Option<LaserController>,
     ) -> Option<String> {
         let cp = self.paused_checkpoint.take()?;
+        let exclusion_polys = doc.all_obstacle_exclusion_polygons();
+        let rapid_speed = doc.travel_speed_mm_s(200.0);
 
         let mut new_traj: Vec<MotionSegment> = Vec::new();
         let return_dist = current_head.distance(cp.point_mm);
         if return_dist > 1e-4 {
-            new_traj.push(MotionSegment {
-                start: current_head,
-                end: cp.point_mm,
-                length_mm: return_dist,
-                speed_mm_s: 200.0,
-                is_rapid: true,
-                path_index_1based: cp.path_index_1based,
-            });
+            let waypoints = Document::route_rapid_between(current_head, cp.point_mm, &exclusion_polys);
+            for pair in waypoints.windows(2) {
+                let len = pair[0].distance(pair[1]);
+                if len > 1e-4 {
+                    new_traj.push(MotionSegment {
+                        start: pair[0],
+                        end: pair[1],
+                        length_mm: len,
+                        speed_mm_s: rapid_speed,
+                        is_rapid: true,
+                        path_index_1based: cp.path_index_1based,
+                    });
+                }
+            }
         }
 
         if cp.seg_idx < self.trajectory.len() {
             let orig_seg = self.trajectory[cp.seg_idx];
             let rem_len = cp.point_mm.distance(orig_seg.end);
             if rem_len > 1e-6 {
-                new_traj.push(MotionSegment {
-                    start: cp.point_mm,
-                    end: orig_seg.end,
-                    length_mm: rem_len,
-                    speed_mm_s: orig_seg.speed_mm_s,
-                    is_rapid: orig_seg.is_rapid,
-                    path_index_1based: orig_seg.path_index_1based,
-                });
+                if orig_seg.is_rapid && !exclusion_polys.is_empty() {
+                    let waypoints = Document::route_rapid_between(cp.point_mm, orig_seg.end, &exclusion_polys);
+                    for pair in waypoints.windows(2) {
+                        let len = pair[0].distance(pair[1]);
+                        if len > 1e-4 {
+                            new_traj.push(MotionSegment {
+                                start: pair[0],
+                                end: pair[1],
+                                length_mm: len,
+                                speed_mm_s: orig_seg.speed_mm_s,
+                                is_rapid: true,
+                                path_index_1based: orig_seg.path_index_1based,
+                            });
+                        }
+                    }
+                } else {
+                    new_traj.push(MotionSegment {
+                        start: cp.point_mm,
+                        end: orig_seg.end,
+                        length_mm: rem_len,
+                        speed_mm_s: orig_seg.speed_mm_s,
+                        is_rapid: orig_seg.is_rapid,
+                        path_index_1based: orig_seg.path_index_1based,
+                    });
+                }
             }
             if cp.seg_idx + 1 < self.trajectory.len() {
-                new_traj.extend_from_slice(&self.trajectory[(cp.seg_idx + 1)..]);
+                if exclusion_polys.is_empty() {
+                    new_traj.extend_from_slice(&self.trajectory[(cp.seg_idx + 1)..]);
+                } else {
+                    // Re-route any remaining rapid segments in case an obstacle moved while paused
+                    let rest = &self.trajectory[(cp.seg_idx + 1)..];
+                    let mut i = 0;
+                    while i < rest.len() {
+                        if !rest[i].is_rapid {
+                            new_traj.push(rest[i]);
+                            i += 1;
+                        } else {
+                            let rapid_start = rest[i].start;
+                            let path_idx = rest[i].path_index_1based;
+                            let spd = rest[i].speed_mm_s;
+                            let mut j = i;
+                            while j + 1 < rest.len()
+                                && rest[j + 1].is_rapid
+                                && rest[j + 1].path_index_1based == path_idx
+                            {
+                                j += 1;
+                            }
+                            let rapid_end = rest[j].end;
+                            let waypoints =
+                                Document::route_rapid_between(rapid_start, rapid_end, &exclusion_polys);
+                            for pair in waypoints.windows(2) {
+                                let len = pair[0].distance(pair[1]);
+                                if len > 1e-4 {
+                                    new_traj.push(MotionSegment {
+                                        start: pair[0],
+                                        end: pair[1],
+                                        length_mm: len,
+                                        speed_mm_s: spd,
+                                        is_rapid: true,
+                                        path_index_1based: path_idx,
+                                    });
+                                }
+                            }
+                            i = j + 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -1194,7 +1260,7 @@ pub fn render_right_panels(
                         .on_hover_text("Return from current position to recorded pause point and continue")
                         .clicked()
                     {
-                        if let Some(msg) = panel_state.continue_run(current_head, controller) {
+                        if let Some(msg) = panel_state.continue_run(doc, current_head, controller) {
                             *status_message = msg;
                         }
                     }
@@ -1580,7 +1646,8 @@ mod tests {
 
         // 2. Simulate user jogging away to (80, 60) while paused, then pressing Continue
         let jogged_pos = kurbo::Point::new(80.0, 60.0);
-        let cont_msg = state.continue_run(jogged_pos, &None);
+        let empty_doc = Document::new();
+        let cont_msg = state.continue_run(&empty_doc, jogged_pos, &None);
         assert!(cont_msg.is_some());
         assert!(!state.is_paused);
         assert!(state.paused_checkpoint.is_none());
@@ -1613,7 +1680,7 @@ mod tests {
         let cp2 = state.paused_checkpoint.unwrap();
         assert!((cp2.point_mm.x - 70.0).abs() < 1e-6);
 
-        assert!(state.continue_run(cp2.point_mm, &None).is_some());
+        assert!(state.continue_run(&empty_doc, cp2.point_mm, &None).is_some());
         // No rapid return needed since head wasn't jogged
         assert_eq!(state.trajectory.len(), 2);
         assert!(!state.trajectory[0].is_rapid);
@@ -1727,7 +1794,7 @@ mod tests {
         assert!((cp5.point_mm.x - 40.0).abs() < 1e-6 && (cp5.point_mm.y - 8.0).abs() < 1e-6);
 
         // 6. Continue from stepped point cleanly picks up remaining Profile 1 (12mm) + rapid + Profile 2
-        assert!(state.continue_run(cp5.point_mm, &None).is_some());
+        assert!(state.continue_run(&Document::new(), cp5.point_mm, &None).is_some());
         assert!(!state.is_paused);
         assert_eq!(state.trajectory.len(), 3);
         assert!((state.trajectory[0].length_mm - 12.0).abs() < 1e-6);
@@ -1806,7 +1873,7 @@ mod tests {
         let stepped = state.paused_checkpoint.unwrap().point_mm;
         assert!((stepped.x - 110.0).abs() < 1e-6 && (stepped.y - 50.0).abs() < 1e-6);
 
-        assert!(state.continue_run(stepped, &None).is_some());
+        assert!(state.continue_run(&doc, stepped, &None).is_some());
         assert!(!state.is_paused);
         assert!((state.trajectory[0].start.x - 110.0).abs() < 1e-6);
 
