@@ -108,6 +108,47 @@ pub fn render_selection_hud(
 
             ui.separator();
 
+            // 0. Selection Layer Assignment Dropdown (preserves cut order indexing)
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Layer:").strong());
+                let first_layer = selection.first().map(|&(l, _)| l);
+                let all_same_layer = first_layer
+                    .map(|fl| selection.iter().all(|&(l, _)| l == fl))
+                    .unwrap_or(false);
+                let current_layer_text = if all_same_layer {
+                    first_layer
+                        .and_then(|l| doc.layers.get(l))
+                        .map(|layer| layer.name.clone())
+                        .unwrap_or_else(|| "Unknown".to_string())
+                } else {
+                    "Mixed Layers".to_string()
+                };
+
+                let mut target_layer: Option<usize> = None;
+                ComboBox::from_id_salt("selection_layer_combo")
+                    .selected_text(RichText::new(current_layer_text).strong())
+                    .width(175.0)
+                    .show_ui(ui, |ui| {
+                        for (l_idx, layer) in doc.layers.iter().enumerate() {
+                            let swatch = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
+                            let selected = all_same_layer && first_layer == Some(l_idx);
+                            let label = RichText::new(format!("■ {}", layer.name)).color(swatch);
+                            if ui.selectable_label(selected, label).clicked() {
+                                target_layer = Some(l_idx);
+                            }
+                        }
+                    });
+
+                if let Some(t_idx) = target_layer {
+                    if !(all_same_layer && first_layer == Some(t_idx)) {
+                        history.record(doc, selection, "Change Selection Layer");
+                        doc.move_selection_to_layer(selection, t_idx);
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+
             // 1. Position & Dimensions Numeric Grid
             Grid::new("selection_coords_grid")
                 .num_columns(4)

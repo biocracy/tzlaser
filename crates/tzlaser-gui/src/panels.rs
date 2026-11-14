@@ -1331,6 +1331,24 @@ pub fn render_right_panels(
                             });
                         });
                 }
+
+                ui.add_space(4.0);
+                let add_layer_btn = Button::new(
+                    RichText::new("➕ Add Layer")
+                        .size(12.0)
+                        .color(Color32::from_rgb(120, 230, 170))
+                        .strong(),
+                )
+                .fill(Color32::from_rgb(26, 46, 40));
+                if ui
+                    .add_sized([ui.available_width(), 26.0], add_layer_btn)
+                    .on_hover_text("Create a new custom layer (preserved when running Auto-Classify)")
+                    .clicked()
+                {
+                    let new_idx = doc.add_custom_layer();
+                    panel_state.active_layer_popup = Some(new_idx);
+                    *status_message = format!("Added custom layer '{}'.", doc.layers[new_idx].name);
+                }
             });
     });
 }

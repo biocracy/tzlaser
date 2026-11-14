@@ -419,6 +419,8 @@ pub struct Layer {
     pub visible: bool,
     pub params: CuttingParams,
     pub entities: Vec<Entity>,
+    #[serde(default)]
+    pub is_custom: bool,
 }
 
 impl Layer {
@@ -429,6 +431,7 @@ impl Layer {
             visible: true,
             params: CuttingParams::default(),
             entities: Vec::new(),
+            is_custom: false,
         }
     }
 }
@@ -937,15 +940,165 @@ impl Document {
         false
     }
 
+    /// Add a new custom layer below existing layers (preserved across Auto-Classify).
+    pub fn add_custom_layer(&mut self) -> usize {
+        const PALETTE: [Color; 7] = [
+            Color::CYAN,
+            Color { r: 255, g: 165, b: 40 },
+            Color::BLUE,
+            Color::YELLOW,
+            Color::MAGENTA,
+            Color::GREEN,
+            Color::RED,
+        ];
+        let mut n = 1;
+        let name = loop {
+            let candidate = format!("Custom {}", n);
+            if !self
+                .layers
+                .iter()
+                .any(|l| l.name.eq_ignore_ascii_case(&candidate))
+            {
+                break candidate;
+            }
+            n += 1;
+        };
+        let color = PALETTE[self.layers.len() % PALETTE.len()];
+        let mut layer = Layer::new(name, color);
+        layer.is_custom = true;
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
+    /// Move all entities in `selection` to `target_layer_idx`, updating `selection` and
+    /// remapping cut-order / manual-sequence / pasted-origin indices so cut ordering is preserved.
+    pub fn move_selection_to_layer(
+        &mut self,
+        selection: &mut Vec<(usize, usize)>,
+        target_layer_idx: usize,
+    ) -> bool {
+        if target_layer_idx >= self.layers.len() || selection.is_empty() {
+            return false;
+        }
+
+        let selected_set: std::collections::HashSet<(usize, usize)> = selection
+            .iter()
+            .copied()
+            .filter(|&(l, e)| {
+                l != target_layer_idx
+                    && self
+                        .layers
+                        .get(l)
+                        .map_or(false, |layer| e < layer.entities.len())
+            })
+            .collect();
+
+        if selected_set.is_empty() {
+            return false;
+        }
+
+        let pre_seq = self.compute_cut_sequence();
+        if self.sort_mode == SortMode::Manual && self.manual_sequence.is_empty() {
+            for info in &pre_seq {
+                let pair = (info.layer_idx, info.entity_idx);
+                if !self.manual_sequence.contains(&pair) {
+                    self.manual_sequence.push(pair);
+                }
+            }
+        }
+
+        let mut old_to_new: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+        let mut moved_entities: Vec<Entity> = Vec::new();
+        let target_base = self.layers[target_layer_idx].entities.len();
+
+        for (e_idx, _) in self.layers[target_layer_idx].entities.iter().enumerate() {
+            old_to_new.insert((target_layer_idx, e_idx), (target_layer_idx, e_idx));
+        }
+
+        for (l_idx, layer) in self.layers.iter_mut().enumerate() {
+            if l_idx == target_layer_idx {
+                continue;
+            }
+            let mut kept = Vec::with_capacity(layer.entities.len());
+            for (e_idx, ent) in layer.entities.drain(..).enumerate() {
+                if selected_set.contains(&(l_idx, e_idx)) {
+                    let new_e = target_base + moved_entities.len();
+                    old_to_new.insert((l_idx, e_idx), (target_layer_idx, new_e));
+                    moved_entities.push(ent);
+                } else {
+                    let new_e = kept.len();
+                    old_to_new.insert((l_idx, e_idx), (l_idx, new_e));
+                    kept.push(ent);
+                }
+            }
+            layer.entities = kept;
+        }
+
+        self.layers[target_layer_idx].entities.extend(moved_entities);
+
+        for pair in selection.iter_mut() {
+            if let Some(&new_pair) = old_to_new.get(pair) {
+                *pair = new_pair;
+            }
+        }
+
+        for pair in &mut self.manual_sequence {
+            if let Some(&new_pair) = old_to_new.get(pair) {
+                *pair = new_pair;
+            }
+        }
+
+        for (l_idx, e_idx, _) in &mut self.saved_cut_order {
+            if let Some(&(nl, ne)) = old_to_new.get(&(*l_idx, *e_idx)) {
+                *l_idx = nl;
+                *e_idx = ne;
+            }
+        }
+
+        if !self.pasted_origins.is_empty() {
+            let mut remapped = HashMap::with_capacity(self.pasted_origins.len());
+            for ((old_l, old_e), mut origin) in self.pasted_origins.drain() {
+                let (nl, ne) = old_to_new.get(&(old_l, old_e)).copied().unwrap_or((old_l, old_e));
+                let (pl, pe) = old_to_new
+                    .get(&(origin.parent_layer, origin.parent_entity))
+                    .copied()
+                    .unwrap_or((origin.parent_layer, origin.parent_entity));
+                origin.parent_layer = pl;
+                origin.parent_entity = pe;
+                remapped.insert((nl, ne), origin);
+            }
+            self.pasted_origins = remapped;
+        }
+
+        true
+    }
+
     /// Auto-detects and classifies profiles into Outer Profiles, Interior Profiles, and Bend / Open Lines.
+    /// Unpacks grouped entities so nested holes/lines inside groups are classified accurately,
+    /// while preserving any user-created custom layers (`is_custom == true`).
     pub fn auto_classify_profiles(&mut self) {
         self.manual_sequence.clear();
         self.pasted_origins.clear();
         self.saved_cut_order.clear();
         self.use_saved_cut_order = false;
+
+        fn flatten_entities(entities: Vec<Entity>, out: &mut Vec<Entity>) {
+            for ent in entities {
+                match ent {
+                    Entity::Group { children } => flatten_entities(children, out),
+                    other => out.push(other),
+                }
+            }
+        }
+
         let mut all_entities = Vec::new();
+        let mut custom_layers = Vec::new();
         for layer in self.layers.drain(..) {
-            all_entities.extend(layer.entities);
+            if layer.is_custom {
+                custom_layers.push(layer);
+            } else {
+                flatten_entities(layer.entities, &mut all_entities);
+            }
         }
 
         let chained = chain_connected_entities(all_entities, 0.1);
@@ -1014,10 +1167,11 @@ impl Document {
             new_layers.push(bend_layer);
         }
 
-        if new_layers.is_empty() {
+        if new_layers.is_empty() && custom_layers.is_empty() {
             new_layers.push(Layer::new("Outer Profiles", Color::GREEN));
         }
 
+        new_layers.extend(custom_layers);
         self.layers = new_layers;
     }
 
@@ -2278,5 +2432,103 @@ mod tests {
         let cut_segs: Vec<&MotionSegment> = traj.iter().filter(|s| !s.is_rapid).collect();
         assert_eq!(cut_segs.iter().filter(|s| s.path_index_1based == 1).count(), 64);
         assert_eq!(cut_segs.iter().filter(|s| s.path_index_1based == 2).count(), 4);
+    }
+
+    #[test]
+    fn test_auto_classify_grouped_paths_and_preserve_custom_layers() {
+        let mut doc = Document::new();
+        // Put a grouped outer rectangle + inner hole + open bend line in Layer 0
+        doc.layers[0].entities.push(Entity::Group {
+            children: vec![
+                Entity::Polyline {
+                    points: vec![
+                        Point::new(0.0, 0.0),
+                        Point::new(200.0, 0.0),
+                        Point::new(200.0, 100.0),
+                        Point::new(0.0, 100.0),
+                    ],
+                    closed: true,
+                },
+                Entity::Circle {
+                    center: Point::new(50.0, 50.0),
+                    radius: 15.0,
+                },
+                Entity::Line {
+                    start: Point::new(100.0, 10.0),
+                    end: Point::new(100.0, 90.0),
+                },
+            ],
+        });
+
+        // Add a custom layer with a custom entity before auto-classifying
+        let custom_idx = doc.add_custom_layer();
+        assert!(doc.layers[custom_idx].is_custom);
+        let custom_name = doc.layers[custom_idx].name.clone();
+        doc.layers[custom_idx].entities.push(Entity::Circle {
+            center: Point::new(300.0, 300.0),
+            radius: 10.0,
+        });
+
+        doc.auto_classify_profiles();
+
+        let outer = doc.layers.iter().find(|l| l.name == "Outer Profiles").expect("Outer layer");
+        let inner = doc.layers.iter().find(|l| l.name == "Interior Profiles").expect("Inner layer");
+        let bend = doc.layers.iter().find(|l| l.name == "Bend / Open Lines").expect("Bend layer");
+        let custom = doc.layers.iter().find(|l| l.name == custom_name).expect("Custom layer must be preserved");
+
+        assert_eq!(outer.entities.len(), 1);
+        assert_eq!(inner.entities.len(), 1);
+        assert_eq!(bend.entities.len(), 1);
+        assert!(custom.is_custom);
+        assert_eq!(custom.entities.len(), 1);
+    }
+
+    #[test]
+    fn test_move_selection_to_layer_preserves_cut_order_and_selection() {
+        let mut doc = Document::new();
+        let rect = Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(200.0, 0.0),
+                Point::new(200.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        };
+        let circle = Entity::Circle {
+            center: Point::new(50.0, 50.0),
+            radius: 10.0,
+        };
+        doc.layers[0].entities.push(rect);
+        doc.layers[0].entities.push(circle);
+        let custom_idx = doc.add_custom_layer();
+
+        // Save custom cut order: [rect (0,0), circle (0,1)]
+        doc.sort_mode = SortMode::Manual;
+        doc.assign_manual_cut_index(0, 0, 1);
+        doc.assign_manual_cut_index(0, 1, 2);
+        doc.save_current_cut_order();
+
+        let before_starts: Vec<Point> = doc
+            .compute_cut_sequence()
+            .into_iter()
+            .map(|c| c.start_point)
+            .collect();
+        assert_eq!(before_starts.len(), 2);
+
+        // Move rect (0, 0) to custom layer
+        let mut selection = vec![(0, 0)];
+        assert!(doc.move_selection_to_layer(&mut selection, custom_idx));
+        assert_eq!(selection, vec![(custom_idx, 0)]);
+        assert_eq!(doc.layers[0].entities.len(), 1);
+        assert_eq!(doc.layers[custom_idx].entities.len(), 1);
+
+        // Cut order sequence must remain identical!
+        let after_starts: Vec<Point> = doc
+            .compute_cut_sequence()
+            .into_iter()
+            .map(|c| c.start_point)
+            .collect();
+        assert_eq!(before_starts, after_starts);
     }
 }
