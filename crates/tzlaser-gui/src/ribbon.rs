@@ -640,7 +640,7 @@ fn render_file_tab(
 
 fn render_view_tab(
     ui: &mut Ui,
-    doc: &Document,
+    doc: &mut Document,
     canvas_state: &mut crate::canvas::CanvasState,
 ) {
     ui.horizontal(|ui| {
@@ -664,18 +664,42 @@ fn render_view_tab(
 
         ribbon_group(ui, "Toolpath Overlays", |ui| {
             ui.vertical(|ui| {
-                let order_active = canvas_state.show_cut_order;
-                let (order_text, order_color, order_bg) = if order_active {
-                    ("🔢 Index: ON", Color32::from_rgb(0, 230, 255), Color32::from_rgb(20, 65, 95))
-                } else {
-                    ("🔢 Index: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
-                };
-                let btn_order = Button::new(RichText::new(order_text).size(11.0).color(order_color).strong())
-                    .fill(order_bg)
-                    .min_size(Vec2::new(112.0, 19.0));
-                if ui.add(btn_order).on_hover_text("Toggle cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
-                    canvas_state.show_cut_order = !canvas_state.show_cut_order;
-                }
+                ui.horizontal(|ui| {
+                    let order_active = canvas_state.show_cut_order;
+                    let (order_text, order_color, order_bg) = if order_active {
+                        ("🔢 Index: ON", Color32::from_rgb(0, 230, 255), Color32::from_rgb(20, 65, 95))
+                    } else {
+                        ("🔢 Index: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                    };
+                    let btn_order = Button::new(RichText::new(order_text).size(11.0).color(order_color).strong())
+                        .fill(order_bg)
+                        .min_size(Vec2::new(102.0, 19.0));
+                    if ui.add(btn_order).on_hover_text("Toggle cut sequence numbers (1, 2, 3...) and green pierce start markers").clicked() {
+                        canvas_state.show_cut_order = !canvas_state.show_cut_order;
+                    }
+
+                    let travel_active = doc.layers.iter().find(|l| l.is_travel).map_or(true, |l| l.visible);
+                    let (travel_text, travel_color, travel_bg) = if travel_active {
+                        ("〰 Travel: ON", Color32::from_rgb(255, 175, 85), Color32::from_rgb(80, 52, 22))
+                    } else {
+                        ("〰 Travel: OFF", Color32::from_rgb(160, 165, 175), Color32::from_rgb(36, 40, 48))
+                    };
+                    let btn_travel = Button::new(RichText::new(travel_text).size(11.0).color(travel_color).strong())
+                        .fill(travel_bg)
+                        .min_size(Vec2::new(102.0, 19.0));
+                    if ui
+                        .add(btn_travel)
+                        .on_hover_text("Toggle rapid travel paths (synced with the Travel layer visibility checkbox)")
+                        .clicked()
+                    {
+                        let new_vis = !travel_active;
+                        for layer in &mut doc.layers {
+                            if layer.is_travel {
+                                layer.visible = new_vis;
+                            }
+                        }
+                    }
+                });
 
                 let dir_active = canvas_state.show_cut_direction;
                 let (dir_text, dir_color, dir_bg) = if dir_active {
@@ -685,7 +709,7 @@ fn render_view_tab(
                 };
                 let btn_dir = Button::new(RichText::new(dir_text).size(11.0).color(dir_color).strong())
                     .fill(dir_bg)
-                    .min_size(Vec2::new(112.0, 19.0));
+                    .min_size(Vec2::new(102.0, 19.0));
                 if ui.add(btn_dir).on_hover_text("Toggle cut direction arrowheads along profile toolpaths").clicked() {
                     canvas_state.show_cut_direction = !canvas_state.show_cut_direction;
                 }

@@ -1274,46 +1274,45 @@ pub fn render_canvas(
         painter.rect_stroke(m_rect, 1.0, Stroke::new(1.5_f32, Color32::from_rgb(0, 220, 255)), StrokeKind::Outside);
     }
 
-    // 9. Render Cut Order Sequence Badges and Starting Pierce Points
-    if state.show_cut_order {
+    // 9. Render Rapid Travel Paths (Travel layer visibility) and Cut Order Badges (show_cut_order)
+    let show_travel_paths = doc.layers.iter().find(|l| l.is_travel).map_or(true, |l| l.visible);
+    if state.show_cut_order || show_travel_paths {
         let cut_sequence = doc.compute_cut_sequence();
-        let exclusion_polys = doc.all_obstacle_exclusion_polygons();
 
-        // Retrigger obstacle-avoidance routing whenever any cut endpoint or obstacle position/radius changes
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        cut_sequence.len().hash(&mut hasher);
-        for info in &cut_sequence {
-            info.start_point.x.to_bits().hash(&mut hasher);
-            info.start_point.y.to_bits().hash(&mut hasher);
-            info.end_point.x.to_bits().hash(&mut hasher);
-            info.end_point.y.to_bits().hash(&mut hasher);
-        }
-        exclusion_polys.len().hash(&mut hasher);
-        for poly in &exclusion_polys {
-            poly.len().hash(&mut hasher);
-            for pt in poly {
-                pt.x.to_bits().hash(&mut hasher);
-                pt.y.to_bits().hash(&mut hasher);
+        if show_travel_paths {
+            let exclusion_polys = doc.all_obstacle_exclusion_polygons();
+
+            // Retrigger obstacle-avoidance routing whenever any cut endpoint or obstacle position/radius changes
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            cut_sequence.len().hash(&mut hasher);
+            for info in &cut_sequence {
+                info.start_point.x.to_bits().hash(&mut hasher);
+                info.start_point.y.to_bits().hash(&mut hasher);
+                info.end_point.x.to_bits().hash(&mut hasher);
+                info.end_point.y.to_bits().hash(&mut hasher);
             }
-        }
-        let scene_hash = hasher.finish();
+            exclusion_polys.len().hash(&mut hasher);
+            for poly in &exclusion_polys {
+                poly.len().hash(&mut hasher);
+                for pt in poly {
+                    pt.x.to_bits().hash(&mut hasher);
+                    pt.y.to_bits().hash(&mut hasher);
+                }
+            }
+            let scene_hash = hasher.finish();
 
-        if state.cached_rapid_routes.0 != Some(scene_hash) {
-            let mut routes = Vec::with_capacity(cut_sequence.len().saturating_sub(1));
+            if state.cached_rapid_routes.0 != Some(scene_hash) {
+                let mut routes = Vec::with_capacity(cut_sequence.len().saturating_sub(1));
+                for order_idx in 1..cut_sequence.len() {
+                    let from = cut_sequence[order_idx - 1].end_point;
+                    let to = cut_sequence[order_idx].start_point;
+                    routes.push(Document::route_rapid_between(from, to, &exclusion_polys));
+                }
+                state.cached_rapid_routes = (Some(scene_hash), routes);
+            }
+
             for order_idx in 1..cut_sequence.len() {
-                let from = cut_sequence[order_idx - 1].end_point;
-                let to = cut_sequence[order_idx].start_point;
-                routes.push(Document::route_rapid_between(from, to, &exclusion_polys));
-            }
-            state.cached_rapid_routes = (Some(scene_hash), routes);
-        }
-
-        for (order_idx, info) in cut_sequence.iter().enumerate() {
-            let sc_start = state.world_to_screen(info.start_point, origin_screen);
-
-            // Rapid travel line from previous cut end (routed around any obstacle exclusion zones)
-            if order_idx > 0 {
                 if let Some(waypoints) = state.cached_rapid_routes.1.get(order_idx - 1) {
                     let rapid_color = if waypoints.len() > 2 {
                         Color32::from_rgba_unmultiplied(255, 165, 70, 140)
@@ -1329,44 +1328,50 @@ pub fn render_canvas(
                     }
                 }
             }
+        }
 
-            // Pierce Starting Point Marker: bright green target dot with outer ring
-            painter.circle_stroke(
-                sc_start,
-                4.5,
-                Stroke::new(1.5_f32, Color32::from_rgb(0, 255, 100)),
-            );
-            painter.circle_filled(sc_start, 2.0, Color32::from_rgb(0, 255, 100));
+        if state.show_cut_order {
+            for (order_idx, info) in cut_sequence.iter().enumerate() {
+                let sc_start = state.world_to_screen(info.start_point, origin_screen);
 
-            // Cut Sequence Number Pill Badge
-            let num = order_idx + 1;
-            let text = format!("{}", num);
-            let badge_pos = Pos2::new(sc_start.x + 10.0, sc_start.y - 10.0);
+                // Pierce Starting Point Marker: bright green target dot with outer ring
+                painter.circle_stroke(
+                    sc_start,
+                    4.5,
+                    Stroke::new(1.5_f32, Color32::from_rgb(0, 255, 100)),
+                );
+                painter.circle_filled(sc_start, 2.0, Color32::from_rgb(0, 255, 100));
 
-            let border_color = if info.is_interior {
-                Color32::from_rgb(255, 215, 0) // Gold for interior holes
-            } else {
-                Color32::from_rgb(0, 229, 255) // Cyan for outer boundaries
-            };
+                // Cut Sequence Number Pill Badge
+                let num = order_idx + 1;
+                let text = format!("{}", num);
+                let badge_pos = Pos2::new(sc_start.x + 10.0, sc_start.y - 10.0);
 
-            let badge_w = (text.len() as f32 * 7.5 + 8.0).max(18.0);
-            let badge_rect = Rect::from_center_size(badge_pos, Vec2::new(badge_w, 16.0));
+                let border_color = if info.is_interior {
+                    Color32::from_rgb(255, 215, 0) // Gold for interior holes
+                } else {
+                    Color32::from_rgb(0, 229, 255) // Cyan for outer boundaries
+                };
 
-            painter.rect_filled(badge_rect, 3.0, Color32::from_rgb(15, 23, 42));
-            painter.rect_stroke(
-                badge_rect,
-                3.0,
-                Stroke::new(1.2_f32, border_color),
-                StrokeKind::Outside,
-            );
+                let badge_w = (text.len() as f32 * 7.5 + 8.0).max(18.0);
+                let badge_rect = Rect::from_center_size(badge_pos, Vec2::new(badge_w, 16.0));
 
-            painter.text(
-                badge_pos,
-                egui::Align2::CENTER_CENTER,
-                text,
-                egui::FontId::monospace(10.5),
-                Color32::WHITE,
-            );
+                painter.rect_filled(badge_rect, 3.0, Color32::from_rgb(15, 23, 42));
+                painter.rect_stroke(
+                    badge_rect,
+                    3.0,
+                    Stroke::new(1.2_f32, border_color),
+                    StrokeKind::Outside,
+                );
+
+                painter.text(
+                    badge_pos,
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    egui::FontId::monospace(10.5),
+                    Color32::WHITE,
+                );
+            }
         }
     }
 

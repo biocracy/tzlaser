@@ -1518,11 +1518,7 @@ pub fn render_right_panels(
                         .stroke(row_stroke)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                if !layer.is_travel {
-                                    ui.checkbox(&mut layer.visible, "");
-                                } else {
-                                    ui.add_space(20.0);
-                                }
+                                ui.checkbox(&mut layer.visible, "");
                                 let swatch_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
                                 let summary = if layer.is_travel {
                                     format!(
