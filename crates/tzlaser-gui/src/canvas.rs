@@ -160,6 +160,7 @@ pub struct CanvasState {
     pub show_cut_direction: bool,
     pub show_grid: bool,
     pub show_rulers: bool,
+    pub home_retraction_mm: f64,
     pub color_by_cut_index: bool,
     pub color_palette: ColorPalette,
     pub manual_sort_active: bool,
@@ -191,6 +192,7 @@ impl Default for CanvasState {
             show_cut_direction: true,
             show_grid: true,
             show_rulers: true,
+            home_retraction_mm: 10.0,
             color_by_cut_index: false,
             color_palette: ColorPalette::Rainbow,
             manual_sort_active: false,
@@ -1114,6 +1116,59 @@ pub fn render_canvas(
             let p1 = state.world_to_screen(Point::new(0.0, wy), origin_screen);
             let p2 = state.world_to_screen(Point::new(w, wy), origin_screen);
             painter.line_segment([p1, p2], Stroke::new(stroke_w, col));
+        }
+    }
+
+    // 5b. Render Homing Retraction Exclusion Zone in the negative machine-coordinate realm
+    // (0,0 origin remains 0,0; the retraction zone sits behind the origin toward the sensors)
+    if state.home_retraction_mm > 0.01 {
+        let r = state.home_retraction_mm;
+        let x_sign = x_screen_dir.x as f64;
+        let y_world_sign = -y_screen_dir.y as f64;
+        let w = state.bed_width_mm as f64;
+        let h = state.bed_height_mm as f64;
+        let to_world = |mx: f64, my: f64| -> Point {
+            Point::new(origin_world.x + mx * x_sign, origin_world.y + my * y_world_sign)
+        };
+
+        let fill_col = Color32::from_rgba_unmultiplied(220, 58, 58, 42);
+        let stroke_col = Color32::from_rgba_unmultiplied(240, 88, 78, 175);
+
+        // X-negative strip: mx in [-r, 0], my in [-r, H]
+        let x_strip = Rect::from_two_pos(
+            state.world_to_screen(to_world(-r, -r), origin_screen),
+            state.world_to_screen(to_world(0.0, h), origin_screen),
+        );
+        // Y-negative strip: mx in [0, W], my in [-r, 0]
+        let y_strip = Rect::from_two_pos(
+            state.world_to_screen(to_world(0.0, -r), origin_screen),
+            state.world_to_screen(to_world(w, 0.0), origin_screen),
+        );
+        painter.rect_filled(x_strip, 0.0, fill_col);
+        painter.rect_filled(y_strip, 0.0, fill_col);
+
+        let l_outline: Vec<Pos2> = [
+            to_world(-r, -r),
+            to_world(w, -r),
+            to_world(w, 0.0),
+            to_world(0.0, 0.0),
+            to_world(0.0, h),
+            to_world(-r, h),
+        ]
+        .into_iter()
+        .map(|p| state.world_to_screen(p, origin_screen))
+        .collect();
+        draw_dashed_closed_poly(&painter, &l_outline, Stroke::new(1.3_f32, stroke_col));
+
+        if (r as f32) * state.zoom >= 7.0 {
+            let lbl_pos = state.world_to_screen(to_world(w * 0.5, -r * 0.5), origin_screen);
+            painter.text(
+                lbl_pos,
+                egui::Align2::CENTER_CENTER,
+                format!("Homing Retraction Exclusion (-{:.0} mm)", r),
+                egui::FontId::proportional(10.0),
+                Color32::from_rgba_unmultiplied(245, 130, 120, 210),
+            );
         }
     }
 
