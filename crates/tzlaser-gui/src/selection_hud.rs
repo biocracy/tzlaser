@@ -124,7 +124,18 @@ pub fn render_selection_hud(
                     "Mixed Layers".to_string()
                 };
 
+                let all_can_be_obstacle = !selection.is_empty()
+                    && selection.iter().all(|&(l, e)| {
+                        doc.layers
+                            .get(l)
+                            .and_then(|ly| ly.entities.get(e))
+                            .map_or(false, |ent| ent.can_be_obstacle())
+                    });
+
                 let mut target_layer: Option<usize> = None;
+                let mut assign_new_obstacle = false;
+                let has_obstacle_layer = doc.layers.iter().any(|l| l.is_obstacle);
+
                 ComboBox::from_id_salt("selection_layer_combo")
                     .selected_text(RichText::new(current_layer_text).strong())
                     .width(175.0)
@@ -136,11 +147,45 @@ pub fn render_selection_hud(
                             let swatch = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
                             let selected = all_same_layer && first_layer == Some(l_idx);
                             let label = RichText::new(format!("■ {}", layer.name)).color(swatch);
-                            if ui.selectable_label(selected, label).clicked() {
+                            if layer.is_obstacle {
+                                let resp = ui
+                                    .add_enabled_ui(all_can_be_obstacle, |ui| {
+                                        ui.selectable_label(selected, label)
+                                    })
+                                    .inner;
+                                if !all_can_be_obstacle {
+                                    resp.on_disabled_hover_text(
+                                        "Only closed shapes with non-zero area can be obstacles (not points or open lines).",
+                                    );
+                                } else if resp.clicked() {
+                                    target_layer = Some(l_idx);
+                                }
+                            } else if ui.selectable_label(selected, label).clicked() {
                                 target_layer = Some(l_idx);
                             }
                         }
+                        if !has_obstacle_layer {
+                            let obs_color = Color32::from_rgb(235, 95, 55);
+                            let label = RichText::new("■ Obstacle").color(obs_color);
+                            let resp = ui
+                                .add_enabled_ui(all_can_be_obstacle, |ui| {
+                                    ui.selectable_label(false, label)
+                                })
+                                .inner;
+                            if !all_can_be_obstacle {
+                                resp.on_disabled_hover_text(
+                                    "Only closed shapes with non-zero area can be obstacles (not points or open lines).",
+                                );
+                            } else if resp.clicked() {
+                                assign_new_obstacle = true;
+                            }
+                        }
                     });
+
+                if assign_new_obstacle {
+                    let obs_idx = doc.ensure_obstacle_layer();
+                    target_layer = Some(obs_idx);
+                }
 
                 if let Some(t_idx) = target_layer {
                     if !(all_same_layer && first_layer == Some(t_idx)) {
@@ -149,6 +194,44 @@ pub fn render_selection_hud(
                     }
                 }
             });
+
+            // 0b. Obstacle Exclusion Radius (shown when any selected entity is on an Obstacle layer)
+            let selected_obstacles: Vec<(usize, usize)> = selection
+                .iter()
+                .copied()
+                .filter(|&(l, _)| doc.layers.get(l).map_or(false, |ly| ly.is_obstacle))
+                .collect();
+            if !selected_obstacles.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Exclusion Radius:")
+                            .strong()
+                            .color(Color32::from_rgb(245, 130, 85)),
+                    );
+                    let mut radius_mm = doc.obstacle_exclusion_radius(
+                        selected_obstacles[0].0,
+                        selected_obstacles[0].1,
+                    );
+                    let resp = ui.add(
+                        DragValue::new(&mut radius_mm)
+                            .range(0.0..=500.0)
+                            .speed(0.1)
+                            .max_decimals(2)
+                            .suffix(" mm"),
+                    );
+                    if resp.drag_started() {
+                        history.record(doc, selection, "Obstacle Exclusion Radius");
+                    }
+                    if resp.changed() {
+                        if !resp.dragged() {
+                            history.record(doc, selection, "Obstacle Exclusion Radius");
+                        }
+                        for &(l, e) in &selected_obstacles {
+                            doc.set_obstacle_exclusion_radius(l, e, radius_mm);
+                        }
+                    }
+                });
+            }
 
             ui.add_space(4.0);
 

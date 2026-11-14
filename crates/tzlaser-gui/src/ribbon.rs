@@ -1,15 +1,19 @@
+use crate::canvas::{catmull_rom_spline, make_ellipse_entity, make_rectangle_entity, DrawTool};
 use eframe::egui::{
-    self, Button, Color32, Frame, Margin, RichText, Stroke, Ui, Vec2,
+    self, Button, Color32, DragValue, Frame, Margin, RichText, Stroke, Ui, Vec2,
 };
+use kurbo::Point;
 use std::net::SocketAddr;
 use tzlaser_core::{
-    apply_lead_lines, Document, DxfImporter, HistoryManager, LeadConfig, LeadType, PulseConfig, SortMode,
+    apply_lead_lines, Color, Document, DxfImporter, Entity, HistoryManager, Layer, LeadConfig,
+    LeadType, PulseConfig, SortMode,
 };
 use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RibbonTab {
     File,
+    Draw,
     Profiles,
     View,
     Laser,
@@ -34,6 +38,16 @@ pub struct RibbonState {
     pub red_pointer_enabled: bool,
     pub gas_open: bool,
     pub pending_sort_action: Option<PendingSortAction>,
+    // Dimensioned shape placement fields for the Draw tab
+    pub draw_place_x: f64,
+    pub draw_place_y: f64,
+    pub draw_rect_w: f64,
+    pub draw_rect_h: f64,
+    pub draw_circle_r: f64,
+    pub draw_line_len: f64,
+    pub draw_line_deg: f64,
+    pub draw_ellipse_rx: f64,
+    pub draw_ellipse_ry: f64,
 }
 
 impl Default for RibbonState {
@@ -47,6 +61,15 @@ impl Default for RibbonState {
             red_pointer_enabled: false,
             gas_open: false,
             pending_sort_action: None,
+            draw_place_x: 150.0,
+            draw_place_y: 150.0,
+            draw_rect_w: 100.0,
+            draw_rect_h: 50.0,
+            draw_circle_r: 25.0,
+            draw_line_len: 100.0,
+            draw_line_deg: 0.0,
+            draw_ellipse_rx: 40.0,
+            draw_ellipse_ry: 25.0,
         }
     }
 }
@@ -111,6 +134,7 @@ pub fn render_ribbon(
         // Ribbon Tab Buttons
         let tabs = [
             (RibbonTab::File, "📁 File & Project"),
+            (RibbonTab::Draw, "✏ Draw"),
             (RibbonTab::Profiles, "📐 Profile CAM"),
             (RibbonTab::View, "👁 View & Overlays"),
             (RibbonTab::Laser, "⚡ Laser & Hardware"),
@@ -203,6 +227,7 @@ pub fn render_ribbon(
         .show(ui, |ui| {
             match state.active_tab {
                 RibbonTab::File => render_file_tab(ui, doc, selection, history, status_message),
+                RibbonTab::Draw => render_draw_tab(ui, state, doc, selection, history, canvas_state, status_message),
                 RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
                 RibbonTab::View => render_view_tab(ui, doc, canvas_state),
                 RibbonTab::Laser => render_laser_tab(ui, state, pulse_config, controller, status, status_message),
@@ -219,6 +244,167 @@ pub fn render_ribbon(
         });
 
     render_sort_overwrite_modal(ui.ctx(), state, doc, selection, history, canvas_state, status_message);
+}
+
+fn place_drawn_entity(
+    doc: &mut Document,
+    selection: &mut Vec<(usize, usize)>,
+    history: &mut HistoryManager,
+    entity: Entity,
+    label: &str,
+    status_message: &mut String,
+) {
+    history.record(doc, selection, &format!("Draw {}", label));
+    let layer_idx = doc
+        .layers
+        .iter()
+        .position(|l| !l.is_travel && !l.is_obstacle)
+        .unwrap_or_else(|| {
+            doc.layers.push(Layer::new("Cut", Color { r: 255, g: 255, b: 255 }));
+            doc.layers.len() - 1
+        });
+    let entity_idx = doc.layers[layer_idx].entities.len();
+    doc.layers[layer_idx].entities.push(entity);
+    selection.clear();
+    selection.push((layer_idx, entity_idx));
+    *status_message = format!("Placed {} on '{}'", label, doc.layers[layer_idx].name);
+}
+
+fn render_draw_tab(
+    ui: &mut Ui,
+    state: &mut RibbonState,
+    doc: &mut Document,
+    selection: &mut Vec<(usize, usize)>,
+    history: &mut HistoryManager,
+    canvas_state: &mut crate::canvas::CanvasState,
+    status_message: &mut String,
+) {
+    let active_bg = Color32::from_rgb(35, 95, 130);
+    let inactive_bg = if cfg!(target_os = "windows") {
+        Color32::from_rgb(44, 50, 62)
+    } else {
+        Color32::from_rgb(36, 40, 48)
+    };
+
+    ribbon_group(ui, "Shapes", |ui| {
+        let tools = [
+            (DrawTool::None, "🖱 Select", "Return to selection / pan mode (Esc)"),
+            (DrawTool::Rectangle, "⬛ Rectangle", "Draw rectangle by 2 corners on canvas or place by dimensions"),
+            (DrawTool::Circle, "⚪ Circle", "Draw circle (center + radius point) or place by radius"),
+            (DrawTool::Line, "📏 Line", "Draw line segment (2 points) or place by length & angle"),
+            (DrawTool::Point, "• Point", "Click canvas or Place to insert a point marker"),
+            (DrawTool::Ellipse, "⬭ Ellipse", "Draw ellipse (center + corner) or place by Rx / Ry"),
+            (DrawTool::Spline, "〰 Spline", "Click control points on canvas; double-click, right-click, or Enter to finish"),
+        ];
+
+        for (tool, label, tip) in tools {
+            let is_active = canvas_state.draw_tool == tool;
+            let btn = Button::new(RichText::new(label).size(11.5).color(if is_active {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(215, 222, 235)
+            }))
+            .fill(if is_active { active_bg } else { inactive_bg })
+            .min_size(Vec2::new(72.0, 26.0));
+            if ui.add(btn).on_hover_text(tip).clicked() {
+                canvas_state.draw_tool = tool;
+                canvas_state.draw_anchor = None;
+                canvas_state.draw_spline_pts.clear();
+                *status_message = match tool {
+                    DrawTool::None => "Selection tool active".to_string(),
+                    DrawTool::Point => "Click on canvas to place a Point (or use Place)".to_string(),
+                    DrawTool::Spline => "Click control points on canvas; Enter / double-click / right-click to finish".to_string(),
+                    _ => format!("{:?} tool active: click/drag on canvas or enter dimensions and click Place", tool),
+                };
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+
+    ribbon_group(ui, "Dimensioned Place", |ui| {
+        ui.label(RichText::new("X:").size(11.0));
+        ui.add(DragValue::new(&mut state.draw_place_x).speed(1.0).max_decimals(2).suffix(" mm"));
+        ui.label(RichText::new("Y:").size(11.0));
+        ui.add(DragValue::new(&mut state.draw_place_y).speed(1.0).max_decimals(2).suffix(" mm"));
+        ui.separator();
+
+        match canvas_state.draw_tool {
+            DrawTool::None => {
+                ui.label(RichText::new("Select a shape tool to draw or place by exact dimensions.").size(11.0).weak());
+            }
+            DrawTool::Rectangle => {
+                ui.label(RichText::new("W:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_rect_w).range(0.1..=10000.0).speed(1.0).max_decimals(2).suffix(" mm"));
+                ui.label(RichText::new("H:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_rect_h).range(0.1..=10000.0).speed(1.0).max_decimals(2).suffix(" mm"));
+                if ui.button(RichText::new("📍 Place").strong()).clicked() {
+                    let a = Point { x: state.draw_place_x, y: state.draw_place_y };
+                    let b = Point { x: state.draw_place_x + state.draw_rect_w, y: state.draw_place_y + state.draw_rect_h };
+                    place_drawn_entity(doc, selection, history, make_rectangle_entity(a, b), "Rectangle", status_message);
+                }
+            }
+            DrawTool::Circle => {
+                ui.label(RichText::new("R:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_circle_r).range(0.1..=5000.0).speed(0.5).max_decimals(2).suffix(" mm"));
+                if ui.button(RichText::new("📍 Place").strong()).clicked() {
+                    let ent = Entity::Circle {
+                        center: Point { x: state.draw_place_x, y: state.draw_place_y },
+                        radius: state.draw_circle_r.max(0.05),
+                    };
+                    place_drawn_entity(doc, selection, history, ent, "Circle", status_message);
+                }
+            }
+            DrawTool::Line => {
+                ui.label(RichText::new("L:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_line_len).range(0.1..=10000.0).speed(1.0).max_decimals(2).suffix(" mm"));
+                ui.label(RichText::new("∠:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_line_deg).range(-360.0..=360.0).speed(1.0).max_decimals(1).suffix("°"));
+                if ui.button(RichText::new("📍 Place").strong()).clicked() {
+                    let rad = state.draw_line_deg.to_radians();
+                    let start = Point { x: state.draw_place_x, y: state.draw_place_y };
+                    let end = Point {
+                        x: state.draw_place_x + state.draw_line_len * rad.cos(),
+                        y: state.draw_place_y + state.draw_line_len * rad.sin(),
+                    };
+                    place_drawn_entity(doc, selection, history, Entity::Line { start, end }, "Line", status_message);
+                }
+            }
+            DrawTool::Point => {
+                if ui.button(RichText::new("📍 Place Point").strong()).clicked() {
+                    let p = Point { x: state.draw_place_x, y: state.draw_place_y };
+                    place_drawn_entity(doc, selection, history, Entity::Line { start: p, end: p }, "Point", status_message);
+                }
+            }
+            DrawTool::Ellipse => {
+                ui.label(RichText::new("Rx:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_ellipse_rx).range(0.1..=5000.0).speed(0.5).max_decimals(2).suffix(" mm"));
+                ui.label(RichText::new("Ry:").size(11.0));
+                ui.add(DragValue::new(&mut state.draw_ellipse_ry).range(0.1..=5000.0).speed(0.5).max_decimals(2).suffix(" mm"));
+                if ui.button(RichText::new("📍 Place").strong()).clicked() {
+                    let ent = make_ellipse_entity(
+                        Point { x: state.draw_place_x, y: state.draw_place_y },
+                        state.draw_ellipse_rx.max(0.05),
+                        state.draw_ellipse_ry.max(0.05),
+                    );
+                    place_drawn_entity(doc, selection, history, ent, "Ellipse", status_message);
+                }
+            }
+            DrawTool::Spline => {
+                ui.checkbox(&mut canvas_state.draw_spline_closed, "Closed");
+                let can_finish = canvas_state.draw_spline_pts.len() >= 2;
+                if ui.add_enabled(can_finish, Button::new(RichText::new("✓ Finish").strong())).clicked() {
+                    let pts = catmull_rom_spline(&canvas_state.draw_spline_pts, canvas_state.draw_spline_closed);
+                    let ent = Entity::Polyline { points: pts, closed: canvas_state.draw_spline_closed };
+                    canvas_state.draw_spline_pts.clear();
+                    place_drawn_entity(doc, selection, history, ent, "Spline", status_message);
+                }
+                if ui.add_enabled(!canvas_state.draw_spline_pts.is_empty(), Button::new("✕ Clear")).clicked() {
+                    canvas_state.draw_spline_pts.clear();
+                }
+            }
+        }
+    });
 }
 
 fn execute_sort_action(

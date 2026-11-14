@@ -1464,6 +1464,12 @@ pub fn render_right_panels(
                                         layer.params.speed_mm_s,
                                         layer.params.cut_height_mm
                                     )
+                                } else if layer.is_obstacle {
+                                    format!(
+                                        "#{}, {:.2} m · Obstacle (No-Cut)",
+                                        layer.total_path_count(),
+                                        layer.total_path_length_m(),
+                                    )
                                 } else {
                                     format!(
                                         "#{}, {:.2} m · {:.0} mm/s · {:.0}% · {}",

@@ -276,6 +276,17 @@ impl Entity {
         }
     }
 
+    /// True if this entity is a closed shape with non-zero area (eligible to be an Obstacle).
+    /// Points and open lines/paths return `false`.
+    pub fn can_be_obstacle(&self) -> bool {
+        match self {
+            Entity::Group { children } => {
+                !children.is_empty() && children.iter().all(|c| c.can_be_obstacle())
+            }
+            _ => self.is_closed() && self.area() > 1e-3,
+        }
+    }
+
     /// Check if point is inside entity (only for closed shapes)
     pub fn contains_point(&self, pt: Point) -> bool {
         match self {
@@ -458,6 +469,8 @@ pub struct Layer {
     pub is_custom: bool,
     #[serde(default)]
     pub is_travel: bool,
+    #[serde(default)]
+    pub is_obstacle: bool,
 }
 
 impl Layer {
@@ -470,6 +483,7 @@ impl Layer {
             entities: Vec::new(),
             is_custom: false,
             is_travel: false,
+            is_obstacle: false,
         }
     }
 
@@ -489,6 +503,27 @@ impl Layer {
             entities: Vec::new(),
             is_custom: false,
             is_travel: true,
+            is_obstacle: false,
+        }
+    }
+
+    pub fn new_obstacle() -> Self {
+        Self {
+            name: "Obstacle".to_string(),
+            color: Color { r: 235, g: 95, b: 55 },
+            visible: true,
+            params: CuttingParams {
+                speed_mm_s: 0.0,
+                power_percent: 0.0,
+                pierce_time_ms: 0,
+                gas_type: "None".to_string(),
+                cut_height_mm: 0.0,
+                frequency_hz: 0,
+            },
+            entities: Vec::new(),
+            is_custom: false,
+            is_travel: false,
+            is_obstacle: true,
         }
     }
 
@@ -569,28 +604,29 @@ pub struct PastedOrigin {
 }
 
 mod tuple_map_serde {
-    use super::PastedOrigin;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::HashMap;
 
-    pub fn serialize<S>(
-        map: &HashMap<(usize, usize), PastedOrigin>,
+    pub fn serialize<S, V>(
+        map: &HashMap<(usize, usize), V>,
         serializer: S,
     ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
+        V: Serialize + Copy,
     {
-        let entries: Vec<((usize, usize), PastedOrigin)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+        let entries: Vec<((usize, usize), V)> = map.iter().map(|(&k, &v)| (k, v)).collect();
         entries.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(
+    pub fn deserialize<'de, D, V>(
         deserializer: D,
-    ) -> Result<HashMap<(usize, usize), PastedOrigin>, D::Error>
+    ) -> Result<HashMap<(usize, usize), V>, D::Error>
     where
         D: Deserializer<'de>,
+        V: Deserialize<'de>,
     {
-        let entries: Vec<((usize, usize), PastedOrigin)> = Vec::deserialize(deserializer)?;
+        let entries: Vec<((usize, usize), V)> = Vec::deserialize(deserializer)?;
         Ok(entries.into_iter().collect())
     }
 }
@@ -610,6 +646,8 @@ pub struct Document {
     pub saved_cut_order: Vec<(usize, usize, Option<usize>)>,
     #[serde(default)]
     pub use_saved_cut_order: bool,
+    #[serde(default, with = "tuple_map_serde")]
+    pub obstacle_exclusion_mm: HashMap<(usize, usize), f64>,
 }
 
 impl Default for Document {
@@ -632,7 +670,49 @@ impl Document {
             next_instance_id: 0,
             saved_cut_order: Vec::new(),
             use_saved_cut_order: false,
+            obstacle_exclusion_mm: HashMap::new(),
         }
+    }
+
+    /// Ensure the dedicated Obstacle layer exists and return its layer index.
+    pub fn ensure_obstacle_layer(&mut self) -> usize {
+        if let Some(idx) = self.layers.iter().position(|l| l.is_obstacle) {
+            return idx;
+        }
+        let insert_at = self
+            .layers
+            .iter()
+            .position(|l| l.is_travel)
+            .unwrap_or(self.layers.len());
+        self.layers.insert(insert_at, Layer::new_obstacle());
+        insert_at
+    }
+
+    /// Exclusion radius (mm) for an obstacle entity (defaults to `1.0` mm).
+    pub fn obstacle_exclusion_radius(&self, layer_idx: usize, entity_idx: usize) -> f64 {
+        self.obstacle_exclusion_mm
+            .get(&(layer_idx, entity_idx))
+            .copied()
+            .unwrap_or(1.0)
+            .max(0.0)
+    }
+
+    /// Set exclusion radius (mm, clamped >= 0.0) for an obstacle entity.
+    pub fn set_obstacle_exclusion_radius(&mut self, layer_idx: usize, entity_idx: usize, radius_mm: f64) {
+        self.obstacle_exclusion_mm
+            .insert((layer_idx, entity_idx), radius_mm.max(0.0));
+    }
+
+    /// Return the outward-offset exclusion polygons (world mm) for a given obstacle entity.
+    pub fn obstacle_exclusion_polygons(&self, layer_idx: usize, entity_idx: usize) -> Vec<Vec<Point>> {
+        let Some(layer) = self.layers.get(layer_idx) else {
+            return Vec::new();
+        };
+        let Some(ent) = layer.entities.get(entity_idx) else {
+            return Vec::new();
+        };
+        let r = self.obstacle_exclusion_radius(layer_idx, entity_idx);
+        offset_entity_outwards(ent, r)
     }
 
     /// Ensure the dedicated Empty Move / Travel layer exists in `self.layers`.
@@ -1167,6 +1247,15 @@ impl Document {
             self.pasted_origins = remapped;
         }
 
+        if !self.obstacle_exclusion_mm.is_empty() {
+            let mut remapped = HashMap::with_capacity(self.obstacle_exclusion_mm.len());
+            for ((old_l, old_e), r) in self.obstacle_exclusion_mm.drain() {
+                let (nl, ne) = old_to_new.get(&(old_l, old_e)).copied().unwrap_or((old_l, old_e));
+                remapped.insert((nl, ne), r);
+            }
+            self.obstacle_exclusion_mm = remapped;
+        }
+
         true
     }
 
@@ -1195,7 +1284,7 @@ impl Document {
         for layer in self.layers.drain(..) {
             if layer.is_travel {
                 travel_layer = Some(layer);
-            } else if layer.is_custom {
+            } else if layer.is_custom || layer.is_obstacle {
                 custom_layers.push(layer);
             } else {
                 preserved_settings.insert(
@@ -1344,7 +1433,7 @@ impl Document {
         let mut raw_paths = Vec::new();
 
         for (l_idx, layer) in self.layers.iter().enumerate() {
-            if !layer.visible || layer.is_travel {
+            if !layer.visible || layer.is_travel || layer.is_obstacle {
                 continue;
             }
             let name_lower = layer.name.to_lowercase();
@@ -1845,11 +1934,51 @@ impl Document {
 
     /// Build ordered rapid and cutting motion segments across the document's active cut sequence,
     /// starting from `start_origin` and returning to `start_origin` at the end.
+    /// Rapid travel moves automatically route around any `Obstacle` layer exclusion zones.
     pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
         let seq = self.compute_cut_sequence();
         let rapid_speed = self.travel_speed_mm_s(rapid_speed_mm_s);
         let mut segments = Vec::new();
         let mut current_pos = start_origin;
+
+        // Collect all obstacle exclusion polygons
+        let mut exclusion_polys: Vec<Vec<Point>> = Vec::new();
+        for (l_idx, layer) in self.layers.iter().enumerate() {
+            if !layer.is_obstacle {
+                continue;
+            }
+            for e_idx in 0..layer.entities.len() {
+                exclusion_polys.extend(self.obstacle_exclusion_polygons(l_idx, e_idx));
+            }
+        }
+
+        let push_rapid_routed = |from: Point,
+                                 to: Point,
+                                 path_index_1based: usize,
+                                 segs: &mut Vec<MotionSegment>| {
+            let direct_len = (to.x - from.x).hypot(to.y - from.y);
+            if direct_len <= 1e-4 {
+                return;
+            }
+            let waypoints = if exclusion_polys.is_empty() {
+                vec![from, to]
+            } else {
+                route_around_obstacles(from, to, &exclusion_polys)
+            };
+            for pair in waypoints.windows(2) {
+                let len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+                if len > 1e-4 {
+                    segs.push(MotionSegment {
+                        start: pair[0],
+                        end: pair[1],
+                        length_mm: len,
+                        speed_mm_s: rapid_speed,
+                        is_rapid: true,
+                        path_index_1based,
+                    });
+                }
+            }
+        };
 
         for (idx, info) in seq.iter().enumerate() {
             let Some(layer) = self.layers.get(info.layer_idx) else { continue; };
@@ -1869,17 +1998,7 @@ impl Document {
             }
 
             let path_index_1based = idx + 1;
-            let rapid_len = (pts[0].x - current_pos.x).hypot(pts[0].y - current_pos.y);
-            if rapid_len > 1e-4 {
-                segments.push(MotionSegment {
-                    start: current_pos,
-                    end: pts[0],
-                    length_mm: rapid_len,
-                    speed_mm_s: rapid_speed,
-                    is_rapid: true,
-                    path_index_1based,
-                });
-            }
+            push_rapid_routed(current_pos, pts[0], path_index_1based, &mut segments);
 
             for pair in pts.windows(2) {
                 let seg_len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
@@ -1901,17 +2020,7 @@ impl Document {
         }
 
         if !segments.is_empty() {
-            let return_len = (start_origin.x - current_pos.x).hypot(start_origin.y - current_pos.y);
-            if return_len > 1e-4 {
-                segments.push(MotionSegment {
-                    start: current_pos,
-                    end: start_origin,
-                    length_mm: return_len,
-                    speed_mm_s: rapid_speed,
-                    is_rapid: true,
-                    path_index_1based: seq.len(),
-                });
-            }
+            push_rapid_routed(current_pos, start_origin, seq.len(), &mut segments);
         }
 
         segments
@@ -2728,5 +2837,331 @@ mod tests {
         assert!((est.rapid_s - 2.0).abs() < 1e-4);
         assert!((est.pierce_s - 1.0).abs() < 1e-4);
         assert!((est.total_s - 23.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_obstacle_validation_offset_and_rapid_avoidance() {
+        let point = Entity::Line {
+            start: Point::new(10.0, 10.0),
+            end: Point::new(10.0, 10.0),
+        };
+        let open_line = Entity::Line {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(50.0, 0.0),
+        };
+        let rect = Entity::Polyline {
+            points: vec![
+                Point::new(40.0, -10.0),
+                Point::new(60.0, -10.0),
+                Point::new(60.0, 10.0),
+                Point::new(40.0, 10.0),
+            ],
+            closed: true,
+        };
+        let circle = Entity::Circle {
+            center: Point::new(50.0, 50.0),
+            radius: 10.0,
+        };
+
+        assert!(!point.can_be_obstacle());
+        assert!(!open_line.can_be_obstacle());
+        assert!(rect.can_be_obstacle());
+        assert!(circle.can_be_obstacle());
+
+        // Offset rectangle by 2.0 mm -> min_x=38, max_x=62, min_y=-12, max_y=12
+        let offset = offset_entity_outwards(&rect, 2.0);
+        assert_eq!(offset.len(), 1);
+        let min_x = offset[0].iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        let max_x = offset[0].iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = offset[0].iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+        let max_y = offset[0].iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+        assert!((min_x - 38.0).abs() < 1e-4);
+        assert!((max_x - 62.0).abs() < 1e-4);
+        assert!((min_y - (-12.0)).abs() < 1e-4);
+        assert!((max_y - 12.0).abs() < 1e-4);
+
+        // Document with two cut lines separated by an obstacle blocking y=0 between x=40..60
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(10.0, 0.0),
+        });
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(90.0, 0.0),
+            end: Point::new(100.0, 0.0),
+        });
+        let obs_layer = doc.ensure_obstacle_layer();
+        doc.layers[obs_layer].entities.push(rect);
+        doc.set_obstacle_exclusion_radius(obs_layer, 0, 1.0);
+
+        // Cut sequence must exclude the obstacle (only 2 cut lines)
+        assert_eq!(doc.compute_cut_sequence().len(), 2);
+
+        // Rapid travel from (10,0) to (90,0) must route around the 1mm exclusion zone (x=39..61, y=-11..11)
+        let traj = doc.build_motion_trajectory(Point::new(0.0, 0.0), 200.0);
+        let rapid_segs: Vec<_> = traj.iter().filter(|s| s.is_rapid).collect();
+        assert!(rapid_segs.len() > 2); // Must detour around obstacle!
+        let inner_exclusion = &offset_entity_outwards(&doc.layers[obs_layer].entities[0], 0.95)[0];
+        for seg in rapid_segs {
+            assert!(
+                !segment_intersects_polygon(seg.start, seg.end, inner_exclusion),
+                "Rapid segment {:?} -> {:?} traversed obstacle exclusion zone!",
+                seg.start,
+                seg.end
+            );
+        }
+    }
+}
+
+/// Compute outward-offset closed polygons for an entity at constant perpendicular distance `radius_mm`.
+/// For closed polylines, convex corners are rounded with circular arcs of radius `radius_mm` so the
+/// distance between the obstacle and the expanded boundary is everywhere `radius_mm`.
+pub fn offset_entity_outwards(entity: &Entity, radius_mm: f64) -> Vec<Vec<Point>> {
+    let r = radius_mm.max(0.0);
+    match entity {
+        Entity::Circle { center, radius } => {
+            let new_r = (radius + r).max(0.0);
+            let segs = 64usize;
+            let poly = (0..segs)
+                .map(|i| {
+                    let ang = std::f64::consts::TAU * (i as f64) / (segs as f64);
+                    Point::new(center.x + new_r * ang.cos(), center.y + new_r * ang.sin())
+                })
+                .collect();
+            vec![poly]
+        }
+        Entity::Polyline { points, closed: true } => {
+            let poly = offset_polygon_outwards(points, r);
+            if poly.len() >= 3 {
+                vec![poly]
+            } else {
+                Vec::new()
+            }
+        }
+        Entity::Group { children } => children
+            .iter()
+            .flat_map(|c| offset_entity_outwards(c, r))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn offset_polygon_outwards(points: &[Point], r: f64) -> Vec<Point> {
+    // Deduplicate consecutive identical points
+    let mut clean: Vec<Point> = Vec::with_capacity(points.len());
+    for &p in points {
+        if clean
+            .last()
+            .map_or(true, |prev| (p.x - prev.x).hypot(p.y - prev.y) > 1e-6)
+        {
+            clean.push(p);
+        }
+    }
+    if clean.len() >= 2 {
+        let first = clean[0];
+        let last = *clean.last().unwrap();
+        if (first.x - last.x).hypot(first.y - last.y) <= 1e-6 {
+            clean.pop();
+        }
+    }
+    if clean.len() < 3 {
+        return Vec::new();
+    }
+    if r <= 1e-6 {
+        return clean;
+    }
+
+    // Ensure CCW winding so outward normal of edge (a -> b) is (dy/len, -dx/len)
+    let mut signed_area = 0.0;
+    let n = clean.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        signed_area += clean[i].x * clean[j].y - clean[j].x * clean[i].y;
+    }
+    if signed_area < 0.0 {
+        clean.reverse();
+    }
+
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let prev = clean[(i + n - 1) % n];
+        let curr = clean[i];
+        let next = clean[(i + 1) % n];
+
+        let e1x = curr.x - prev.x;
+        let e1y = curr.y - prev.y;
+        let l1 = e1x.hypot(e1y);
+        let e2x = next.x - curr.x;
+        let e2y = next.y - curr.y;
+        let l2 = e2x.hypot(e2y);
+        if l1 < 1e-9 || l2 < 1e-9 {
+            continue;
+        }
+
+        // Outward unit normals for CCW polygon
+        let n1x = e1y / l1;
+        let n1y = -e1x / l1;
+        let n2x = e2y / l2;
+        let n2y = -e2x / l2;
+
+        let cross = (e1x / l1) * (e2y / l2) - (e1y / l1) * (e2x / l2);
+        if cross >= 0.0 {
+            // Convex corner: round with arc of radius r from angle(n1) to angle(n2)
+            let a1 = n1y.atan2(n1x);
+            let mut a2 = n2y.atan2(n2x);
+            while a2 < a1 {
+                a2 += std::f64::consts::TAU;
+            }
+            let sweep = a2 - a1;
+            let steps = ((sweep / 0.35).ceil() as usize).clamp(2, 8);
+            for s in 0..=steps {
+                let ang = a1 + sweep * (s as f64) / (steps as f64);
+                out.push(Point::new(curr.x + r * ang.cos(), curr.y + r * ang.sin()));
+            }
+        } else {
+            // Concave corner: intersect the two offset lines
+            let p1 = Point::new(curr.x + n1x * r, curr.y + n1y * r);
+            let p2 = Point::new(curr.x + n2x * r, curr.y + n2y * r);
+            let denom = (e1x / l1) * (e2y / l2) - (e1y / l1) * (e2x / l2);
+            if denom.abs() > 1e-6 {
+                let dx = p2.x - p1.x;
+                let dy = p2.y - p1.y;
+                let t = (dx * (e2y / l2) - dy * (e2x / l2)) / denom;
+                out.push(Point::new(p1.x + (e1x / l1) * t, p1.y + (e1y / l1) * t));
+            } else {
+                out.push(p1);
+            }
+        }
+    }
+    out
+}
+
+fn segments_intersect_strict(a: Point, b: Point, c: Point, d: Point) -> bool {
+    let orient = |p: Point, q: Point, r: Point| -> f64 {
+        (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+    };
+    let o1 = orient(a, b, c);
+    let o2 = orient(a, b, d);
+    let o3 = orient(c, d, a);
+    let o4 = orient(c, d, b);
+    if (o1 > 1e-7 && o2 < -1e-7 || o1 < -1e-7 && o2 > 1e-7)
+        && (o3 > 1e-7 && o4 < -1e-7 || o3 < -1e-7 && o4 > 1e-7)
+    {
+        return true;
+    }
+    false
+}
+
+/// True if segment `a -> b` enters or crosses `poly`.
+pub fn segment_intersects_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mid = Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    if point_in_polygon(mid, poly) {
+        return true;
+    }
+    let n = poly.len();
+    for i in 0..n {
+        let p1 = poly[i];
+        let p2 = poly[(i + 1) % n];
+        if segments_intersect_strict(a, b, p1, p2) {
+            return true;
+        }
+    }
+    false
+}
+
+fn route_around_obstacles(start: Point, goal: Point, obstacles: &[Vec<Point>]) -> Vec<Point> {
+    let blocks_any = |a: Point, b: Point| -> bool {
+        obstacles
+            .iter()
+            .any(|poly| segment_intersects_polygon(a, b, poly))
+    };
+
+    if !blocks_any(start, goal) {
+        return vec![start, goal];
+    }
+
+    // Build visibility graph nodes: start (0), goal (1), and slightly outward-nudged vertices of obstacles
+    let mut nodes: Vec<Point> = Vec::new();
+    nodes.push(start);
+    nodes.push(goal);
+
+    for poly in obstacles {
+        if poly.len() < 3 {
+            continue;
+        }
+        let cx: f64 = poly.iter().map(|p| p.x).sum::<f64>() / (poly.len() as f64);
+        let cy: f64 = poly.iter().map(|p| p.y).sum::<f64>() / (poly.len() as f64);
+        // Subsample dense polygons (e.g. circles/rounded corners) to keep visibility graph fast
+        let step = (poly.len() / 24).max(1);
+        for (idx, &v) in poly.iter().enumerate() {
+            if idx % step != 0 {
+                continue;
+            }
+            let dx = v.x - cx;
+            let dy = v.y - cy;
+            let len = dx.hypot(dy).max(1e-6);
+            // Nudge 0.05mm outward from centroid so visibility edges don't graze-collide
+            let candidate = Point::new(v.x + (dx / len) * 0.05, v.y + (dy / len) * 0.05);
+            if !obstacles.iter().any(|p| point_in_polygon(candidate, p)) {
+                nodes.push(candidate);
+            }
+        }
+    }
+
+    let n = nodes.len();
+    let mut dist = vec![f64::INFINITY; n];
+    let mut prev = vec![usize::MAX; n];
+    let mut visited = vec![false; n];
+    dist[0] = 0.0;
+
+    for _ in 0..n {
+        let mut u = usize::MAX;
+        let mut best_d = f64::INFINITY;
+        for i in 0..n {
+            if !visited[i] && dist[i] < best_d {
+                best_d = dist[i];
+                u = i;
+            }
+        }
+        if u == usize::MAX || u == 1 {
+            break;
+        }
+        visited[u] = true;
+
+        for v in 0..n {
+            if visited[v] || u == v {
+                continue;
+            }
+            if !blocks_any(nodes[u], nodes[v]) {
+                let d = dist[u] + (nodes[v].x - nodes[u].x).hypot(nodes[v].y - nodes[u].y);
+                if d < dist[v] {
+                    dist[v] = d;
+                    prev[v] = u;
+                }
+            }
+        }
+    }
+
+    if !dist[1].is_finite() {
+        return vec![start, goal];
+    }
+
+    let mut path = Vec::new();
+    let mut cur = 1;
+    while cur != usize::MAX {
+        path.push(nodes[cur]);
+        if cur == 0 {
+            break;
+        }
+        cur = prev[cur];
+    }
+    path.reverse();
+    if path.len() >= 2 {
+        path
+    } else {
+        vec![start, goal]
     }
 }
