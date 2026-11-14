@@ -40,6 +40,7 @@ pub struct PanelState {
     pub seg_progress_mm: f64,
     pub total_length_mm: f64,
     pub traveled_length_mm: f64,
+    pub estimated_job_secs: f64,
     pub last_tick: Option<std::time::Instant>,
     pub last_hw_dispatched_seg: Option<usize>,
     pub paused_checkpoint: Option<PauseCheckpoint>,
@@ -66,6 +67,7 @@ impl Default for PanelState {
             seg_progress_mm: 0.0,
             total_length_mm: 0.0,
             traveled_length_mm: 0.0,
+            estimated_job_secs: 0.0,
             last_tick: None,
             last_hw_dispatched_seg: None,
             paused_checkpoint: None,
@@ -75,6 +77,24 @@ impl Default for PanelState {
             new_mat_name: String::new(),
             new_mat_material: "Mild Steel".to_string(),
             new_mat_thickness: 2.0,
+        }
+    }
+}
+
+/// Format a duration in seconds into a compact human-readable string (e.g. `23.0s`, `01:45`, `1:02:15`).
+pub fn format_duration_secs(secs: f64) -> String {
+    let s = secs.max(0.0);
+    if s < 60.0 {
+        format!("{:.1}s", s)
+    } else {
+        let total = s.round() as u64;
+        let hrs = total / 3600;
+        let mins = (total % 3600) / 60;
+        let rem_s = total % 60;
+        if hrs > 0 {
+            format!("{}:{:02}:{:02}", hrs, mins, rem_s)
+        } else {
+            format!("{:02}:{:02}", mins, rem_s)
         }
     }
 }
@@ -92,6 +112,8 @@ impl PanelState {
             return "No active toolpaths to run on visible layers.".to_string();
         }
         self.total_length_mm = traj.iter().map(|s| s.length_mm).sum();
+        let est = doc.estimate_job_time(current_head);
+        self.estimated_job_secs = est.total_s;
         self.full_trajectory = traj.clone();
         self.trajectory = traj;
         self.current_seg_idx = 0;
@@ -104,15 +126,26 @@ impl PanelState {
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
 
+        let est_str = format_duration_secs(self.estimated_job_secs);
         if mode == RunMode::DryCut {
             if let Some(ref c) = controller {
                 if c.is_connected() {
                     c.set_red_pointer(true);
                 }
             }
-            format!("Dry-Cut simulation started ({} segments, {:.1} mm).", self.trajectory.len(), self.total_length_mm)
+            format!(
+                "Dry-Cut simulation started ({} segments, {:.1} mm, Est: {}).",
+                self.trajectory.len(),
+                self.total_length_mm,
+                est_str
+            )
         } else {
-            format!("Cutting job started ({} segments, {:.1} mm).", self.trajectory.len(), self.total_length_mm)
+            format!(
+                "Cutting job started ({} segments, {:.1} mm, Est: {}).",
+                self.trajectory.len(),
+                self.total_length_mm,
+                est_str
+            )
         }
     }
 
@@ -123,6 +156,7 @@ impl PanelState {
         self.last_tick = None;
         self.last_hw_dispatched_seg = None;
         self.full_trajectory.clear();
+        self.estimated_job_secs = 0.0;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
         status.laser_on = false;
@@ -637,6 +671,26 @@ impl PanelState {
                     }
                 }
             }
+        }
+        if !self.full_trajectory.is_empty() {
+            let motion_s: f64 = self
+                .full_trajectory
+                .iter()
+                .map(|s| {
+                    let denom = if s.is_rapid {
+                        s.speed_mm_s.max(1.0)
+                    } else {
+                        s.speed_mm_s.max(0.5)
+                    };
+                    s.length_mm / denom
+                })
+                .sum();
+            let pierce_s: f64 = seq
+                .iter()
+                .filter_map(|info| doc.layers.get(info.layer_idx))
+                .map(|layer| (layer.params.pierce_time_ms as f64) / 1000.0)
+                .sum();
+            self.estimated_job_secs = motion_s + pierce_s;
         }
     }
 
@@ -1233,13 +1287,18 @@ pub fn render_right_panels(
                     } else {
                         "Cutting"
                     };
+                    let est_suffix = if panel_state.estimated_job_secs > 0.0 {
+                        format!(" · Est {}", format_duration_secs(panel_state.estimated_job_secs))
+                    } else {
+                        String::new()
+                    };
                     let bar_text = if !is_connected && panel_state.run_mode == RunMode::DryCut {
                         format!(
-                            "{}: Path {}/{} ({:.0}%) [{}x]",
-                            mode_tag, cur_path, total_paths, progress * 100.0, panel_state.sim_speed_multiplier
+                            "{}: Path {}/{} ({:.0}%) [{}x]{}",
+                            mode_tag, cur_path, total_paths, progress * 100.0, panel_state.sim_speed_multiplier, est_suffix
                         )
                     } else {
-                        format!("{}: Path {}/{} ({:.0}%)", mode_tag, cur_path, total_paths, progress * 100.0)
+                        format!("{}: Path {}/{} ({:.0}%){}", mode_tag, cur_path, total_paths, progress * 100.0, est_suffix)
                     };
                     ui.add(ProgressBar::new(progress).text(bar_text));
                 }
@@ -1305,14 +1364,15 @@ pub fn render_right_panels(
                                 let swatch_color = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
                                 let summary = if layer.is_travel {
                                     format!(
-                                        "Travel · {:.0} mm/s · H:{:.1} mm",
+                                        "{:.0} mm/s · H:{:.1} mm",
                                         layer.params.speed_mm_s,
                                         layer.params.cut_height_mm
                                     )
                                 } else {
                                     format!(
-                                        "{} paths · {:.0} mm/s · {:.0}% · {}",
-                                        layer.entities.len(),
+                                        "#{}, {:.2} m · {:.0} mm/s · {:.0}% · {}",
+                                        layer.total_path_count(),
+                                        layer.total_path_length_m(),
                                         layer.params.speed_mm_s,
                                         layer.params.power_percent,
                                         layer.params.gas_type

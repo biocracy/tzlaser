@@ -234,6 +234,27 @@ impl Entity {
         }
     }
 
+    /// Number of individual cuttable paths represented by this entity (counting group children).
+    pub fn path_count(&self) -> usize {
+        match self {
+            Entity::Group { children } => children.iter().map(|c| c.path_count()).sum(),
+            _ => 1,
+        }
+    }
+
+    /// Total path length in mm (recursing into groups without counting inter-child travel jumps).
+    pub fn path_length_mm(&self) -> f64 {
+        match self {
+            Entity::Group { children } => children.iter().map(|c| c.path_length_mm()).sum(),
+            _ => {
+                let pts = self.sample_points();
+                pts.windows(2)
+                    .map(|pair| (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y))
+                    .sum()
+            }
+        }
+    }
+
     /// Approximate 2D area (positive for closed shapes, 0 for open shapes)
     pub fn area(&self) -> f64 {
         match self {
@@ -454,7 +475,7 @@ impl Layer {
 
     pub fn new_travel() -> Self {
         Self {
-            name: "Empty Move / Travel".to_string(),
+            name: "Travel".to_string(),
             color: Color { r: 130, g: 165, b: 205 },
             visible: true,
             params: CuttingParams {
@@ -470,6 +491,24 @@ impl Layer {
             is_travel: true,
         }
     }
+
+    /// Total number of individual paths in this layer (counting children inside groups).
+    pub fn total_path_count(&self) -> usize {
+        self.entities.iter().map(|e| e.path_count()).sum()
+    }
+
+    /// Total path length in meters across all entities in this layer.
+    pub fn total_path_length_m(&self) -> f64 {
+        self.entities.iter().map(|e| e.path_length_mm()).sum::<f64>() / 1000.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JobTimeEstimate {
+    pub total_s: f64,
+    pub cut_s: f64,
+    pub rapid_s: f64,
+    pub pierce_s: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1878,6 +1917,35 @@ impl Document {
         segments
     }
 
+    /// Estimate total job duration (in seconds) from `start_origin`:
+    /// cutting length / layer speed + rapid travel length / travel speed + piercing time per path.
+    pub fn estimate_job_time(&self, start_origin: Point) -> JobTimeEstimate {
+        let traj = self.build_motion_trajectory(start_origin, 200.0);
+        let mut cut_s = 0.0;
+        let mut rapid_s = 0.0;
+        for seg in &traj {
+            if seg.is_rapid {
+                rapid_s += seg.length_mm / seg.speed_mm_s.max(1.0);
+            } else {
+                cut_s += seg.length_mm / seg.speed_mm_s.max(0.5);
+            }
+        }
+
+        let seq = self.compute_cut_sequence();
+        let pierce_s: f64 = seq
+            .iter()
+            .filter_map(|info| self.layers.get(info.layer_idx))
+            .map(|layer| (layer.params.pierce_time_ms as f64) / 1000.0)
+            .sum();
+
+        JobTimeEstimate {
+            total_s: cut_s + rapid_s + pierce_s,
+            cut_s,
+            rapid_s,
+            pierce_s,
+        }
+    }
+
     /// Find the closest point along any active cutting path in the document within `tolerance_mm`.
     /// Returns `Some((projected_point_mm, path_index_1based, distance_mm))`.
     pub fn closest_point_on_cut_paths(
@@ -2621,5 +2689,44 @@ mod tests {
             .map(|c| c.start_point)
             .collect();
         assert_eq!(before_starts, after_starts);
+    }
+
+    #[test]
+    fn test_layer_path_stats_and_job_time_estimate() {
+        let mut doc = Document::new();
+        // Set travel layer speed to 100 mm/s
+        if let Some(travel) = doc.layers.iter_mut().find(|l| l.is_travel) {
+            assert_eq!(travel.name, "Travel");
+            travel.params.speed_mm_s = 100.0;
+        }
+        // Layer 0: speed 50 mm/s, pierce 500 ms
+        doc.layers[0].params.speed_mm_s = 50.0;
+        doc.layers[0].params.pierce_time_ms = 500;
+
+        // Grouped two lines of 500 mm each = 1000 mm = 1.00 m, 2 paths
+        let line1 = Entity::Line {
+            start: Point::new(100.0, 0.0),
+            end: Point::new(600.0, 0.0),
+        };
+        let line2 = Entity::Line {
+            start: Point::new(600.0, 0.0),
+            end: Point::new(100.0, 0.0),
+        };
+        doc.layers[0].entities.push(Entity::Group {
+            children: vec![line1, line2],
+        });
+
+        assert_eq!(doc.layers[0].total_path_count(), 2);
+        assert!((doc.layers[0].total_path_length_m() - 1.0).abs() < 1e-6);
+
+        let est = doc.estimate_job_time(Point::new(0.0, 0.0));
+        // Cut: 1000 mm / 50 mm/s = 20.0s
+        // Rapid: 100 mm to start + 100 mm return = 200 mm / 100 mm/s = 2.0s
+        // Pierce: 2 paths * 500 ms = 1.0s
+        // Total = 23.0s
+        assert!((est.cut_s - 20.0).abs() < 1e-4);
+        assert!((est.rapid_s - 2.0).abs() < 1e-4);
+        assert!((est.pierce_s - 1.0).abs() < 1e-4);
+        assert!((est.total_s - 23.0).abs() < 1e-4);
     }
 }

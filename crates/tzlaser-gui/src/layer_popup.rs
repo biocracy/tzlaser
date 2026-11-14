@@ -44,7 +44,7 @@ pub fn render_layer_popup(
             );
             ui.label(RichText::new(&layer_title).strong());
             let count_text = if doc.layers[layer_idx].is_travel {
-                "(Empty Move / Travel)".to_string()
+                "(Travel Layer)".to_string()
             } else {
                 format!("({} profiles)", profile_count)
             };
