@@ -17,8 +17,51 @@ pub const CONTINUOUS_JOG_PULSES_XY: i32 = 472_000;
 /// Default continuous jog travel distance in pulses on Port 999 (matches SC2000 `±1,000,000`).
 pub const CONTINUOUS_JOG_PULSES_Z: i32 = 1_000_000;
 
-/// Default Z-axis jog speed register value on Port 999 (conservative default `25`; SC2000 capture used `100`).
-pub const DEFAULT_Z_JOG_SPEED: u32 = 25;
+/// Default Z-axis jog speed register value on Port 999 (matches SC2000 capture `100`).
+pub const DEFAULT_Z_JOG_SPEED: u32 = 100;
+
+/// Wireless remote control button bitmasks reported by the controller board in `R1042` (`regs[42]`)
+/// and mirrored in `R1043` (`regs[43]`).
+pub mod remote_buttons {
+    pub const X_MINUS: u32 = 0x0000_0002; // Bit 1 (2): Jog X-
+    pub const Y_MINUS: u32 = 0x0000_0100; // Bit 8 (256): Jog Y-
+    pub const Y_PLUS: u32 = 0x0000_0400;  // Bit 10 (1024): Jog Y+
+    pub const Z_PLUS: u32 = 0x0001_0000;  // Bit 16 (65536): Jog Z+
+    pub const X_PLUS: u32 = 0x0002_0000;  // Bit 17 (131072): Jog X+
+    pub const Z_MINUS: u32 = 0x0004_0000; // Bit 18 (262144): Jog Z-
+}
+
+/// Decode a wireless remote control button bitmask (`R1042`) into a continuous jog `(Axis, direction)`.
+pub fn decode_remote_jog(mask: u32) -> Option<(Axis, i32)> {
+    if (mask & remote_buttons::X_MINUS) != 0 {
+        Some((Axis::X, -1))
+    } else if (mask & remote_buttons::X_PLUS) != 0 {
+        Some((Axis::X, 1))
+    } else if (mask & remote_buttons::Y_MINUS) != 0 {
+        Some((Axis::Y, -1))
+    } else if (mask & remote_buttons::Y_PLUS) != 0 {
+        Some((Axis::Y, 1))
+    } else if (mask & remote_buttons::Z_MINUS) != 0 {
+        Some((Axis::Z, -1))
+    } else if (mask & remote_buttons::Z_PLUS) != 0 {
+        Some((Axis::Z, 1))
+    } else {
+        None
+    }
+}
+
+/// Format a human-readable label for the active wireless remote control button bitmask (`R1042`).
+pub fn format_remote_button(mask: u32) -> String {
+    if mask == 0 {
+        return "Idle".to_string();
+    }
+    if let Some((axis, dir)) = decode_remote_jog(mask) {
+        let sign = if dir >= 0 { "+" } else { "-" };
+        format!("Jog {:?}{} (0x{:X})", axis, sign, mask)
+    } else {
+        format!("Key 0x{:X}", mask)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
@@ -63,6 +106,7 @@ pub struct MachineStatus {
     pub capacitive_height_mm: f32,
     pub capacitance_pf: f32,
     pub follower_active: bool,
+    pub remote_button_mask: u32,
     pub raw_registers: Vec<u32>,
 }
 
@@ -84,6 +128,7 @@ impl Default for MachineStatus {
             capacitive_height_mm: 50.0,
             capacitance_pf: 12.4,
             follower_active: false,
+            remote_button_mask: 0,
             raw_registers: Vec::new(),
         }
     }
@@ -97,11 +142,16 @@ impl MachineStatus {
 
         // Verified from SC2000 X/Y/Z Wireshark capture:
         // R1008 tracks live X position; R1009 (and R1010 dual-drive gantry) tracks live Y position.
-        // (R1012 and R1014 are X and Y encoder feedback at 1/1.5 ratio.)
+        // (R1012 and R1014 are X and Y encoder feedback at 1/1.5 ratio; Z comes from Port 999 D9.)
         let pos_x = regs.get(8).copied().unwrap_or(0) as i32;
         let pos_y = regs.get(9).copied().unwrap_or(0) as i32;
-        let pos_z = regs.get(16).copied().unwrap_or(0) as i32;
+        let pos_z = 0;
         let pos_w = regs.get(23).copied().unwrap_or(0) as i32;
+
+        // Wireless remote control button bitmask is reported in R1042 (regs[42]) and mirrored in R1043 (regs[43]).
+        let r42 = regs.get(42).copied().unwrap_or(0);
+        let r43 = regs.get(43).copied().unwrap_or(0);
+        let remote_button_mask = if r42 == r43 { r42 } else { 0 };
 
         let laser_on = regs.get(30).copied().unwrap_or(0) & 0x01 != 0;
         let laser_power_pct = (regs.get(31).copied().unwrap_or(0) as f32) / 10.0;
@@ -118,7 +168,7 @@ impl MachineStatus {
         let gas_pressure_bar = if gas_valve_open { 8.5 } else { 0.0 };
         let raw_cap = regs.get(35).copied().unwrap_or(1240) as f32;
         let capacitance_pf = raw_cap / 100.0;
-        let capacitive_height_mm = ((pos_z.max(0) as f32) / 1000.0).clamp(0.2, 50.0);
+        let capacitive_height_mm = 50.0;
         let follower_active = regs.get(36).copied().unwrap_or(0) != 0;
 
         Self {
@@ -137,6 +187,7 @@ impl MachineStatus {
             capacitive_height_mm,
             capacitance_pf,
             follower_active,
+            remote_button_mask,
             raw_registers: regs.to_vec(),
         }
     }
@@ -402,6 +453,17 @@ mod tests {
         assert_eq!(pos_z, -44688);
         assert_eq!(raw_cap, 0x0005_D862);
         assert_eq!(state_code, 0);
+    }
+
+    #[test]
+    fn test_decode_remote_control_buttons_from_r1042() {
+        assert_eq!(decode_remote_jog(0), None);
+        assert_eq!(decode_remote_jog(0x0000_0002), Some((Axis::X, -1)));
+        assert_eq!(decode_remote_jog(0x0002_0000), Some((Axis::X, 1)));
+        assert_eq!(decode_remote_jog(0x0000_0100), Some((Axis::Y, -1)));
+        assert_eq!(decode_remote_jog(0x0000_0400), Some((Axis::Y, 1)));
+        assert_eq!(decode_remote_jog(0x0004_0000), Some((Axis::Z, -1)));
+        assert_eq!(decode_remote_jog(0x0001_0000), Some((Axis::Z, 1)));
     }
 }
 

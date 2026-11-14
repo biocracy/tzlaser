@@ -130,17 +130,17 @@ pub fn render_properties_window(
                         .fill(Color32::from_rgb(48, 42, 24)),
                     )
                     .on_hover_text(
-                        "Apply values observed in the SC2000 Wireshark capture (590 pls/mm XY, 1000 pls/mm Z, 10 mm/s jog)",
+                        "Apply values observed in the SC2000 Wireshark capture (590 pls/mm XY, 10000 pls/mm Z, 10 mm/s jog)",
                     )
                     .clicked()
                 {
                     pulse_config.pulses_per_mm_x = 590.0;
                     pulse_config.pulses_per_mm_y = 590.0;
-                    pulse_config.pulses_per_mm_z = 1000.0;
+                    pulse_config.pulses_per_mm_z = 10_000.0;
                     pulse_config.jog_start_speed_mm_s = 10.0;
                     pulse_config.jog_speed_mm_s = 10.0;
                     pulse_config.jog_accel_mm_s2 = 100.0;
-                    pulse_config.z_jog_speed_reg = 50;
+                    pulse_config.z_jog_speed_reg = 100;
                     changed = true;
                 }
 
@@ -160,14 +160,14 @@ pub fn render_properties_window(
                 {
                     pulse_config.pulses_per_mm_x = 200.0;
                     pulse_config.pulses_per_mm_y = 200.0;
-                    pulse_config.pulses_per_mm_z = 200.0;
+                    pulse_config.pulses_per_mm_z = 10_000.0;
                     pulse_config.jog_start_speed_mm_s = 5.0;
                     pulse_config.jog_speed_mm_s = 10.0;
                     pulse_config.jog_accel_mm_s2 = 80.0;
-                    pulse_config.z_jog_speed_reg = 25;
+                    pulse_config.z_jog_speed_reg = 100;
                     pulse_config.default_step_mm = 1.0;
                     panel_state.jog_mode = JogMode::Step(1.0);
-                    panel_state.step_index = 1;
+                    panel_state.step_index = 2;
                     changed = true;
                 }
             });

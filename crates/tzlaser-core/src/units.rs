@@ -19,6 +19,9 @@ fn default_true() -> bool {
 fn default_pulses_per_mm() -> f64 {
     200.0
 }
+fn default_pulses_per_mm_z() -> f64 {
+    10_000.0
+}
 fn default_pulses_per_deg_w() -> f64 {
     100.0
 }
@@ -32,7 +35,7 @@ fn default_jog_accel_mm_s2() -> f64 {
     80.0
 }
 fn default_z_jog_speed_reg() -> u32 {
-    25
+    100
 }
 fn default_step_mm() -> f64 {
     1.0
@@ -66,7 +69,7 @@ pub struct PulseConfig {
     pub pulses_per_mm_x: f64,
     #[serde(default = "default_pulses_per_mm")]
     pub pulses_per_mm_y: f64,
-    #[serde(default = "default_pulses_per_mm")]
+    #[serde(default = "default_pulses_per_mm_z")]
     pub pulses_per_mm_z: f64,
     #[serde(default = "default_pulses_per_deg_w")]
     pub pulses_per_deg_w: f64,
@@ -109,7 +112,7 @@ impl Default for PulseConfig {
             soft_limits_enabled: true,
             pulses_per_mm_x: default_pulses_per_mm(),
             pulses_per_mm_y: default_pulses_per_mm(),
-            pulses_per_mm_z: default_pulses_per_mm(),
+            pulses_per_mm_z: default_pulses_per_mm_z(),
             pulses_per_deg_w: default_pulses_per_deg_w(),
             invert_x: false,
             invert_y: false,
@@ -149,6 +152,12 @@ impl PulseConfig {
                 if let Ok(raw) = std::fs::read_to_string(p) {
                     if let Ok(mut parsed) = serde_json::from_str::<PulseConfig>(&raw) {
                         parsed.config_path = Some(p.clone());
+                        // Migrate uncalibrated 200.0 Z pulses/mm + 25 speed reg to Port 999's 10,000 units/mm + 100 speed reg
+                        if (parsed.pulses_per_mm_z - 200.0).abs() < 1e-6 && parsed.z_jog_speed_reg == 25 {
+                            parsed.pulses_per_mm_z = default_pulses_per_mm_z();
+                            parsed.z_jog_speed_reg = default_z_jog_speed_reg();
+                            let _ = parsed.save();
+                        }
                         return parsed;
                     }
                 }

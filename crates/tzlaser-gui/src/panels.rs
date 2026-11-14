@@ -1,7 +1,7 @@
 use egui::{Button, CollapsingHeader, Color32, Frame, Grid, ProgressBar, RichText, ScrollArea, Ui};
 use tzlaser_core::document::closest_point_on_segment;
 use tzlaser_core::{Document, MaterialLibrary, MotionSegment, PulseConfig};
-use tzlaser_protocol::{Axis, LaserController, MachineStatus};
+use tzlaser_protocol::{format_remote_button, Axis, LaserController, MachineStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JogMode {
@@ -935,7 +935,7 @@ pub fn render_right_panels(
             .show(ui, |ui| {
                 ui.add_space(2.0);
 
-                // Connection Status Badge
+                // Connection Status Badge & Wireless Remote Control (`R1042`) Status
                 let is_connected = controller.as_ref().map_or(false, |c| c.is_connected());
                 ui.horizontal(|ui| {
                     let (dot_color, label) = if is_connected {
@@ -947,6 +947,26 @@ pub fn render_right_panels(
                     ui.label(RichText::new(label).strong());
                     ui.label(format!("({})", panel_state.target_ip));
                 });
+
+                if is_connected {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🎮 Remote:").size(11.5).strong());
+                        if status.remote_button_mask != 0 {
+                            ui.label(
+                                RichText::new(format!("● {}", format_remote_button(status.remote_button_mask)))
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(0, 235, 160))
+                                    .strong(),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("Ready (Listening R1042)")
+                                    .size(11.0)
+                                    .weak(),
+                            );
+                        }
+                    });
+                }
 
                 ui.add_space(6.0);
 
