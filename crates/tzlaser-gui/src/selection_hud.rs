@@ -3,7 +3,7 @@ use tzlaser_core::{Document, HistoryManager};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AnchorPoint {
-    BottomLeft,
+    TableOrigin,
     Center,
 }
 
@@ -22,7 +22,7 @@ pub struct SelectionHudState {
 impl Default for SelectionHudState {
     fn default() -> Self {
         Self {
-            anchor: AnchorPoint::BottomLeft,
+            anchor: AnchorPoint::TableOrigin,
             step_mm: 10.0,
             lock_aspect: true,
             scale_pct: 100.0,
@@ -43,6 +43,7 @@ pub fn render_selection_hud(
     history: &mut HistoryManager,
     bed_width: f32,
     bed_height: f32,
+    origin_corner: &str,
 ) {
     if selection.is_empty() {
         return;
@@ -55,17 +56,34 @@ pub fn render_selection_hud(
     let width = bounds.width();
     let height = bounds.height();
 
-    // Determine current position based on selected anchor
-    let (current_x, current_y) = match state.anchor {
-        AnchorPoint::BottomLeft => (bounds.min_x(), bounds.min_y()),
+    // Link selection origin corner & coordinate frame to the selected table origin
+    let w_f64 = bed_width as f64;
+    let h_f64 = bed_height as f64;
+    let (origin_label, origin_world, sel_origin_corner, x_sign, y_world_sign) =
+        if origin_corner.contains("Top-Left") {
+            ("Origin (TL)", (0.0, h_f64), (bounds.min_x(), bounds.max_y()), 1.0, -1.0)
+        } else if origin_corner.contains("Bottom-Right") {
+            ("Origin (BR)", (w_f64, 0.0), (bounds.max_x(), bounds.min_y()), -1.0, 1.0)
+        } else if origin_corner.contains("Top-Right") {
+            ("Origin (TR)", (w_f64, h_f64), (bounds.max_x(), bounds.max_y()), -1.0, -1.0)
+        } else {
+            ("Origin (BL)", (0.0, 0.0), (bounds.min_x(), bounds.min_y()), 1.0, 1.0)
+        };
+
+    // Determine current position in machine coordinates relative to table origin
+    let anchor_world = match state.anchor {
+        AnchorPoint::TableOrigin => sel_origin_corner,
         AnchorPoint::Center => (
             (bounds.min_x() + bounds.max_x()) / 2.0,
             (bounds.min_y() + bounds.max_y()) / 2.0,
         ),
     };
+    let current_x = (anchor_world.0 - origin_world.0) * x_sign;
+    let current_y = (anchor_world.1 - origin_world.1) * y_world_sign;
 
     let mut edit_x = current_x;
     let mut edit_y = current_y;
+    let is_locked = doc.is_selection_locked(selection);
 
     Window::new(RichText::new("🎯 Selection Transform").color(Color32::from_rgb(0, 225, 255)).strong())
         .default_pos([260.0, 75.0])
@@ -84,33 +102,45 @@ pub fn render_selection_hud(
                 ui.label(RichText::new(label_text).italics().color(Color32::from_rgb(255, 220, 50)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut state.anchor, AnchorPoint::Center, "Center");
-                    ui.selectable_value(&mut state.anchor, AnchorPoint::BottomLeft, "Origin (BL)");
+                    ui.selectable_value(&mut state.anchor, AnchorPoint::TableOrigin, origin_label);
                 });
             });
 
-            // Group / Ungroup action bar
+            // Lock + Group / Ungroup action bar
             let can_group = selection.len() > 1;
-            if can_group || has_group {
-                ui.horizontal(|ui| {
-                    if can_group {
-                        let group_btn = Button::new(RichText::new("🔗 Group Profiles").strong().color(Color32::from_rgb(0, 230, 255)))
-                            .fill(Color32::from_rgb(24, 45, 65));
-                        if ui.add(group_btn).on_hover_text("Lock selected profiles into a single rigid object with fixed relative positions").clicked() {
-                            history.record(doc, selection, "Group Profiles");
-                            doc.group_selection(selection);
-                        }
-                    }
+            ui.horizontal(|ui| {
+                let (lock_text, lock_fg, lock_bg) = if is_locked {
+                    ("🔒 Locked", Color32::from_rgb(255, 195, 95), Color32::from_rgb(72, 46, 22))
+                } else {
+                    ("🔓 Lock", Color32::from_rgb(190, 202, 220), Color32::from_rgb(38, 43, 52))
+                };
+                if ui
+                    .add(Button::new(RichText::new(lock_text).size(11.5).color(lock_fg).strong()).fill(lock_bg))
+                    .on_hover_text("Lock selected paths, groups, or obstacles to prevent accidental displacement")
+                    .clicked()
+                {
+                    history.record(doc, selection, if is_locked { "Unlock Selection" } else { "Lock Selection" });
+                    doc.set_selection_locked(selection, !is_locked);
+                }
 
-                    if has_group {
-                        let ungroup_btn = Button::new(RichText::new("🔓 Ungroup").color(Color32::from_rgb(255, 190, 70)))
-                            .fill(Color32::from_rgb(45, 38, 25));
-                        if ui.add(ungroup_btn).on_hover_text("Break grouped object back into individual profiles").clicked() {
-                            history.record(doc, selection, "Ungroup Profiles");
-                            doc.ungroup_selection(selection);
-                        }
+                if can_group {
+                    let group_btn = Button::new(RichText::new("🔗 Group").strong().color(Color32::from_rgb(0, 230, 255)))
+                        .fill(Color32::from_rgb(24, 45, 65));
+                    if ui.add(group_btn).on_hover_text("Group selected paths/obstacles into a single rigid object").clicked() {
+                        history.record(doc, selection, "Group Profiles");
+                        doc.group_selection(selection);
                     }
-                });
-            }
+                }
+
+                if has_group {
+                    let ungroup_btn = Button::new(RichText::new("🔓 Ungroup").color(Color32::from_rgb(255, 190, 70)))
+                        .fill(Color32::from_rgb(45, 38, 25));
+                    if ui.add(ungroup_btn).on_hover_text("Break grouped object back into individual profiles").clicked() {
+                        history.record(doc, selection, "Ungroup Profiles");
+                        doc.ungroup_selection(selection);
+                    }
+                }
+            });
 
             ui.separator();
 
@@ -244,6 +274,7 @@ pub fn render_selection_hud(
             // 1. Position & Dimensions Numeric Grid (editable X, Y, W, H)
             let mut edit_w = width;
             let mut edit_h = height;
+            ui.add_enabled_ui(!is_locked, |ui| {
             Grid::new("selection_coords_grid")
                 .num_columns(4)
                 .spacing([10.0, 6.0])
@@ -257,7 +288,7 @@ pub fn render_selection_hud(
                         if !x_resp.dragged() {
                             history.record(doc, selection, "Edit X Position");
                         }
-                        let dx = edit_x - current_x;
+                        let dx = (edit_x - current_x) * x_sign;
                         doc.translate_selection(selection, dx, 0.0);
                     }
 
@@ -292,7 +323,7 @@ pub fn render_selection_hud(
                         if !y_resp.dragged() {
                             history.record(doc, selection, "Edit Y Position");
                         }
-                        let dy = edit_y - current_y;
+                        let dy = (edit_y - current_y) * y_world_sign;
                         doc.translate_selection(selection, 0.0, dy);
                     }
 
@@ -406,7 +437,7 @@ pub fn render_selection_hud(
                 // Row 1: Y+
                 if ui.add_sized(btn_size, Button::new(RichText::new("▲ Y+").size(14.0))).clicked() {
                     history.record(doc, selection, "Nudge Y+");
-                    doc.translate_selection(selection, 0.0, step);
+                    doc.translate_selection(selection, 0.0, step * y_world_sign);
                 }
 
                 // Row 2: X- | Center on Bed | X+
@@ -414,7 +445,7 @@ pub fn render_selection_hud(
                     ui.add_space((ui.available_width() - (btn_size.x * 3.0 + 12.0)).max(0.0) / 2.0);
                     if ui.add_sized(btn_size, Button::new(RichText::new("◄ X-").size(14.0))).clicked() {
                         history.record(doc, selection, "Nudge X-");
-                        doc.translate_selection(selection, -step, 0.0);
+                        doc.translate_selection(selection, -step * x_sign, 0.0);
                     }
 
                     // Center Option
@@ -431,16 +462,17 @@ pub fn render_selection_hud(
 
                     if ui.add_sized(btn_size, Button::new(RichText::new("X+ ►").size(14.0))).clicked() {
                         history.record(doc, selection, "Nudge X+");
-                        doc.translate_selection(selection, step, 0.0);
+                        doc.translate_selection(selection, step * x_sign, 0.0);
                     }
                 });
 
                 // Row 3: Y-
                 if ui.add_sized(btn_size, Button::new(RichText::new("▼ Y-").size(14.0))).clicked() {
                     history.record(doc, selection, "Nudge Y-");
-                    doc.translate_selection(selection, 0.0, -step);
+                    doc.translate_selection(selection, 0.0, -step * y_world_sign);
                 }
             });
+            }); // end add_enabled_ui(!is_locked)
 
             ui.add_space(8.0);
             ui.separator();

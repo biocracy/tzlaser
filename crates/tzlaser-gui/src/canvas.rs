@@ -927,14 +927,18 @@ pub fn render_canvas(
     }
 
     // Process drag motion
-    if !state.manual_sort_active {
+    if !state.manual_sort_active && !doc.is_selection_locked(selection) {
         if response.drag_started_by(PointerButton::Primary) && state.is_dragging_selection && !selection.is_empty() {
             history.record(doc, selection, "Move Selection");
         }
     }
 
     if response.dragged_by(PointerButton::Primary) {
-        if !state.manual_sort_active && state.is_dragging_selection && !selection.is_empty() {
+        if !state.manual_sort_active
+            && state.is_dragging_selection
+            && !selection.is_empty()
+            && !doc.is_selection_locked(selection)
+        {
             let drag_screen = response.drag_delta();
             let dx_mm = (drag_screen.x as f64) / (state.zoom as f64);
             let dy_mm = -(drag_screen.y as f64) / (state.zoom as f64);
@@ -982,6 +986,7 @@ pub fn render_canvas(
 
     // 4. Keyboard Arrow Nudge & Delete
     if !selection.is_empty() && response.hovered() {
+        let is_locked = doc.is_selection_locked(selection);
         let step = state.active_step_mm;
         let mut key_dx = 0.0;
         let mut key_dy = 0.0;
@@ -997,12 +1002,12 @@ pub fn render_canvas(
         if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
             key_dy += step;
         }
-        if key_dx != 0.0 || key_dy != 0.0 {
+        if !is_locked && (key_dx != 0.0 || key_dy != 0.0) {
             history.record(doc, selection, "Nudge Selection");
             doc.translate_selection(selection, key_dx, key_dy);
         }
 
-        if ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+        if !is_locked && ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
             history.record(doc, selection, "Delete Selection");
             doc.delete_selection(selection);
             selection.clear();
@@ -1050,25 +1055,68 @@ pub fn render_canvas(
     painter.rect_filled(bed_rect, 0.0, bed_fill);
     painter.rect_stroke(bed_rect, 0.0, Stroke::new(1.5_f32, bed_border), StrokeKind::Outside);
 
+    // Origin marker & X/Y axes stemming from the selected table origin corner
+    let (origin_world, x_screen_dir, y_screen_dir) = state.origin_world_and_axes();
+
     if state.show_grid {
-        let mut x = 0.0;
-        while x <= state.bed_width_mm {
-            let p1 = state.world_to_screen(Point::new(x as f64, 0.0), origin_screen);
-            let p2 = state.world_to_screen(Point::new(x as f64, state.bed_height_mm as f64), origin_screen);
-            painter.line_segment([p1, p2], Stroke::new(1.0_f32, grid_color));
-            x += 100.0;
+        let minor_grid_color = if cfg!(target_os = "windows") {
+            Color32::from_rgb(34, 39, 49)
+        } else {
+            Color32::from_rgb(30, 34, 42)
+        };
+        let target_mm = (90.0_f32 / state.zoom.max(0.01)) as f64;
+        let candidates = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+        let major_step = candidates
+            .iter()
+            .copied()
+            .find(|&c| c >= target_mm)
+            .unwrap_or(1000.0);
+        let minor_step = major_step / 5.0;
+        let draw_minor = (minor_step as f32) * state.zoom >= 8.0;
+        let step = if draw_minor { minor_step } else { major_step };
+
+        let x_sign = x_screen_dir.x as f64;
+        let y_world_sign = -y_screen_dir.y as f64;
+        let w = state.bed_width_mm as f64;
+        let h = state.bed_height_mm as f64;
+
+        let mx_a = (0.0 - origin_world.x) * x_sign;
+        let mx_b = (w - origin_world.x) * x_sign;
+        let (mx_min, mx_max) = (mx_a.min(mx_b), mx_a.max(mx_b));
+        let kx_start = (mx_min / step).ceil() as i64;
+        let kx_end = (mx_max / step).floor() as i64;
+        for k in kx_start..=kx_end {
+            let wx = origin_world.x + (k as f64) * step * x_sign;
+            let is_major = !draw_minor || k.rem_euclid(5) == 0;
+            let (stroke_w, col) = if is_major {
+                (1.0_f32, grid_color)
+            } else {
+                (0.6_f32, minor_grid_color)
+            };
+            let p1 = state.world_to_screen(Point::new(wx, 0.0), origin_screen);
+            let p2 = state.world_to_screen(Point::new(wx, h), origin_screen);
+            painter.line_segment([p1, p2], Stroke::new(stroke_w, col));
         }
-        let mut y = 0.0;
-        while y <= state.bed_height_mm {
-            let p1 = state.world_to_screen(Point::new(0.0, y as f64), origin_screen);
-            let p2 = state.world_to_screen(Point::new(state.bed_width_mm as f64, y as f64), origin_screen);
-            painter.line_segment([p1, p2], Stroke::new(1.0_f32, grid_color));
-            y += 100.0;
+
+        let my_a = (0.0 - origin_world.y) * y_world_sign;
+        let my_b = (h - origin_world.y) * y_world_sign;
+        let (my_min, my_max) = (my_a.min(my_b), my_a.max(my_b));
+        let ky_start = (my_min / step).ceil() as i64;
+        let ky_end = (my_max / step).floor() as i64;
+        for k in ky_start..=ky_end {
+            let wy = origin_world.y + (k as f64) * step * y_world_sign;
+            let is_major = !draw_minor || k.rem_euclid(5) == 0;
+            let (stroke_w, col) = if is_major {
+                (1.0_f32, grid_color)
+            } else {
+                (0.6_f32, minor_grid_color)
+            };
+            let p1 = state.world_to_screen(Point::new(0.0, wy), origin_screen);
+            let p2 = state.world_to_screen(Point::new(w, wy), origin_screen);
+            painter.line_segment([p1, p2], Stroke::new(stroke_w, col));
         }
     }
 
-    // Origin marker & X/Y axes stemming from the selected table origin corner
-    let (origin_world, x_screen_dir, y_screen_dir) = state.origin_world_and_axes();
     let origin_pt = state.world_to_screen(origin_world, origin_screen);
     let axis_len = 64.0_f32;
 

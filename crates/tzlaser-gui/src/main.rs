@@ -396,6 +396,7 @@ impl eframe::App for TzlaserApp {
                 &mut self.history,
                 self.canvas_state.bed_width_mm,
                 self.canvas_state.bed_height_mm,
+                &self.canvas_state.origin_corner,
             );
         }
 

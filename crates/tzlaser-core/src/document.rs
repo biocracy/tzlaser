@@ -718,6 +718,27 @@ mod tuple_map_serde {
     }
 }
 
+mod tuple_set_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashSet;
+
+    pub fn serialize<S>(set: &HashSet<(usize, usize)>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<(usize, usize)> = set.iter().copied().collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashSet<(usize, usize)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries: Vec<(usize, usize)> = Vec::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub layers: Vec<Layer>,
@@ -739,6 +760,8 @@ pub struct Document {
     pub entity_groups: HashMap<(usize, usize), u64>,
     #[serde(default)]
     pub next_group_id: u64,
+    #[serde(default, with = "tuple_set_serde")]
+    pub locked_entities: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Default for Document {
@@ -764,6 +787,7 @@ impl Document {
             obstacle_exclusion_mm: HashMap::new(),
             entity_groups: HashMap::new(),
             next_group_id: 0,
+            locked_entities: std::collections::HashSet::new(),
         }
     }
 
@@ -879,9 +903,32 @@ impl Document {
         total
     }
 
-    /// Translate all selected entities by (dx, dy) in millimeters.
+    /// True if `(l_idx, e_idx)` is locked against accidental displacement/transforms.
+    pub fn is_entity_locked(&self, l_idx: usize, e_idx: usize) -> bool {
+        self.locked_entities.contains(&(l_idx, e_idx))
+    }
+
+    /// True if any entity in `selection` is locked.
+    pub fn is_selection_locked(&self, selection: &[(usize, usize)]) -> bool {
+        selection
+            .iter()
+            .any(|&(l, e)| self.locked_entities.contains(&(l, e)))
+    }
+
+    /// Lock or unlock all entities in `selection`.
+    pub fn set_selection_locked(&mut self, selection: &[(usize, usize)], locked: bool) {
+        for &pair in selection {
+            if locked {
+                self.locked_entities.insert(pair);
+            } else {
+                self.locked_entities.remove(&pair);
+            }
+        }
+    }
+
+    /// Translate all selected entities by (dx, dy) in millimeters (no-op if any selected entity is locked).
     pub fn translate_selection(&mut self, selection: &[(usize, usize)], dx: f64, dy: f64) {
-        if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
+        if self.is_selection_locked(selection) || (dx.abs() < 1e-9 && dy.abs() < 1e-9) {
             return;
         }
         for &(l_idx, e_idx) in selection {
@@ -893,8 +940,11 @@ impl Document {
         }
     }
 
-    /// Scale selected entities around their combined bounding-box center.
+    /// Scale selected entities around their combined bounding-box center (no-op if locked).
     pub fn scale_selection(&mut self, selection: &[(usize, usize)], sx: f64, sy: f64) {
+        if self.is_selection_locked(selection) {
+            return;
+        }
         let Some(bounds) = self.selection_bounding_box(selection) else { return; };
         let center = Point::new(
             (bounds.min_x() + bounds.max_x()) * 0.5,
@@ -909,9 +959,9 @@ impl Document {
         }
     }
 
-    /// Rotate selected entities counter-clockwise around their combined bounding-box center by `angle_deg` degrees.
+    /// Rotate selected entities counter-clockwise around their combined bounding-box center by `angle_deg` degrees (no-op if locked).
     pub fn rotate_selection(&mut self, selection: &[(usize, usize)], angle_deg: f64) {
-        if angle_deg.abs() < 1e-9 {
+        if self.is_selection_locked(selection) || angle_deg.abs() < 1e-9 {
             return;
         }
         let Some(bounds) = self.selection_bounding_box(selection) else { return; };
@@ -929,8 +979,11 @@ impl Document {
         }
     }
 
-    /// Mirror selected entities horizontally across their bounding box center.
+    /// Mirror selected entities horizontally across their bounding box center (no-op if locked).
     pub fn mirror_selection_horizontal(&mut self, selection: &[(usize, usize)]) {
+        if self.is_selection_locked(selection) {
+            return;
+        }
         let Some(bounds) = self.selection_bounding_box(selection) else { return; };
         let center_x = (bounds.min_x() + bounds.max_x()) / 2.0;
         for &(l_idx, e_idx) in selection {
@@ -942,8 +995,11 @@ impl Document {
         }
     }
 
-    /// Mirror selected entities vertically across their bounding box center.
+    /// Mirror selected entities vertically across their bounding box center (no-op if locked).
     pub fn mirror_selection_vertical(&mut self, selection: &[(usize, usize)]) {
+        if self.is_selection_locked(selection) {
+            return;
+        }
         let Some(bounds) = self.selection_bounding_box(selection) else { return; };
         let center_y = (bounds.min_y() + bounds.max_y()) / 2.0;
         for &(l_idx, e_idx) in selection {
@@ -1119,6 +1175,19 @@ impl Document {
                         }
                     }
                     self.obstacle_exclusion_mm = next;
+                }
+                if !self.locked_entities.is_empty() {
+                    let mut next = std::collections::HashSet::with_capacity(self.locked_entities.len());
+                    for (ll, le) in self.locked_entities.drain() {
+                        if ll == l_idx {
+                            if let Some(ne) = remap_index(le) {
+                                next.insert((ll, ne));
+                            }
+                        } else {
+                            next.insert((ll, le));
+                        }
+                    }
+                    self.locked_entities = next;
                 }
             }
         }
@@ -1484,6 +1553,15 @@ impl Document {
                 remapped.insert((nl, ne), gid);
             }
             self.entity_groups = remapped;
+        }
+
+        if !self.locked_entities.is_empty() {
+            let mut remapped = std::collections::HashSet::with_capacity(self.locked_entities.len());
+            for (old_l, old_e) in self.locked_entities.drain() {
+                let (nl, ne) = old_to_new.get(&(old_l, old_e)).copied().unwrap_or((old_l, old_e));
+                remapped.insert((nl, ne));
+            }
+            self.locked_entities = remapped;
         }
 
         true
@@ -3332,6 +3410,31 @@ mod tests {
         let bc = doc.selection_bounding_box(&sel_circ).unwrap();
         assert!((bc.width() - 40.0).abs() < 0.2);
         assert!((bc.height() - 20.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_locked_entities_prevent_displacement() {
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(Entity::Line {
+            start: Point::new(10.0, 10.0),
+            end: Point::new(30.0, 10.0),
+        });
+        let sel = vec![(0, 0)];
+        doc.set_selection_locked(&sel, true);
+        assert!(doc.is_selection_locked(&sel));
+
+        doc.translate_selection(&sel, 50.0, 50.0);
+        doc.scale_selection(&sel, 2.0, 2.0);
+        doc.rotate_selection(&sel, 90.0);
+        doc.mirror_selection_horizontal(&sel);
+        let b = doc.selection_bounding_box(&sel).unwrap();
+        assert!((b.min_x() - 10.0).abs() < 1e-6);
+        assert!((b.max_x() - 30.0).abs() < 1e-6);
+
+        doc.set_selection_locked(&sel, false);
+        doc.translate_selection(&sel, 50.0, 0.0);
+        let b2 = doc.selection_bounding_box(&sel).unwrap();
+        assert!((b2.min_x() - 60.0).abs() < 1e-6);
     }
 }
 
