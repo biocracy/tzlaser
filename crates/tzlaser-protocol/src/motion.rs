@@ -5,6 +5,7 @@ use crate::packet::Packet;
 pub mod registers {
     pub const REG_COMMAND: u32 = 104;      // 0x0068: 2 = Stop/Cancel, 3 = Init
     pub const REG_MODE_CTRL: u32 = 108;    // 0x006C: 2 DWORDs mode/reset flags
+    pub const REG_HOME_CMD: u32 = 112;     // 0x0070: 9 DWORDs XY homing parameters & trigger
     pub const REG_JOG_MOTION: u32 = 116;   // 0x0074: 7 DWORDs [vmin, vjog, accel, dx, dy, dz, dw]
     pub const REG_JOG_RAMP: u32 = 120;     // 0x0078: 2 DWORDs [118000, 1180000]
     pub const REG_ENABLE_FLAG: u32 = 124;  // 0x007C: 1 DWORD [1]
@@ -166,6 +167,10 @@ pub struct MachineStatus {
     pub capacitance_pf: f32,
     pub follower_active: bool,
     pub remote_button_mask: u32,
+    pub xy_homed: bool,
+    pub z_homed: bool,
+    pub is_homing_xy: bool,
+    pub is_homing_z: bool,
     pub raw_registers: Vec<u32>,
 }
 
@@ -188,6 +193,10 @@ impl Default for MachineStatus {
             capacitance_pf: 12.4,
             follower_active: false,
             remote_button_mask: 0,
+            xy_homed: false,
+            z_homed: false,
+            is_homing_xy: false,
+            is_homing_z: false,
             raw_registers: Vec::new(),
         }
     }
@@ -231,6 +240,8 @@ impl MachineStatus {
         let capacitance_pf = raw_cap / 100.0;
         let capacitive_height_mm = 50.0;
         let follower_active = regs.get(36).copied().unwrap_or(0) != 0;
+        let xy_homed = (regs.get(3).copied().unwrap_or(0) & 0x03) == 0x03;
+        let is_homing_xy = regs.get(5).copied().unwrap_or(0) == 1;
 
         Self {
             pos_x,
@@ -249,6 +260,10 @@ impl MachineStatus {
             capacitance_pf,
             follower_active,
             remote_button_mask,
+            xy_homed,
+            z_homed: false,
+            is_homing_xy,
+            is_homing_z: false,
             raw_registers: regs.to_vec(),
         }
     }
@@ -468,6 +483,88 @@ pub fn build_z_stop_packet() -> Vec<u8> {
     encode_modbus_rtu(&body)
 }
 
+/// Build a Port 999 Z-axis home packet (Modbus Function 0x10 at register `0x0065`, 2 words, `cmd = 2`).
+/// Raises the head (`Z+`) until the upper limit/capacitive sensor triggers, then zeroes Z.
+/// Matches SC2000 packet: `01100065000204000200009478`.
+pub fn build_z_home_packet() -> Vec<u8> {
+    let body: [u8; 11] = [
+        0x01, 0x10, 0x00, 0x65, 0x00, 0x02, 0x04, 0x00, 0x02, 0x00, 0x00,
+    ];
+    encode_modbus_rtu(&body)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HomeConfig {
+    /// +1 = home X toward +X (Right), -1 = home X toward -X (Left)
+    pub x_dir: i32,
+    /// +1 = home Y toward +Y (Top), -1 = home Y toward -Y (Bottom)
+    pub y_dir: i32,
+    /// Fast seek speed in pulses/s
+    pub fast_speed_pls_s: u32,
+    /// Slow/creep backoff speed in pulses/s
+    pub slow_speed_pls_s: u32,
+    /// Maximum search distance in pulses
+    pub max_search_pulses: u32,
+}
+
+/// Build the Port 502 XY homing sequence (`REG_HOME_CMD = 112`) toward the configured origin corner.
+/// Observed in SC2000 homing capture:
+/// - `1244`: `24823` (`0x60F7` sensor/limit config)
+/// - `1412`: `[0, 0, 0, 0]` (clear home/work offset)
+/// - `1252`: unbounded soft limits `R1063..R1070`
+/// - `112`: `[flags_mask, slow, accel_step, fast, max_dist, slow, slow, slow, 0]`
+///   where `flags_mask = 0x0103 | (x_dir >= 0 ? 0x10 : 0) | (y_dir >= 0 ? 0x20 : 0)` (`275` for Bottom-Right).
+pub fn build_xy_home_packets(mut seq_gen: impl FnMut() -> u16, cfg: HomeConfig) -> Vec<Packet> {
+    let x_bit = if cfg.x_dir >= 0 { 0x10 } else { 0 };
+    let y_bit = if cfg.y_dir >= 0 { 0x20 } else { 0 };
+    let flags_mask = 0x0103_u32 | x_bit | y_bit;
+
+    let slow = cfg.slow_speed_pls_s.max(100);
+    let accel_step = (slow / 5).max(50);
+    let fast = cfg.fast_speed_pls_s.max(slow);
+    let max_dist = cfg.max_search_pulses.max(10_000);
+
+    vec![
+        Packet::write_request(seq_gen(), 1244, vec![24823]),
+        Packet::write_request(seq_gen(), 1412, vec![0, 0, 0, 0]),
+        Packet::write_request(
+            seq_gen(),
+            1252,
+            vec![
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x8000_0000,
+            ],
+        ),
+        Packet::write_request(
+            seq_gen(),
+            registers::REG_HOME_CMD,
+            vec![flags_mask, slow, accel_step, fast, max_dist, slow, slow, slow, 0],
+        ),
+    ]
+}
+
+/// Check if Port 999 64-word status response indicates Z-axis has been homed (`D5 == 0x8000_0001`).
+pub fn decode_z_homed_from_poll(bytes: &[u8]) -> Option<bool> {
+    if bytes.len() < 133 || bytes[0] != 0x01 || bytes[1] != 0x03 || bytes[2] != 0x80 {
+        return None;
+    }
+    let received_crc = u16::from_le_bytes([bytes[131], bytes[132]]);
+    if received_crc != modbus_crc16(&bytes[..131]) {
+        return None;
+    }
+    let base = 3 + 5 * 4;
+    let w0 = u16::from_be_bytes([bytes[base], bytes[base + 1]]) as u32;
+    let w1 = u16::from_be_bytes([bytes[base + 2], bytes[base + 3]]) as u32;
+    let d5 = (w1 << 16) | w0;
+    Some(d5 == 0x8000_0001)
+}
+
 /// Decode a Port 999 64-word status polling response (`01 03 80 <128 bytes> <crc16_le>`).
 /// Returns `Some((pos_z, raw_capacitance, state_code))` if valid.
 /// Note: Hardware `D9` is 0 at the top limit and becomes negative as the head moves down
@@ -554,6 +651,48 @@ mod tests {
         assert_eq!(format_remote_button(0x0000_0020), "Frame (0x20)");
         assert_eq!(format_remote_button(0x0100_0000), "Idle");
         assert_eq!(format_remote_button(0x0202_0000), "Jog X+ [Fast] (0x20000)");
+    }
+
+    #[test]
+    fn test_home_packets_match_wireshark_capture() {
+        assert_eq!(
+            hex::encode(build_z_home_packet()),
+            "01100065000204000200009478"
+        );
+
+        let mut seq = 0u16;
+        let gen = || {
+            let s = seq;
+            seq += 1;
+            s
+        };
+
+        // Bottom-Right (+X, -Y) => flags_mask = 275 (0x0113), matching SC2000 packet #1401
+        let pkts = build_xy_home_packets(
+            gen,
+            HomeConfig {
+                x_dir: 1,
+                y_dir: -1,
+                fast_speed_pls_s: 59_000,
+                slow_speed_pls_s: 1_180,
+                max_search_pulses: 590_000,
+            },
+        );
+        assert_eq!(pkts.len(), 4);
+        let home_pkt = &pkts[3];
+        assert_eq!(home_pkt.addr, registers::REG_HOME_CMD);
+        assert_eq!(
+            home_pkt.data,
+            vec![275, 1180, 236, 59_000, 590_000, 1180, 1180, 1180, 0]
+        );
+
+        // Other 3 corners
+        let bl = build_xy_home_packets(|| 0, HomeConfig { x_dir: -1, y_dir: -1, fast_speed_pls_s: 1000, slow_speed_pls_s: 200, max_search_pulses: 10_000 });
+        assert_eq!(bl[3].data[0], 259); // 0x0103
+        let tl = build_xy_home_packets(|| 0, HomeConfig { x_dir: -1, y_dir: 1, fast_speed_pls_s: 1000, slow_speed_pls_s: 200, max_search_pulses: 10_000 });
+        assert_eq!(tl[3].data[0], 291); // 0x0123
+        let tr = build_xy_home_packets(|| 0, HomeConfig { x_dir: 1, y_dir: 1, fast_speed_pls_s: 1000, slow_speed_pls_s: 200, max_search_pulses: 10_000 });
+        assert_eq!(tr[3].data[0], 307); // 0x0133
     }
 }
 

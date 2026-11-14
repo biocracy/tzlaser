@@ -1,7 +1,7 @@
 use egui::{Button, CollapsingHeader, Color32, Frame, Grid, ProgressBar, RichText, ScrollArea, Ui};
 use tzlaser_core::document::closest_point_on_segment;
 use tzlaser_core::{Document, MaterialLibrary, MotionSegment, PulseConfig};
-use tzlaser_protocol::{format_remote_button, Axis, LaserController, MachineStatus};
+use tzlaser_protocol::{Axis, LaserController, MachineStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JogMode {
@@ -30,7 +30,6 @@ pub struct PauseCheckpoint {
 pub struct PanelState {
     pub jog_mode: JogMode,
     pub step_index: usize,
-    pub active_continuous_jog: Option<(Axis, i32)>,
     pub target_ip: String,
     pub run_mode: RunMode,
     pub is_paused: bool,
@@ -51,15 +50,15 @@ pub struct PanelState {
     pub new_mat_name: String,
     pub new_mat_material: String,
     pub new_mat_thickness: f64,
-    pub last_remote_button_mask: u32,
+    pub show_home_prompt: bool,
+    pub prompted_home_this_connection: bool,
 }
 
 impl Default for PanelState {
     fn default() -> Self {
         Self {
-            jog_mode: JogMode::Step(1.0),
-            step_index: 2, // 1.0mm
-            active_continuous_jog: None,
+            jog_mode: JogMode::Step(10.0),
+            step_index: 2, // 10mm
             target_ip: "10.1.1.168:502".to_string(),
             run_mode: RunMode::Idle,
             is_paused: false,
@@ -80,8 +79,38 @@ impl Default for PanelState {
             new_mat_name: String::new(),
             new_mat_material: "Mild Steel".to_string(),
             new_mat_thickness: 2.0,
-            last_remote_button_mask: 0,
+            show_home_prompt: false,
+            prompted_home_this_connection: false,
         }
+    }
+}
+
+/// Build `HomeConfig` matching the selected `origin_corner` and pulse scaling in `PulseConfig`.
+pub fn home_config_from_pulse(pulse_config: &PulseConfig) -> tzlaser_protocol::HomeConfig {
+    let x_dir = if pulse_config.origin_corner.contains("Right") {
+        1
+    } else {
+        -1
+    };
+    let y_dir = if pulse_config.origin_corner.contains("Top") {
+        1
+    } else {
+        -1
+    };
+    let ppm = pulse_config
+        .pulses_per_mm_x
+        .max(pulse_config.pulses_per_mm_y)
+        .max(10.0);
+    let max_dim = pulse_config
+        .table_width_mm
+        .max(pulse_config.table_height_mm)
+        .max(500.0);
+    tzlaser_protocol::HomeConfig {
+        x_dir,
+        y_dir,
+        fast_speed_pls_s: ((40.0 * ppm).round() as u32).max(1_000),
+        slow_speed_pls_s: ((2.0 * ppm).round() as u32).max(100),
+        max_search_pulses: ((max_dim * 1.2 * ppm).round() as u32).max(50_000),
     }
 }
 
@@ -805,26 +834,10 @@ pub fn render_right_panels(
                 // 1A. Head Position DRO (Moved here from Machine Controls)
                 let pos_x_mm = pulses_cfg.pulses_to_mm_x(status.pos_x);
                 let pos_y_mm = pulses_cfg.pulses_to_mm_y(status.pos_y);
-                let pos_z_mm = pulses_cfg.pulses_to_mm_z(status.pos_z);
+                let pos_z_mm = pulses_cfg.pulses_to_mm_x(status.pos_z);
 
-                let card_fill = if cfg!(target_os = "windows") {
-                    Color32::from_rgb(22, 26, 34)
-                } else {
-                    Color32::from_rgb(18, 20, 24)
-                };
-                let card_header_color = if cfg!(target_os = "windows") {
-                    Color32::from_rgb(185, 200, 225)
-                } else {
-                    Color32::from_rgb(140, 150, 170)
-                };
-                let standby_color = if cfg!(target_os = "windows") {
-                    Color32::from_rgb(190, 200, 216)
-                } else {
-                    Color32::from_rgb(140, 145, 155)
-                };
-
-                Frame::group(ui.style()).fill(card_fill).show(ui, |ui| {
-                    ui.label(RichText::new("Head Coordinates (WCS)").size(11.0).color(card_header_color).strong());
+                Frame::group(ui.style()).fill(Color32::from_rgb(18, 20, 24)).show(ui, |ui| {
+                    ui.label(RichText::new("Head Coordinates (WCS)").size(11.0).color(Color32::from_rgb(140, 150, 170)).strong());
                     ui.add_space(2.0);
                     Grid::new("dro_grid").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
                         ui.label(RichText::new("X:").color(Color32::from_rgb(255, 90, 90)).strong().size(14.0));
@@ -847,15 +860,15 @@ pub fn render_right_panels(
                 ui.add_space(6.0);
 
                 // 1B. Laser Source Status
-                Frame::group(ui.style()).fill(card_fill).show(ui, |ui| {
-                    ui.label(RichText::new("Laser Source").size(11.0).color(card_header_color).strong());
+                Frame::group(ui.style()).fill(Color32::from_rgb(18, 20, 24)).show(ui, |ui| {
+                    ui.label(RichText::new("Laser Source").size(11.0).color(Color32::from_rgb(140, 150, 170)).strong());
                     ui.add_space(2.0);
                     Grid::new("laser_monitor_grid").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
                         ui.label("Emission:");
                         if status.laser_on {
                             ui.colored_label(Color32::from_rgb(255, 60, 60), "● ACTIVE / FIRING");
                         } else {
-                            ui.colored_label(standby_color, "○ READY / STANDBY");
+                            ui.colored_label(Color32::from_rgb(140, 145, 155), "○ READY / STANDBY");
                         }
                         ui.end_row();
 
@@ -876,15 +889,15 @@ pub fn render_right_panels(
                 ui.add_space(6.0);
 
                 // 1C. Assist Gas Solenoid Valve
-                Frame::group(ui.style()).fill(card_fill).show(ui, |ui| {
-                    ui.label(RichText::new("Assist Gas Solenoid").size(11.0).color(card_header_color).strong());
+                Frame::group(ui.style()).fill(Color32::from_rgb(18, 20, 24)).show(ui, |ui| {
+                    ui.label(RichText::new("Assist Gas Solenoid").size(11.0).color(Color32::from_rgb(140, 150, 170)).strong());
                     ui.add_space(2.0);
                     Grid::new("gas_monitor_grid").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
                         ui.label("Valve Status:");
                         if status.gas_valve_open {
                             ui.colored_label(Color32::from_rgb(0, 220, 255), "● OPEN (Purging)");
                         } else {
-                            ui.colored_label(standby_color, "○ CLOSED");
+                            ui.colored_label(Color32::from_rgb(140, 145, 155), "○ CLOSED");
                         }
                         ui.end_row();
 
@@ -901,8 +914,8 @@ pub fn render_right_panels(
                 ui.add_space(6.0);
 
                 // 1D. Capacitive Height Sensor Readout (BCS100 Follower)
-                Frame::group(ui.style()).fill(card_fill).show(ui, |ui| {
-                    ui.label(RichText::new("Capacitive Height Sensor").size(11.0).color(card_header_color).strong());
+                Frame::group(ui.style()).fill(Color32::from_rgb(18, 20, 24)).show(ui, |ui| {
+                    ui.label(RichText::new("Capacitive Height Sensor").size(11.0).color(Color32::from_rgb(140, 150, 170)).strong());
                     ui.add_space(2.0);
                     Grid::new("height_sensor_grid").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
                         ui.label("Nozzle Height:");
@@ -917,7 +930,7 @@ pub fn render_right_panels(
                         if status.follower_active {
                             ui.colored_label(Color32::from_rgb(0, 255, 120), "● TRACKING (Locked)");
                         } else {
-                            ui.colored_label(standby_color, "○ STANDBY");
+                            ui.colored_label(Color32::from_rgb(140, 145, 155), "○ STANDBY");
                         }
                         ui.end_row();
                     });
@@ -937,7 +950,7 @@ pub fn render_right_panels(
             .show(ui, |ui| {
                 ui.add_space(2.0);
 
-                // Connection Status Badge & Wireless Remote Control (`R1042`) Status
+                // Connection Status Badge
                 let is_connected = controller.as_ref().map_or(false, |c| c.is_connected());
                 ui.horizontal(|ui| {
                     let (dot_color, label) = if is_connected {
@@ -950,62 +963,14 @@ pub fn render_right_panels(
                     ui.label(format!("({})", panel_state.target_ip));
                 });
 
-                if is_connected {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("🎮 Remote:").size(11.5).strong());
-                        let r1041 = status.raw_registers.get(41).copied().unwrap_or(0);
-                        let r1092 = status.raw_registers.get(92).copied().unwrap_or(0);
-                        let lcr_id = if r1041 != 0 { r1041 } else { r1092 };
-                        let active_key_mask = status.remote_button_mask
-                            & !tzlaser_protocol::remote_buttons::STICKY_FLAGS;
-                        if active_key_mask != 0 {
-                            panel_state.last_remote_button_mask = status.remote_button_mask;
-                            ui.label(
-                                RichText::new(format!(
-                                    "● {}",
-                                    format_remote_button(status.remote_button_mask)
-                                ))
-                                .size(11.5)
-                                .color(Color32::from_rgb(0, 235, 160))
-                                .strong(),
-                            );
-                        } else if lcr_id != 0 {
-                            let label_text = if panel_state.last_remote_button_mask != 0 {
-                                format!(
-                                    "Linked (ID {:08X}) · Last: {}",
-                                    lcr_id,
-                                    format_remote_button(panel_state.last_remote_button_mask)
-                                )
-                            } else {
-                                format!("Linked (ID {:08X}) · Ready", lcr_id)
-                            };
-                            ui.label(
-                                RichText::new(label_text)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(130, 225, 165)),
-                            );
-                        } else {
-                            let label_text = if panel_state.last_remote_button_mask != 0 {
-                                format!(
-                                    "Ready · Last: {}",
-                                    format_remote_button(panel_state.last_remote_button_mask)
-                                )
-                            } else {
-                                "Ready (Listening R1042/R1043)".to_string()
-                            };
-                            ui.label(RichText::new(label_text).size(11.0).weak());
-                        }
-                    });
-                }
-
                 ui.add_space(6.0);
 
                 // Jog Mode & Step Selection
-                let step_options = [0.1, 0.5, 1.0, 5.0, 10.0, 50.0];
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Jog Mode:").strong());
                     let is_step = matches!(panel_state.jog_mode, JogMode::Step(_));
                     if ui.selectable_label(is_step, "Step").clicked() {
+                        let step_options = [0.1, 1.0, 10.0, 50.0, 100.0];
                         panel_state.jog_mode = JogMode::Step(step_options[panel_state.step_index.min(step_options.len() - 1)]);
                     }
                     let is_cont = matches!(panel_state.jog_mode, JogMode::Continuous);
@@ -1015,6 +980,7 @@ pub fn render_right_panels(
                 });
 
                 if let JogMode::Step(mut step_val) = panel_state.jog_mode {
+                    let step_options = [0.1, 1.0, 10.0, 50.0, 100.0];
                     ui.horizontal_wrapped(|ui| {
                         for (i, &step) in step_options.iter().enumerate() {
                             let selected = (step_val - step).abs() < 1e-6;
@@ -1028,7 +994,7 @@ pub fn render_right_panels(
                             .add(
                                 egui::DragValue::new(&mut step_val)
                                     .range(0.01..=1000.0)
-                                    .speed(0.2)
+                                    .speed(0.5)
                                     .suffix(" mm"),
                             )
                             .changed()
@@ -1043,16 +1009,15 @@ pub fn render_right_panels(
                 // Jog Control Pad (3x3 Grid: +/-Z to the right of +/-Y, with X+ centered between Z+ and Z-)
                 let step_dist = match panel_state.jog_mode {
                     JogMode::Step(d) => d,
-                    JogMode::Continuous => 1.0,
+                    JogMode::Continuous => 10.0,
                 };
                 let step_pulses_x = pulses_cfg.mm_to_pulses_x(step_dist);
                 let step_pulses_y = pulses_cfg.mm_to_pulses_y(step_dist);
-                let step_pulses_z = pulses_cfg.mm_to_pulses_z(step_dist);
+                let step_pulses_z = (step_dist * pulses_cfg.pulses_per_mm_z).round() as i32;
 
                 let btn_size = [72.0, 34.0];
                 let pad_width = 72.0 * 3.0 + 12.0;
                 let mut jog_cmd: Option<(Axis, i32)> = None;
-                let mut held_jog: Option<(Axis, i32)> = None;
                 let mut stop_clicked = false;
 
                 ui.horizontal(|ui| {
@@ -1063,143 +1028,63 @@ pub fn render_right_panels(
                         .show(ui, |ui| {
                             // Row 1: [empty] | Y+ | Z+
                             ui.allocate_exact_size(egui::vec2(btn_size[0], btn_size[1]), egui::Sense::hover());
-                            let y_plus_resp = ui.add_sized(btn_size, Button::new(RichText::new("Y+ ▲").size(13.0)));
-                            if y_plus_resp.clicked() {
+                            if ui.add_sized(btn_size, Button::new(RichText::new("Y+ ▲").size(13.0))).clicked() {
                                 jog_cmd = Some((Axis::Y, step_pulses_y));
                             }
-                            if y_plus_resp.is_pointer_button_down_on() {
-                                held_jog = Some((Axis::Y, 1));
-                            }
-
                             let z_plus_btn = Button::new(RichText::new("Z+ ▲").size(13.0).color(Color32::from_rgb(130, 195, 255)))
                                 .fill(Color32::from_rgb(28, 38, 56));
-                            let z_plus_resp = ui.add_sized(btn_size, z_plus_btn).on_hover_text("Raise cutting head (Z+)");
-                            if z_plus_resp.clicked() {
+                            if ui.add_sized(btn_size, z_plus_btn).on_hover_text("Raise cutting head (Z+)").clicked() {
                                 jog_cmd = Some((Axis::Z, step_pulses_z));
-                            }
-                            if z_plus_resp.is_pointer_button_down_on() {
-                                held_jog = Some((Axis::Z, 1));
                             }
                             ui.end_row();
 
                             // Row 2: X- | STOP | X+ (middle between Z+ and Z-)
-                            let x_minus_resp = ui.add_sized(btn_size, Button::new(RichText::new("◄ X-").size(13.0)));
-                            if x_minus_resp.clicked() {
+                            if ui.add_sized(btn_size, Button::new(RichText::new("◄ X-").size(13.0))).clicked() {
                                 jog_cmd = Some((Axis::X, -step_pulses_x));
                             }
-                            if x_minus_resp.is_pointer_button_down_on() {
-                                held_jog = Some((Axis::X, -1));
-                            }
-
                             let stop_btn = Button::new(RichText::new("STOP").color(Color32::WHITE).strong())
                                 .fill(Color32::from_rgb(180, 40, 40));
                             if ui.add_sized(btn_size, stop_btn).clicked() {
                                 stop_clicked = true;
                             }
-
-                            let x_plus_resp = ui.add_sized(btn_size, Button::new(RichText::new("X+ ►").size(13.0)));
-                            if x_plus_resp.clicked() {
+                            if ui.add_sized(btn_size, Button::new(RichText::new("X+ ►").size(13.0))).clicked() {
                                 jog_cmd = Some((Axis::X, step_pulses_x));
-                            }
-                            if x_plus_resp.is_pointer_button_down_on() {
-                                held_jog = Some((Axis::X, 1));
                             }
                             ui.end_row();
 
                             // Row 3: [empty] | Y- | Z-
                             ui.allocate_exact_size(egui::vec2(btn_size[0], btn_size[1]), egui::Sense::hover());
-                            let y_minus_resp = ui.add_sized(btn_size, Button::new(RichText::new("Y- ▼").size(13.0)));
-                            if y_minus_resp.clicked() {
+                            if ui.add_sized(btn_size, Button::new(RichText::new("Y- ▼").size(13.0))).clicked() {
                                 jog_cmd = Some((Axis::Y, -step_pulses_y));
                             }
-                            if y_minus_resp.is_pointer_button_down_on() {
-                                held_jog = Some((Axis::Y, -1));
-                            }
-
                             let z_minus_btn = Button::new(RichText::new("Z- ▼").size(13.0).color(Color32::from_rgb(130, 195, 255)))
                                 .fill(Color32::from_rgb(28, 38, 56));
-                            let z_minus_resp = ui.add_sized(btn_size, z_minus_btn).on_hover_text("Lower cutting head (Z-)");
-                            if z_minus_resp.clicked() {
+                            if ui.add_sized(btn_size, z_minus_btn).on_hover_text("Lower cutting head (Z-)").clicked() {
                                 jog_cmd = Some((Axis::Z, -step_pulses_z));
-                            }
-                            if z_minus_resp.is_pointer_button_down_on() {
-                                held_jog = Some((Axis::Z, -1));
                             }
                             ui.end_row();
                         });
                 });
 
                 if stop_clicked {
-                    panel_state.active_continuous_jog = None;
                     panel_state.stop_run(controller, status);
                     *status_message = "Motion stopped.".to_string();
-                } else if matches!(panel_state.jog_mode, JogMode::Continuous) {
-                    if let Some((axis, raw_dir)) = held_jog {
-                        let hw_dir = match axis {
-                            Axis::X if pulses_cfg.invert_x => -raw_dir,
-                            Axis::Y if pulses_cfg.invert_y => -raw_dir,
-                            Axis::Z if pulses_cfg.invert_z => -raw_dir,
-                            _ => raw_dir,
-                        };
-                        if panel_state.active_continuous_jog != Some((axis, hw_dir)) {
-                            panel_state.active_continuous_jog = Some((axis, hw_dir));
-                            if is_connected {
-                                if let Some(c) = controller {
-                                    c.start_continuous_jog(axis, hw_dir);
-                                }
-                            }
-                            let sign_str = if raw_dir >= 0 { "+" } else { "-" };
-                            *status_message = format!("Continuous jogging {:?}{}...", axis, sign_str);
+                } else if let Some((axis, pulses)) = jog_cmd {
+                    if is_connected {
+                        if let Some(c) = controller {
+                            c.jog(axis, pulses);
                         }
-                        if !is_connected {
-                            let cont_delta = (0.5 * pulses_cfg.pulses_per_mm_x).round() as i32 * hw_dir;
-                            match axis {
-                                Axis::X => status.pos_x += cont_delta,
-                                Axis::Y => status.pos_y += cont_delta,
-                                Axis::Z => {
-                                    status.pos_z += cont_delta;
-                                    status.capacitive_height_mm =
-                                        ((status.pos_z as f32).abs() / (pulses_cfg.pulses_per_mm_z as f32)).max(0.0);
-                                }
-                                Axis::W => status.pos_w += cont_delta,
+                    } else {
+                        match axis {
+                            Axis::X => status.pos_x += pulses,
+                            Axis::Y => status.pos_y += pulses,
+                            Axis::Z => {
+                                status.pos_z += pulses;
+                                status.capacitive_height_mm =
+                                    ((status.pos_z as f32) / (pulses_cfg.pulses_per_mm_z as f32)).max(0.0);
                             }
+                            Axis::W => status.pos_w += pulses,
                         }
-                        ui.ctx().request_repaint();
-                    } else if let Some((axis, _)) = panel_state.active_continuous_jog.take() {
-                        if is_connected {
-                            if let Some(c) = controller {
-                                c.stop();
-                            }
-                        }
-                        *status_message = format!("Stopped {:?} jog.", axis);
-                    }
-                } else {
-                    if panel_state.active_continuous_jog.take().is_some() {
-                        if is_connected {
-                            if let Some(c) = controller {
-                                c.stop();
-                            }
-                        }
-                    }
-                    if let Some((axis, pulses)) = jog_cmd {
-                        if is_connected {
-                            if let Some(c) = controller {
-                                c.jog(axis, pulses);
-                            }
-                        } else {
-                            match axis {
-                                Axis::X => status.pos_x += pulses,
-                                Axis::Y => status.pos_y += pulses,
-                                Axis::Z => {
-                                    status.pos_z += pulses;
-                                    status.capacitive_height_mm =
-                                        ((status.pos_z as f32).abs() / (pulses_cfg.pulses_per_mm_z as f32)).max(0.0);
-                                }
-                                Axis::W => status.pos_w += pulses,
-                            }
-                        }
-                        let sign_mm = if pulses >= 0 { step_dist } else { -step_dist };
-                        *status_message = format!("Step jog {:?} {:+.2} mm ({:+} pulses)", axis, sign_mm, pulses);
                     }
                 }
 
@@ -1365,12 +1250,75 @@ pub fn render_right_panels(
                     }
                 });
 
+                ui.add_space(4.0);
+
+                // Row 4: 🏠 Home (All 3 axes toward selected origin)  |  ⬆ Z-Home (Z-up only)
+                ui.horizontal(|ui| {
+                    let home_fill = if is_connected {
+                        if status.is_homing_xy || status.is_homing_z {
+                            Color32::from_rgb(165, 115, 25)
+                        } else if status.xy_homed && status.z_homed {
+                            Color32::from_rgb(24, 92, 62)
+                        } else {
+                            Color32::from_rgb(35, 78, 120)
+                        }
+                    } else {
+                        Color32::from_rgb(48, 50, 62)
+                    };
+                    let home_btn = Button::new(RichText::new("🏠 Home").size(12.5).color(Color32::WHITE).strong())
+                        .fill(home_fill);
+                    if ui
+                        .add_enabled_ui(is_connected, |ui| ui.add_sized([run_btn_w, 28.0], home_btn))
+                        .inner
+                        .on_hover_text(format!(
+                            "Home all 3 axes (Z up to sensor, then X/Y toward {})",
+                            pulses_cfg.origin_corner
+                        ))
+                        .on_disabled_hover_text("Connect to machine controller to home axes")
+                        .clicked()
+                    {
+                        if let Some(ref c) = controller {
+                            c.home_all(home_config_from_pulse(pulses_cfg));
+                            *status_message = format!(
+                                "Homing Z (up) and X/Y toward {}...",
+                                pulses_cfg.origin_corner
+                            );
+                        }
+                    }
+
+                    let z_home_fill = if is_connected {
+                        if status.is_homing_z {
+                            Color32::from_rgb(165, 115, 25)
+                        } else if status.z_homed {
+                            Color32::from_rgb(24, 92, 62)
+                        } else {
+                            Color32::from_rgb(35, 78, 120)
+                        }
+                    } else {
+                        Color32::from_rgb(48, 50, 62)
+                    };
+                    let z_home_btn = Button::new(RichText::new("⬆ Z-Home").size(12.5).color(Color32::WHITE).strong())
+                        .fill(z_home_fill);
+                    if ui
+                        .add_enabled_ui(is_connected, |ui| ui.add_sized([run_btn_w, 28.0], z_home_btn))
+                        .inner
+                        .on_hover_text("Home Z-axis only (raise head Z-up until upper capacitive/limit sensor triggers)")
+                        .on_disabled_hover_text("Connect to machine controller to home Z-axis")
+                        .clicked()
+                    {
+                        if let Some(ref c) = controller {
+                            c.home_z();
+                            *status_message = "Homing Z-axis (moving Z-up to sensor)...".to_string();
+                        }
+                    }
+                });
+
                 // Pause Buffer Card (visible when a paused checkpoint is active)
                 if let Some(cp) = panel_state.paused_checkpoint {
                     ui.add_space(4.0);
                     Frame::group(ui.style())
                         .fill(Color32::from_rgb(36, 30, 20))
-                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(205, 145, 38)))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(205, 145, 38)))
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(format!(
@@ -1490,22 +1438,13 @@ pub fn render_right_panels(
                     let is_open = panel_state.active_layer_popup == Some(l_idx);
                     let row_fill = if is_open {
                         Color32::from_rgb(35, 45, 58)
-                    } else if cfg!(target_os = "windows") {
-                        Color32::from_rgb(34, 39, 49)
                     } else {
                         Color32::from_rgb(28, 30, 36)
                     };
                     let row_stroke = if is_open {
-                        egui::Stroke::new(1.0_f32, Color32::from_rgb(80, 175, 235))
-                    } else if cfg!(target_os = "windows") {
-                        egui::Stroke::new(1.0_f32, Color32::from_rgb(64, 73, 92))
+                        egui::Stroke::new(1.0, Color32::from_rgb(80, 175, 235))
                     } else {
-                        egui::Stroke::new(1.0_f32, Color32::from_rgb(44, 47, 56))
-                    };
-                    let summary_color = if cfg!(target_os = "windows") {
-                        Color32::from_rgb(208, 218, 235)
-                    } else {
-                        Color32::from_rgb(175, 185, 200)
+                        egui::Stroke::new(1.0, Color32::from_rgb(44, 47, 56))
                     };
 
                     Frame::group(ui.style())
@@ -1551,7 +1490,7 @@ pub fn render_right_panels(
                                     ui.label(
                                         RichText::new(summary)
                                             .size(10.5)
-                                            .color(summary_color),
+                                            .color(Color32::from_rgb(175, 185, 200)),
                                     );
                                 });
 

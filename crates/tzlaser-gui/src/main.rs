@@ -234,6 +234,18 @@ impl eframe::App for TzlaserApp {
             ctx.request_repaint();
         }
 
+        // Prompt to home machine on first connection to controller board
+        let is_connected = self.controller.as_ref().map_or(false, |c| c.is_connected());
+        if !is_connected {
+            self.panel_state.prompted_home_this_connection = false;
+            self.panel_state.show_home_prompt = false;
+        } else if !self.panel_state.prompted_home_this_connection {
+            self.panel_state.prompted_home_this_connection = true;
+            if !self.status.xy_homed || !self.status.z_homed {
+                self.panel_state.show_home_prompt = true;
+            }
+        }
+
         // Global Keyboard Shortcuts: Cmd+Z (Undo) and Cmd+Shift+Z / Cmd+Y (Redo)
         let cmd = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
         let shift = ctx.input(|i| i.modifiers.shift);
@@ -405,6 +417,76 @@ impl eframe::App for TzlaserApp {
             &self.controller,
             &mut self.status_message,
         );
+
+        // 8. Initial Connection Homing Prompt
+        if self.panel_state.show_home_prompt {
+            let mut close_prompt = false;
+            egui::Window::new("🏠 Home Machine?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.label(
+                        RichText::new("Controller board connected!")
+                            .size(13.5)
+                            .strong()
+                            .color(Color32::from_rgb(120, 235, 180)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Would you like to home the cutting head now?\n\n• Z-axis will move UP until its upper sensor triggers.\n• X and Y axes will move toward {} until both origin sensors trigger.",
+                            self.pulse_config.origin_corner
+                        ))
+                        .size(12.0),
+                    );
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let home_all_btn = egui::Button::new(
+                            RichText::new("🏠 Home All Axes").color(Color32::WHITE).strong(),
+                        )
+                        .fill(Color32::from_rgb(28, 125, 78))
+                        .min_size(egui::Vec2::new(125.0, 28.0));
+                        if ui.add(home_all_btn).clicked() {
+                            if let Some(ref c) = self.controller {
+                                c.home_all(panels::home_config_from_pulse(&self.pulse_config));
+                                self.status_message = format!(
+                                    "Homing Z (up) and X/Y toward {}...",
+                                    self.pulse_config.origin_corner
+                                );
+                            }
+                            close_prompt = true;
+                        }
+
+                        let home_z_btn = egui::Button::new(
+                            RichText::new("⬆ Z-Home Only").color(Color32::WHITE).strong(),
+                        )
+                        .fill(Color32::from_rgb(32, 85, 130))
+                        .min_size(egui::Vec2::new(110.0, 28.0));
+                        if ui.add(home_z_btn).clicked() {
+                            if let Some(ref c) = self.controller {
+                                c.home_z();
+                                self.status_message =
+                                    "Homing Z-axis (moving Z-up to sensor)...".to_string();
+                            }
+                            close_prompt = true;
+                        }
+
+                        let skip_btn = egui::Button::new(RichText::new("Skip").size(12.0))
+                            .fill(Color32::from_rgb(48, 52, 62))
+                            .min_size(egui::Vec2::new(72.0, 28.0));
+                        if ui.add(skip_btn).clicked() {
+                            close_prompt = true;
+                        }
+                    });
+                });
+            if close_prompt {
+                self.panel_state.show_home_prompt = false;
+            }
+        }
     }
 }
 

@@ -205,7 +205,7 @@ pub fn render_ribbon(
                 RibbonTab::File => render_file_tab(ui, doc, selection, history, status_message),
                 RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
                 RibbonTab::View => render_view_tab(ui, doc, canvas_state),
-                RibbonTab::Laser => render_laser_tab(ui, state, controller, status, status_message),
+                RibbonTab::Laser => render_laser_tab(ui, state, pulse_config, controller, status, status_message),
                 RibbonTab::Properties => render_properties_tab(
                     ui,
                     pulse_config,
@@ -797,6 +797,7 @@ fn render_profiles_tab(
 fn render_laser_tab(
     ui: &mut Ui,
     state: &mut RibbonState,
+    pulse_config: &PulseConfig,
     controller: &mut Option<LaserController>,
     status: &MachineStatus,
     status_message: &mut String,
@@ -899,8 +900,23 @@ fn render_laser_tab(
 
         ui.add_space(4.0);
 
-        // 3. Work Origin & Framing
-        ribbon_group(ui, "Origin & Framing", |ui| {
+        // 3. Work Origin, Homing & Framing
+        ribbon_group(ui, "Origin, Homing & Framing", |ui| {
+            let is_conn = controller.as_ref().map_or(false, |c| c.is_connected());
+            if ui.add_enabled(is_conn, Button::new(RichText::new("🏠 Home All").size(12.0).color(Color32::from_rgb(130, 235, 180))).fill(Color32::from_rgb(24, 65, 50))).on_hover_text(format!("Home all 3 axes (Z up, then X/Y toward {})", pulse_config.origin_corner)).clicked() {
+                if let Some(ref c) = controller {
+                    c.home_all(crate::panels::home_config_from_pulse(pulse_config));
+                    *status_message = format!("Homing Z (up) and X/Y toward {}...", pulse_config.origin_corner);
+                }
+            }
+
+            if ui.add_enabled(is_conn, Button::new(RichText::new("⬆ Z-Home").size(12.0).color(Color32::from_rgb(130, 210, 255))).fill(Color32::from_rgb(24, 52, 78))).on_hover_text("Home Z-axis only (Z-up until sensor triggers)").clicked() {
+                if let Some(ref c) = controller {
+                    c.home_z();
+                    *status_message = "Homing Z-axis (moving Z-up to sensor)...".to_string();
+                }
+            }
+
             if ui.add(Button::new(RichText::new("📍 Set Origin").size(12.0).color(Color32::from_rgb(0, 230, 230))).fill(Color32::from_rgb(20, 48, 55))).on_hover_text("Zero Workpiece Origin (G54 X0 Y0) at current head position").clicked() {
                 *status_message = format!("Workpiece Origin set at current position (X: {}, Y: {})", status.pos_x, status.pos_y);
             }

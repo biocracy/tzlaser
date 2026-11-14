@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use crate::motion::{
     build_init_packets, build_initial_enable_packets, build_jog_packet, build_stop_packets,
-    build_z_handshake_packets, build_z_jog_packet, build_z_poll_packet, build_z_stop_packet,
-    decode_remote_jog, decode_z_poll_response, registers, remote_buttons, Axis, JogConfig,
+    build_xy_home_packets, build_z_handshake_packets, build_z_home_packet, build_z_jog_packet,
+    build_z_poll_packet, build_z_stop_packet, decode_remote_jog, decode_z_homed_from_poll,
+    decode_z_poll_response, registers, remote_buttons, Axis, HomeConfig, JogConfig,
     MachineStatus, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
@@ -16,6 +17,8 @@ pub enum Command {
     Jog { axis: Axis, pulses: i32 },
     StartContinuousJog { axis: Axis, direction: i32 },
     Stop,
+    HomeAll(HomeConfig),
+    HomeZ,
     UpdateJogConfig { config: JogConfig, z_speed: u32 },
     WriteRegisters { addr: u32, values: Vec<u32> },
     CalibrateHeightSensor,
@@ -371,6 +374,47 @@ impl LaserController {
                                 last_z_poll = Instant::now() - Duration::from_secs(1);
                             }
                         }
+                        Command::HomeAll(home_cfg) => {
+                            auto_stop_at = None;
+                            active_step_watch = None;
+                            active_z_step_watch = None;
+                            active_remote_jog = None;
+
+                            // 1. Home Z up first so the nozzle clears the sheet before XY moves
+                            if let Some(ref zs) = z_socket {
+                                let raw_z_home = build_z_home_packet();
+                                send_z_cmd_with_ack(
+                                    zs,
+                                    &raw_z_home,
+                                    &mut z_buf,
+                                    &mut z_status_seen,
+                                    &mut latest_z,
+                                );
+                                last_z_poll = Instant::now() - Duration::from_secs(1);
+                            }
+
+                            // 2. Home X and Y toward the selected origin corner
+                            for hpkt in build_xy_home_packets(
+                                || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                home_cfg,
+                            ) {
+                                let _ = send_and_wait_ack(&socket, &hpkt, &mut buf);
+                            }
+                        }
+                        Command::HomeZ => {
+                            active_z_step_watch = None;
+                            if let Some(ref zs) = z_socket {
+                                let raw_z_home = build_z_home_packet();
+                                send_z_cmd_with_ack(
+                                    zs,
+                                    &raw_z_home,
+                                    &mut z_buf,
+                                    &mut z_status_seen,
+                                    &mut latest_z,
+                                );
+                                last_z_poll = Instant::now() - Duration::from_secs(1);
+                            }
+                        }
                         Command::UpdateJogConfig { config, z_speed } => {
                             jog_cfg = config;
                             z_jog_speed = z_speed.clamp(1, 500);
@@ -498,7 +542,8 @@ impl LaserController {
                         {
                             // Ensure hardware soft limits R1063..R1070 (addr = 1252) remain unbounded
                             // ([0x7FFFFFFF, 0x80000000, ...]) so ±472,000 continuous & remote jogs are never blocked.
-                            if pkt.data.len() > 68
+                            if pkt.data.get(5).copied().unwrap_or(0) != 1
+                                && pkt.data.len() > 68
                                 && (pkt.data[63] != 0x7FFF_FFFF
                                     || pkt.data[64] != 0x8000_0000
                                     || pkt.data[65] != 0x7FFF_FFFF
@@ -698,7 +743,11 @@ impl LaserController {
                                 }
                             }
                             let mut st = status_clone.lock().unwrap();
+                            let prev_z_homed = st.z_homed;
+                            let prev_homing_z = st.is_homing_z;
                             *st = new_st;
+                            st.z_homed = prev_z_homed;
+                            st.is_homing_z = prev_homing_z;
                         }
                     }
                 }
@@ -718,6 +767,10 @@ impl LaserController {
                                     st.is_connected = true;
                                 }
                                 st.apply_z_status(pos_z, raw_cap, state_code);
+                                if let Some(zh) = decode_z_homed_from_poll(&z_buf[..n]) {
+                                    st.z_homed = zh;
+                                }
+                                st.is_homing_z = state_code == 2 && !st.z_homed;
                             }
                         }
                     }
@@ -748,6 +801,14 @@ impl LaserController {
 
     pub fn stop(&self) {
         let _ = self.command_tx.send(Command::Stop);
+    }
+
+    pub fn home_all(&self, cfg: HomeConfig) {
+        let _ = self.command_tx.send(Command::HomeAll(cfg));
+    }
+
+    pub fn home_z(&self) {
+        let _ = self.command_tx.send(Command::HomeZ);
     }
 
     pub fn update_jog_config(&self, config: JogConfig, z_speed: u32) {
