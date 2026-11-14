@@ -1042,9 +1042,9 @@ pub fn render_canvas(
         Color32::from_rgb(60, 65, 75)
     };
     let grid_color = if cfg!(target_os = "windows") {
-        Color32::from_rgb(44, 50, 62)
+        Color32::from_rgb(56, 64, 78)
     } else {
-        Color32::from_rgb(32, 34, 40)
+        Color32::from_rgb(50, 56, 68)
     };
 
     painter.rect_filled(bed_rect, 0.0, bed_fill);
@@ -1055,14 +1055,14 @@ pub fn render_canvas(
         while x <= state.bed_width_mm {
             let p1 = state.world_to_screen(Point::new(x as f64, 0.0), origin_screen);
             let p2 = state.world_to_screen(Point::new(x as f64, state.bed_height_mm as f64), origin_screen);
-            painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
+            painter.line_segment([p1, p2], Stroke::new(1.0_f32, grid_color));
             x += 100.0;
         }
         let mut y = 0.0;
         while y <= state.bed_height_mm {
             let p1 = state.world_to_screen(Point::new(0.0, y as f64), origin_screen);
             let p2 = state.world_to_screen(Point::new(state.bed_width_mm as f64, y as f64), origin_screen);
-            painter.line_segment([p1, p2], Stroke::new(0.5_f32, grid_color));
+            painter.line_segment([p1, p2], Stroke::new(1.0_f32, grid_color));
             y += 100.0;
         }
     }
@@ -1632,14 +1632,18 @@ pub fn render_canvas(
             .unwrap_or(1000.0);
         let minor_step = major_step / 5.0;
 
-        // Horizontal (X) ruler
+        // Horizontal (X) ruler in machine coordinates (0 at origin_world.x, increasing along x_screen_dir)
+        let x_sign = x_screen_dir.x as f64;
         let w_left = state.screen_to_world(Pos2::new(vr.min.x + r_thick, vr.min.y), origin_screen).x;
         let w_right = state.screen_to_world(Pos2::new(vr.max.x, vr.min.y), origin_screen).x;
-        let (x_min, x_max) = (w_left.min(w_right), w_left.max(w_right));
-        let k_start = (x_min / minor_step).floor() as i64;
-        let k_end = (x_max / minor_step).ceil() as i64;
+        let m_left = (w_left - origin_world.x) * x_sign;
+        let m_right = (w_right - origin_world.x) * x_sign;
+        let (mx_min, mx_max) = (m_left.min(m_right), m_left.max(m_right));
+        let k_start = (mx_min / minor_step).floor() as i64;
+        let k_end = (mx_max / minor_step).ceil() as i64;
         for k in k_start..=k_end {
-            let wx = (k as f64) * minor_step;
+            let mx = (k as f64) * minor_step;
+            let wx = origin_world.x + mx * x_sign;
             let sx = state.world_to_screen(Point::new(wx, 0.0), origin_screen).x;
             if sx < vr.min.x + r_thick || sx > vr.max.x {
                 continue;
@@ -1654,21 +1658,25 @@ pub fn render_canvas(
                 painter.text(
                     Pos2::new(sx + 3.0, vr.min.y + 2.0),
                     egui::Align2::LEFT_TOP,
-                    format!("{:.0}", wx),
+                    format!("{:.0}", mx),
                     egui::FontId::monospace(9.5),
                     label_color,
                 );
             }
         }
 
-        // Vertical (Y) ruler
+        // Vertical (Y) ruler in machine coordinates (0 at origin_world.y, increasing along y_screen_dir)
+        let y_sign = y_screen_dir.y as f64;
         let w_top = state.screen_to_world(Pos2::new(vr.min.x, vr.min.y + r_thick), origin_screen).y;
         let w_bot = state.screen_to_world(Pos2::new(vr.min.x, vr.max.y), origin_screen).y;
-        let (y_min, y_max) = (w_top.min(w_bot), w_top.max(w_bot));
-        let ky_start = (y_min / minor_step).floor() as i64;
-        let ky_end = (y_max / minor_step).ceil() as i64;
+        let m_top = (origin_world.y - w_top) * y_sign;
+        let m_bot = (origin_world.y - w_bot) * y_sign;
+        let (my_min, my_max) = (m_top.min(m_bot), m_top.max(m_bot));
+        let ky_start = (my_min / minor_step).floor() as i64;
+        let ky_end = (my_max / minor_step).ceil() as i64;
         for k in ky_start..=ky_end {
-            let wy = (k as f64) * minor_step;
+            let my = (k as f64) * minor_step;
+            let wy = origin_world.y - my * y_sign;
             let sy = state.world_to_screen(Point::new(0.0, wy), origin_screen).y;
             if sy < vr.min.y + r_thick || sy > vr.max.y {
                 continue;
@@ -1683,7 +1691,7 @@ pub fn render_canvas(
                 painter.text(
                     Pos2::new(vr.min.x + 2.0, sy + 2.0),
                     egui::Align2::LEFT_TOP,
-                    format!("{:.0}", wy),
+                    format!("{:.0}", my),
                     egui::FontId::monospace(9.0),
                     label_color,
                 );
