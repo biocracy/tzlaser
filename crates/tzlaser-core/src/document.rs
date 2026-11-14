@@ -745,7 +745,7 @@ pub struct Document {
     #[serde(default)]
     pub sort_mode: SortMode,
     #[serde(default)]
-    pub manual_sequence: Vec<(usize, usize)>,
+    pub manual_sequence: Vec<(usize, usize, Option<usize>)>,
     #[serde(default, with = "tuple_map_serde")]
     pub pasted_origins: HashMap<(usize, usize), PastedOrigin>,
     #[serde(default)]
@@ -881,6 +881,38 @@ impl Document {
                             closest = Some(((l_idx, e_idx), d));
                         }
                         _ => {}
+                    }
+                }
+            }
+        }
+
+        closest.map(|(idx, _)| idx)
+    }
+
+    /// Hit-test individual cuttable paths across visible non-obstacle layers.
+    /// For `Entity::Group`, returns `(layer_idx, entity_idx, Some(child_idx))` for the specific child path clicked.
+    pub fn hit_test_path(&self, pt: Point, tolerance_mm: f64) -> Option<(usize, usize, Option<usize>)> {
+        let mut closest: Option<((usize, usize, Option<usize>), f64)> = None;
+
+        for (l_idx, layer) in self.layers.iter().enumerate() {
+            if !layer.visible || layer.is_travel || layer.is_obstacle {
+                continue;
+            }
+            for (e_idx, entity) in layer.entities.iter().enumerate() {
+                match entity {
+                    Entity::Group { children } => {
+                        for (c_idx, child) in children.iter().enumerate() {
+                            let d = child.distance_to_point(pt);
+                            if d <= tolerance_mm && closest.map_or(true, |(_, cur)| d < cur) {
+                                closest = Some(((l_idx, e_idx, Some(c_idx)), d));
+                            }
+                        }
+                    }
+                    _ => {
+                        let d = entity.distance_to_point(pt);
+                        if d <= tolerance_mm && closest.map_or(true, |(_, cur)| d < cur) {
+                            closest = Some(((l_idx, e_idx, None), d));
+                        }
                     }
                 }
             }
@@ -1072,7 +1104,14 @@ impl Document {
                         },
                     );
                     if !self.manual_sequence.is_empty() {
-                        self.manual_sequence.push((l_idx, new_idx));
+                        match &self.layers[l_idx].entities[new_idx] {
+                            Entity::Group { children } => {
+                                for c_idx in 0..children.len() {
+                                    self.manual_sequence.push((l_idx, new_idx, Some(c_idx)));
+                                }
+                            }
+                            _ => self.manual_sequence.push((l_idx, new_idx, None)),
+                        }
                     }
                     if self.use_saved_cut_order && !self.saved_cut_order.is_empty() {
                         match &self.layers[l_idx].entities[new_idx] {
@@ -1481,9 +1520,9 @@ impl Document {
         let pre_seq = self.compute_cut_sequence();
         if self.sort_mode == SortMode::Manual && self.manual_sequence.is_empty() {
             for info in &pre_seq {
-                let pair = (info.layer_idx, info.entity_idx);
-                if !self.manual_sequence.contains(&pair) {
-                    self.manual_sequence.push(pair);
+                let entry = (info.layer_idx, info.entity_idx, info.child_idx);
+                if !self.manual_sequence.contains(&entry) {
+                    self.manual_sequence.push(entry);
                 }
             }
         }
@@ -1523,9 +1562,10 @@ impl Document {
             }
         }
 
-        for pair in &mut self.manual_sequence {
-            if let Some(&new_pair) = old_to_new.get(pair) {
-                *pair = new_pair;
+        for (l_idx, e_idx, _) in &mut self.manual_sequence {
+            if let Some(&(nl, ne)) = old_to_new.get(&(*l_idx, *e_idx)) {
+                *l_idx = nl;
+                *e_idx = ne;
             }
         }
 
@@ -1846,9 +1886,13 @@ impl Document {
         if mode == SortMode::Manual && !self.manual_sequence.is_empty() {
             let mut result = Vec::with_capacity(raw_paths.len());
             let mut used = vec![false; raw_paths.len()];
-            for &(l_idx, e_idx) in &self.manual_sequence {
+            for &(l_idx, e_idx, c_idx) in &self.manual_sequence {
                 for (i, item) in raw_paths.iter().enumerate() {
-                    if !used[i] && item.layer_idx == l_idx && item.entity_idx == e_idx {
+                    if !used[i]
+                        && item.layer_idx == l_idx
+                        && item.entity_idx == e_idx
+                        && item.child_idx == c_idx
+                    {
                         result.push(*item);
                         used[i] = true;
                     }
@@ -2157,23 +2201,30 @@ impl Document {
         }
     }
 
-    /// Assigns a specific 1-based cut order index to `(layer_idx, entity_idx)` in manual sort mode.
-    pub fn assign_manual_cut_index(&mut self, layer_idx: usize, entity_idx: usize, target_1based: usize) {
+    /// Assigns a specific 1-based cut order index to `(layer_idx, entity_idx, child_idx)` in manual sort mode.
+    pub fn assign_manual_cut_index(
+        &mut self,
+        layer_idx: usize,
+        entity_idx: usize,
+        child_idx: Option<usize>,
+        target_1based: usize,
+    ) {
         self.sort_mode = SortMode::Manual;
         self.use_saved_cut_order = false;
         if self.manual_sequence.is_empty() {
             let current = self.compute_cut_sequence_with_mode(SortMode::Manual);
             for info in current {
-                let pair = (info.layer_idx, info.entity_idx);
-                if !self.manual_sequence.contains(&pair) {
-                    self.manual_sequence.push(pair);
+                let entry = (info.layer_idx, info.entity_idx, info.child_idx);
+                if !self.manual_sequence.contains(&entry) {
+                    self.manual_sequence.push(entry);
                 }
             }
         }
 
-        self.manual_sequence.retain(|&p| p != (layer_idx, entity_idx));
+        let target = (layer_idx, entity_idx, child_idx);
+        self.manual_sequence.retain(|&p| p != target);
         let insert_pos = target_1based.saturating_sub(1).min(self.manual_sequence.len());
-        self.manual_sequence.insert(insert_pos, (layer_idx, entity_idx));
+        self.manual_sequence.insert(insert_pos, target);
     }
 
     /// Move selected entities earlier in their layer entity sequence (for manual order adjustments).
@@ -2738,8 +2789,8 @@ mod tests {
         assert!(!doc.layers[0].entities[0].is_closed());
 
         // 5. Interactive manual cut index assignment
-        doc.assign_manual_cut_index(0, 2, 1); // Put 3rd entity at index #1
-        doc.assign_manual_cut_index(0, 1, 2); // Put 2nd entity at index #2
+        doc.assign_manual_cut_index(0, 2, None, 1); // Put 3rd entity at index #1
+        doc.assign_manual_cut_index(0, 1, None, 2); // Put 2nd entity at index #2
         let manual_seq = doc.compute_cut_sequence_with_mode(SortMode::Manual);
         assert_eq!(manual_seq[0].entity_idx, 2);
         assert_eq!(manual_seq[1].entity_idx, 1);
@@ -2946,9 +2997,9 @@ mod tests {
         doc.layers = vec![layer];
 
         assert!(!doc.has_saved_cut_order());
-        doc.assign_manual_cut_index(0, 2, 1);
-        doc.assign_manual_cut_index(0, 1, 2);
-        doc.assign_manual_cut_index(0, 0, 3);
+        doc.assign_manual_cut_index(0, 2, None, 1);
+        doc.assign_manual_cut_index(0, 1, None, 2);
+        doc.assign_manual_cut_index(0, 0, None, 3);
         doc.save_current_cut_order();
         assert!(doc.has_saved_cut_order());
         assert!(doc.use_saved_cut_order);
@@ -3109,8 +3160,8 @@ mod tests {
 
         // Save custom cut order: [rect (0,0), circle (0,1)]
         doc.sort_mode = SortMode::Manual;
-        doc.assign_manual_cut_index(0, 0, 1);
-        doc.assign_manual_cut_index(0, 1, 2);
+        doc.assign_manual_cut_index(0, 0, None, 1);
+        doc.assign_manual_cut_index(0, 1, None, 2);
         doc.save_current_cut_order();
 
         let before_starts: Vec<Point> = doc
@@ -3449,6 +3500,42 @@ mod tests {
         doc.translate_selection(&sel, 50.0, 0.0);
         let b2 = doc.selection_bounding_box(&sel).unwrap();
         assert!((b2.min_x() - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_manual_sort_individual_paths_inside_group() {
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(Entity::Group {
+            children: vec![
+                Entity::Line {
+                    start: Point::new(0.0, 0.0),
+                    end: Point::new(10.0, 0.0),
+                },
+                Entity::Line {
+                    start: Point::new(0.0, 20.0),
+                    end: Point::new(10.0, 20.0),
+                },
+                Entity::Line {
+                    start: Point::new(0.0, 40.0),
+                    end: Point::new(10.0, 40.0),
+                },
+            ],
+        });
+
+        // Clicking on the 3rd child path inside the group hits (0, 0, Some(2))
+        let hit = doc.hit_test_path(Point::new(5.0, 40.0), 2.0);
+        assert_eq!(hit, Some((0, 0, Some(2))));
+
+        // Assigning child 2 to index 1, child 0 to index 2, child 1 to index 3 reorders only those individual paths
+        doc.assign_manual_cut_index(0, 0, Some(2), 1);
+        doc.assign_manual_cut_index(0, 0, Some(0), 2);
+        doc.assign_manual_cut_index(0, 0, Some(1), 3);
+
+        let seq = doc.compute_cut_sequence();
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq[0].child_idx, Some(2));
+        assert_eq!(seq[1].child_idx, Some(0));
+        assert_eq!(seq[2].child_idx, Some(1));
     }
 }
 

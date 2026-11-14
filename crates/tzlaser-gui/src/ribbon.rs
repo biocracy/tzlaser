@@ -415,6 +415,7 @@ fn execute_sort_action(
     canvas_state: &mut crate::canvas::CanvasState,
     status_message: &mut String,
 ) {
+    canvas_state.push_sort_undo(doc);
     match action {
         PendingSortAction::SaveOverwriteOrder => {
             let label = if doc.has_saved_cut_order() {
@@ -1026,6 +1027,29 @@ fn render_profiles_tab(
                             if ui.add(restore_btn).on_hover_text("Restore previously saved cutting order for this table layout").clicked() {
                                 state.pending_sort_action = Some(PendingSortAction::RestoreSavedOrder);
                             }
+                        }
+                    }
+
+                    let can_undo_sort = !canvas_state.sort_undo_stack.is_empty();
+                    let undo_sort_btn = Button::new(
+                        RichText::new("↩ Undo Index")
+                            .size(11.0)
+                            .color(if can_undo_sort {
+                                Color32::from_rgb(255, 210, 120)
+                            } else {
+                                Color32::from_rgb(115, 120, 130)
+                            })
+                            .strong(),
+                    )
+                    .fill(Color32::from_rgb(42, 38, 30))
+                    .min_size(Vec2::new(84.0, 19.0));
+                    if ui
+                        .add_enabled(can_undo_sort, undo_sort_btn)
+                        .on_hover_text("Undo only the last cut-index / sorting change (does not affect geometry or positions)")
+                        .clicked()
+                    {
+                        if canvas_state.pop_sort_undo(doc) {
+                            *status_message = "Undid last cut-index change.".to_string();
                         }
                     }
                 });

@@ -135,6 +135,15 @@ pub struct PathContextMenu {
     pub path_index_1based: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct SortSnapshot {
+    pub sort_mode: tzlaser_core::SortMode,
+    pub manual_sequence: Vec<(usize, usize, Option<usize>)>,
+    pub saved_cut_order: Vec<(usize, usize, Option<usize>)>,
+    pub use_saved_cut_order: bool,
+    pub manual_sort_next_index: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawTool {
     None,
@@ -165,6 +174,7 @@ pub struct CanvasState {
     pub color_palette: ColorPalette,
     pub manual_sort_active: bool,
     pub manual_sort_next_index: usize,
+    pub sort_undo_stack: Vec<SortSnapshot>,
     pub last_viewport_size: Vec2,
     pub context_menu: Option<PathContextMenu>,
     pub pending_continue_from_point: Option<Point>,
@@ -197,6 +207,7 @@ impl Default for CanvasState {
             color_palette: ColorPalette::Rainbow,
             manual_sort_active: false,
             manual_sort_next_index: 1,
+            sort_undo_stack: Vec::new(),
             last_viewport_size: Vec2::new(800.0, 600.0),
             context_menu: None,
             pending_continue_from_point: None,
@@ -210,6 +221,32 @@ impl Default for CanvasState {
 }
 
 impl CanvasState {
+    pub fn push_sort_undo(&mut self, doc: &Document) {
+        self.sort_undo_stack.push(SortSnapshot {
+            sort_mode: doc.sort_mode,
+            manual_sequence: doc.manual_sequence.clone(),
+            saved_cut_order: doc.saved_cut_order.clone(),
+            use_saved_cut_order: doc.use_saved_cut_order,
+            manual_sort_next_index: self.manual_sort_next_index,
+        });
+        if self.sort_undo_stack.len() > 100 {
+            self.sort_undo_stack.remove(0);
+        }
+    }
+
+    pub fn pop_sort_undo(&mut self, doc: &mut Document) -> bool {
+        if let Some(snap) = self.sort_undo_stack.pop() {
+            doc.sort_mode = snap.sort_mode;
+            doc.manual_sequence = snap.manual_sequence;
+            doc.saved_cut_order = snap.saved_cut_order;
+            doc.use_saved_cut_order = snap.use_saved_cut_order;
+            self.manual_sort_next_index = snap.manual_sort_next_index;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn fit_view_to_doc(&mut self, doc: &Document) {
         let bounds = doc.bounding_box().unwrap_or_else(|| {
             kurbo::Rect::new(0.0, 0.0, self.bed_width_mm as f64, self.bed_height_mm as f64)
@@ -878,9 +915,10 @@ pub fn render_canvas(
 
             if state.manual_sort_active {
                 // Interactive Manual Sort Mode: single-path selection & assign next cut index
-                if let Some((l_idx, e_idx)) = doc.hit_test(press_world, tolerance_mm) {
+                if let Some((l_idx, e_idx, c_idx)) = doc.hit_test_path(press_world, tolerance_mm) {
                     history.record(doc, selection, "Manual Cut Order");
-                    doc.assign_manual_cut_index(l_idx, e_idx, state.manual_sort_next_index);
+                    state.push_sort_undo(doc);
+                    doc.assign_manual_cut_index(l_idx, e_idx, c_idx, state.manual_sort_next_index);
                     state.manual_sort_next_index += 1;
                     selection.clear();
                     selection.push((l_idx, e_idx));
@@ -964,8 +1002,16 @@ pub fn render_canvas(
                         if sel_rect.intersect(eb).area() > 0.0 || sel_rect.contains(eb.origin()) {
                             if state.manual_sort_active {
                                 // In manual sort mode, marquee selection allows only single path selection
+                                let c_idx = match ent {
+                                    Entity::Group { children } => children.iter().position(|c| {
+                                        let cb = c.bounding_box();
+                                        sel_rect.intersect(cb).area() > 0.0 || sel_rect.contains(cb.origin())
+                                    }),
+                                    _ => None,
+                                };
                                 history.record(doc, selection, "Manual Cut Order");
-                                doc.assign_manual_cut_index(l_idx, e_idx, state.manual_sort_next_index);
+                                state.push_sort_undo(doc);
+                                doc.assign_manual_cut_index(l_idx, e_idx, c_idx, state.manual_sort_next_index);
                                 state.manual_sort_next_index += 1;
                                 selection.clear();
                                 selection.push((l_idx, e_idx));
