@@ -22,13 +22,34 @@ pub const DEFAULT_Z_JOG_SPEED: u32 = 50;
 
 /// Wireless remote control button bitmasks reported by the controller board in `R1042` (`regs[42]`)
 /// (`RegName43` = LCR real-time key value) and mirrored in `R1043` (`regs[43]`, `RegName44` = LCR matched code value).
+/// Extracted from SC2000 `MainApp.exe` key table at VA `0x006C1300`.
 pub mod remote_buttons {
-    pub const X_MINUS: u32 = 0x0000_0002; // Bit 1 (2): Jog X-
-    pub const Y_MINUS: u32 = 0x0000_0100; // Bit 8 (256): Jog Y-
-    pub const Y_PLUS: u32 = 0x0000_0400;  // Bit 10 (1024): Jog Y+
-    pub const Z_MINUS: u32 = 0x0001_0000; // Bit 16 (65536): Jog Z- (lower head)
-    pub const X_PLUS: u32 = 0x0002_0000;  // Bit 17 (131072): Jog X+
-    pub const Z_PLUS: u32 = 0x0004_0000;  // Bit 18 (262144): Jog Z+ (raise head toward upper limit)
+    pub const W_MINUS: u32 = 0x0000_0001;   // Bit 0: Jog W-
+    pub const X_MINUS: u32 = 0x0000_0002;   // Bit 1: Jog X-
+    pub const W_PLUS: u32 = 0x0000_0004;    // Bit 2: Jog W+
+    pub const START: u32 = 0x0000_0008;     // Bit 3: Start
+    pub const SPEED: u32 = 0x0000_0010;     // Bit 4: Fast/Slow speed toggle
+    pub const FRAME: u32 = 0x0000_0020;     // Bit 5: Frame / Border trace
+    pub const GUIDE: u32 = 0x0000_0040;     // Bit 6: Red light / Guide laser
+    pub const Y_MINUS: u32 = 0x0000_0100;   // Bit 8: Jog Y-
+    pub const Y_PLUS: u32 = 0x0000_0400;    // Bit 10: Jog Y+
+    pub const PAUSE: u32 = 0x0000_0800;     // Bit 11: Pause
+    pub const STEP_MODE: u32 = 0x0000_1000; // Bit 12: Step / Continuous mode
+    pub const GAS: u32 = 0x0000_4000;       // Bit 14: Assist gas blow
+    pub const Z_MINUS: u32 = 0x0001_0000;   // Bit 16: Jog Z- (lower head)
+    pub const X_PLUS: u32 = 0x0002_0000;    // Bit 17: Jog X+
+    pub const Z_PLUS: u32 = 0x0004_0000;    // Bit 18: Jog Z+ (raise head toward upper limit)
+    pub const STOP: u32 = 0x0008_0000;      // Bit 19: Stop
+    pub const ZERO: u32 = 0x0010_0000;      // Bit 20: Return to Zero
+    pub const FN_MOD: u32 = 0x0020_0000;    // Bit 21: Fn modifier flag
+    pub const FOLLOW: u32 = 0x0040_0000;    // Bit 22: Capacitive follower toggle
+    pub const CLEAR: u32 = 0x0080_0000;     // Bit 23: Clear
+    pub const STEP_FLAG: u32 = 0x0100_0000; // Bit 24: Remote step mode state flag
+    pub const FAST_FLAG: u32 = 0x0200_0000; // Bit 25: Remote fast speed state flag
+    pub const ORIGIN: u32 = 0x1000_0000;    // Bit 28: Return to Origin
+    pub const PULSE: u32 = 0x4000_0000;     // Bit 30: Laser Burst / Pulse
+    /// Sticky modifier/mode state bits in the upper byte of R1042 that may remain set when no action key is held.
+    pub const STICKY_FLAGS: u32 = STEP_FLAG | FAST_FLAG | FN_MOD;
 }
 
 /// Decode a wireless remote control button bitmask (`R1042`) into a continuous jog `(Axis, direction)`.
@@ -45,6 +66,10 @@ pub fn decode_remote_jog(mask: u32) -> Option<(Axis, i32)> {
         Some((Axis::Z, -1))
     } else if (mask & remote_buttons::Z_PLUS) != 0 {
         Some((Axis::Z, 1))
+    } else if (mask & remote_buttons::W_MINUS) != 0 {
+        Some((Axis::W, -1))
+    } else if (mask & remote_buttons::W_PLUS) != 0 {
+        Some((Axis::W, 1))
     } else {
         None
     }
@@ -52,15 +77,49 @@ pub fn decode_remote_jog(mask: u32) -> Option<(Axis, i32)> {
 
 /// Format a human-readable label for the active wireless remote control button bitmask (`R1042`).
 pub fn format_remote_button(mask: u32) -> String {
-    if mask == 0 {
+    let key = mask & !remote_buttons::STICKY_FLAGS;
+    if key == 0 {
         return "Idle".to_string();
     }
-    if let Some((axis, dir)) = decode_remote_jog(mask) {
+    if let Some((axis, dir)) = decode_remote_jog(key) {
         let sign = if dir >= 0 { "+" } else { "-" };
-        format!("Jog {:?}{} (0x{:X})", axis, sign, mask)
-    } else {
-        format!("Key 0x{:X}", mask)
+        let speed_tag = if (mask & remote_buttons::FAST_FLAG) != 0 {
+            " [Fast]"
+        } else {
+            ""
+        };
+        return format!("Jog {:?}{}{} (0x{:X})", axis, sign, speed_tag, key);
     }
+    let name = if (key & remote_buttons::START) != 0 {
+        "Start"
+    } else if (key & remote_buttons::PAUSE) != 0 {
+        "Pause"
+    } else if (key & remote_buttons::STOP) != 0 {
+        "Stop"
+    } else if (key & remote_buttons::FRAME) != 0 {
+        "Frame"
+    } else if (key & remote_buttons::SPEED) != 0 {
+        "Speed"
+    } else if (key & remote_buttons::STEP_MODE) != 0 {
+        "Step/Cont"
+    } else if (key & remote_buttons::GUIDE) != 0 {
+        "Guide Laser"
+    } else if (key & remote_buttons::GAS) != 0 {
+        "Gas Blow"
+    } else if (key & remote_buttons::ZERO) != 0 {
+        "Return Zero"
+    } else if (key & remote_buttons::ORIGIN) != 0 {
+        "Return Origin"
+    } else if (key & remote_buttons::FOLLOW) != 0 {
+        "Follower"
+    } else if (key & remote_buttons::PULSE) != 0 {
+        "Laser Pulse"
+    } else if (key & remote_buttons::CLEAR) != 0 {
+        "Clear"
+    } else {
+        "Key"
+    };
+    format!("{} (0x{:X})", name, key)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +304,22 @@ pub fn build_init_packets(mut seq_gen: impl FnMut() -> u16) -> Vec<Packet> {
         Packet::write_request(seq_gen(), 1304, vec![471_568]),
         Packet::write_request(seq_gen(), 1244, vec![24823]),
         Packet::write_request(seq_gen(), 1248, vec![0]),
+        // Initialize hardware soft limits R1063..R1070 (addr = 1252, 8 DWORDs: X+, X-, Y1+, Y1-, Y2+, Y2-, W+, W-)
+        // to unbounded [+MAX, -MAX] (matching SC2000 Frame 953) so ±472,000 continuous & remote jogs are never blocked.
+        Packet::write_request(
+            seq_gen(),
+            1252,
+            vec![
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x8000_0000,
+            ],
+        ),
         Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![1]),
         Packet::write_request(seq_gen(), 1308, vec![16680]),
         Packet::write_request(seq_gen(), 1332, vec![1]),
@@ -476,6 +551,9 @@ mod tests {
         assert_eq!(decode_remote_jog(0x0000_0400), Some((Axis::Y, 1)));
         assert_eq!(decode_remote_jog(0x0001_0000), Some((Axis::Z, -1)));
         assert_eq!(decode_remote_jog(0x0004_0000), Some((Axis::Z, 1)));
+        assert_eq!(format_remote_button(0x0000_0020), "Frame (0x20)");
+        assert_eq!(format_remote_button(0x0100_0000), "Idle");
+        assert_eq!(format_remote_button(0x0202_0000), "Jog X+ [Fast] (0x20000)");
     }
 }
 

@@ -51,6 +51,7 @@ pub struct PanelState {
     pub new_mat_name: String,
     pub new_mat_material: String,
     pub new_mat_thickness: f64,
+    pub last_remote_button_mask: u32,
 }
 
 impl Default for PanelState {
@@ -79,6 +80,7 @@ impl Default for PanelState {
             new_mat_name: String::new(),
             new_mat_material: "Mild Steel".to_string(),
             new_mat_thickness: 2.0,
+            last_remote_button_mask: 0,
         }
     }
 }
@@ -951,26 +953,47 @@ pub fn render_right_panels(
                 if is_connected {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("🎮 Remote:").size(11.5).strong());
-                        let lcr_id = status.raw_registers.get(41).copied().unwrap_or(0);
-                        if status.remote_button_mask != 0 {
+                        let r1041 = status.raw_registers.get(41).copied().unwrap_or(0);
+                        let r1092 = status.raw_registers.get(92).copied().unwrap_or(0);
+                        let lcr_id = if r1041 != 0 { r1041 } else { r1092 };
+                        let active_key_mask = status.remote_button_mask
+                            & !tzlaser_protocol::remote_buttons::STICKY_FLAGS;
+                        if active_key_mask != 0 {
+                            panel_state.last_remote_button_mask = status.remote_button_mask;
                             ui.label(
-                                RichText::new(format!("● {}", format_remote_button(status.remote_button_mask)))
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(0, 235, 160))
-                                    .strong(),
+                                RichText::new(format!(
+                                    "● {}",
+                                    format_remote_button(status.remote_button_mask)
+                                ))
+                                .size(11.5)
+                                .color(Color32::from_rgb(0, 235, 160))
+                                .strong(),
                             );
                         } else if lcr_id != 0 {
+                            let label_text = if panel_state.last_remote_button_mask != 0 {
+                                format!(
+                                    "Linked (ID {:08X}) · Last: {}",
+                                    lcr_id,
+                                    format_remote_button(panel_state.last_remote_button_mask)
+                                )
+                            } else {
+                                format!("Linked (ID {:08X}) · Ready", lcr_id)
+                            };
                             ui.label(
-                                RichText::new(format!("Linked (ID {:08X}) · Ready", lcr_id))
+                                RichText::new(label_text)
                                     .size(11.0)
                                     .color(Color32::from_rgb(130, 225, 165)),
                             );
                         } else {
-                            ui.label(
-                                RichText::new("Ready (Listening R1042/R1043)")
-                                    .size(11.0)
-                                    .weak(),
-                            );
+                            let label_text = if panel_state.last_remote_button_mask != 0 {
+                                format!(
+                                    "Ready · Last: {}",
+                                    format_remote_button(panel_state.last_remote_button_mask)
+                                )
+                            } else {
+                                "Ready (Listening R1042/R1043)".to_string()
+                            };
+                            ui.label(RichText::new(label_text).size(11.0).weak());
                         }
                     });
                 }

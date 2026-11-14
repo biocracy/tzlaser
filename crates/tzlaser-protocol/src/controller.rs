@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use crate::motion::{
     build_init_packets, build_initial_enable_packets, build_jog_packet, build_stop_packets,
     build_z_handshake_packets, build_z_jog_packet, build_z_poll_packet, build_z_stop_packet,
-    decode_remote_jog, decode_z_poll_response, registers, Axis, JogConfig, MachineStatus,
-    CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
+    decode_remote_jog, decode_z_poll_response, registers, remote_buttons, Axis, JogConfig,
+    MachineStatus, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
 
@@ -82,6 +82,9 @@ impl LaserController {
             let mut active_step_watch: Option<(Axis, i32, i32)> = None;
             let mut active_z_step_watch: Option<(i32, i32, Instant)> = None;
             let mut active_remote_jog: Option<(Axis, i32)> = None;
+            let mut remote_jog_started_at: Option<Instant> = None;
+            let mut pending_remote_stop_at: Option<Instant> = None;
+            let mut prev_remote_mask: u32 = 0;
 
             // Helper to send a Port 502 packet and wait briefly for its ACK during initialization
             let send_and_wait_ack = |sock: &UdpSocket, pkt: &Packet, recv_buf: &mut [u8]| -> bool {
@@ -89,7 +92,7 @@ impl LaserController {
                     return false;
                 }
                 let deadline = Instant::now() + Duration::from_millis(25);
-                while Instant::now() < deadline {
+                while Instant::now() < deadline && running_clone.load(Ordering::Relaxed) {
                     if let Ok((n, src)) = sock.recv_from(recv_buf) {
                         if src == target_addr {
                             if let Ok(resp) = Packet::decode(&recv_buf[..n]) {
@@ -114,7 +117,7 @@ impl LaserController {
                     let _ = zs.send_to(cmd_bytes, z_target_addr);
                     let deadline = Instant::now() + Duration::from_millis(28);
                     let mut retry_after_poll = false;
-                    while Instant::now() < deadline {
+                    while Instant::now() < deadline && running_clone.load(Ordering::Relaxed) {
                         if let Ok((n, src)) = zs.recv_from(recv_buf) {
                             if src == z_target_addr {
                                 if n >= 8 && recv_buf[0] == 0x01 && recv_buf[1] == 0x10 {
@@ -139,15 +142,41 @@ impl LaserController {
                 }
             };
 
-            // Send initial enable sequence on Port 502 and spaced handshake on Port 999
+            // Send initial enable sequence on Port 502 and run full SC2000 board initialization
+            // right away if Port 502 responds, so `ReadRegisters(1000, 144)` responses in the main loop
+            // are never swallowed by `send_and_wait_ack`.
+            let mut port502_ack = false;
             for pkt in build_initial_enable_packets(|| seq_clone.fetch_add(1, Ordering::Relaxed)) {
-                let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
+                if !running_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                if send_and_wait_ack(&socket, &pkt, &mut buf) {
+                    port502_ack = true;
+                }
+            }
+            if port502_ack && running_clone.load(Ordering::Relaxed) {
+                log::info!(
+                    "Controller online at {}; running SC2000 board initialization sequence...",
+                    target_addr
+                );
+                for init_pkt in build_init_packets(|| seq_clone.fetch_add(1, Ordering::Relaxed)) {
+                    if !running_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = send_and_wait_ack(&socket, &init_pkt, &mut buf);
+                }
+                board_initialized = true;
+                connected_clone.store(true, Ordering::Relaxed);
+                log::info!("Controller initialization sequence complete.");
             }
             if let Some(ref zs) = z_socket {
                 for raw in build_z_handshake_packets() {
+                    if !running_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let _ = zs.send_to(&raw, z_target_addr);
                     let deadline = Instant::now() + Duration::from_millis(22);
-                    while Instant::now() < deadline {
+                    while Instant::now() < deadline && running_clone.load(Ordering::Relaxed) {
                         if let Ok((n, src)) = zs.recv_from(&mut z_buf) {
                             if src == z_target_addr {
                                 if let Some((pos_z, raw_cap, state_code)) =
@@ -177,6 +206,21 @@ impl LaserController {
                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                         let p2 = Packet::write_request(s, registers::REG_COMMAND, vec![2]);
                         let _ = socket.send_to(&p2.encode(), target_addr);
+                    }
+                }
+
+                // Check scheduled delayed remote stop (ensures brief remote button taps move for at least 150ms)
+                if let Some(t_rem_stop) = pending_remote_stop_at {
+                    if Instant::now() >= t_rem_stop {
+                        pending_remote_stop_at = None;
+                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                        let p1 = Packet::write_request(
+                            s,
+                            registers::REG_JOG_RAMP,
+                            vec![118_000, 1_180_000],
+                        );
+                        let _ = socket.send_to(&p1.encode(), target_addr);
+                        pending_stop_p2_at = Some(Instant::now() + Duration::from_millis(140));
                     }
                 }
 
@@ -434,8 +478,17 @@ impl LaserController {
                             for init_pkt in build_init_packets(|| {
                                 seq_clone.fetch_add(1, Ordering::Relaxed)
                             }) {
+                                if !running_clone.load(Ordering::Relaxed) {
+                                    break;
+                                }
                                 let _ = send_and_wait_ack(&socket, &init_pkt, &mut buf);
                             }
+                            // Request a fresh 144-register status poll immediately after initialization
+                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let poll_pkt =
+                                Packet::read_request(s, registers::REG_STATUS_BASE, 144);
+                            let _ = socket.send_to(&poll_pkt.encode(), target_addr);
+                            last_poll = Instant::now();
                             log::info!("Controller initialization sequence complete.");
                         }
 
@@ -443,15 +496,74 @@ impl LaserController {
                             && pkt.addr == registers::REG_STATUS_BASE
                             && pkt.data.len() >= 24
                         {
+                            // Ensure hardware soft limits R1063..R1070 (addr = 1252) remain unbounded
+                            // ([0x7FFFFFFF, 0x80000000, ...]) so ±472,000 continuous & remote jogs are never blocked.
+                            if pkt.data.len() > 68
+                                && (pkt.data[63] != 0x7FFF_FFFF
+                                    || pkt.data[64] != 0x8000_0000
+                                    || pkt.data[65] != 0x7FFF_FFFF
+                                    || pkt.data[66] != 0x8000_0000)
+                            {
+                                let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let sl_pkt = Packet::write_request(
+                                    s,
+                                    1252,
+                                    vec![
+                                        0x7FFF_FFFF,
+                                        0x8000_0000,
+                                        0x7FFF_FFFF,
+                                        0x8000_0000,
+                                        0x7FFF_FFFF,
+                                        0x8000_0000,
+                                        0x7FFF_FFFF,
+                                        0x8000_0000,
+                                    ],
+                                );
+                                let _ = socket.send_to(&sl_pkt.encode(), target_addr);
+                            }
+
                             let mut new_st = MachineStatus::from_status_registers(&pkt.data);
                             if z_status_seen {
                                 new_st.apply_z_status(latest_z.0, latest_z.1, latest_z.2);
                             }
 
-                            // 5A. Wireless Remote Control (`R1042` / `R1043`) Continuous Jog Dispatch
+                            // 5A. Wireless Remote Control (`R1042` / `R1043`) Button & Continuous Jog Dispatch
                             // The wireless remote is paired to the controller board, which exposes the
                             // pressed button bitmask in `R1042` and `R1043`. The PC software watches this
                             // bitmask and sends the corresponding X/Y (Port 502) or Z (Port 999) jog & stop packets.
+                            let rising_mask = new_st.remote_button_mask & !prev_remote_mask;
+                            prev_remote_mask = new_st.remote_button_mask;
+
+                            if (rising_mask & remote_buttons::STOP) != 0 {
+                                auto_stop_at = None;
+                                active_step_watch = None;
+                                active_z_step_watch = None;
+                                active_remote_jog = None;
+                                pending_remote_stop_at = None;
+                                let (p1, _p2) = build_stop_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                });
+                                let _ = socket.send_to(&p1.encode(), target_addr);
+                                pending_stop_p2_at =
+                                    Some(Instant::now() + Duration::from_millis(140));
+                                if let Some(ref zs) = z_socket {
+                                    let raw_stop = build_z_stop_packet();
+                                    send_z_cmd_with_ack(
+                                        zs,
+                                        &raw_stop,
+                                        &mut z_buf,
+                                        &mut z_status_seen,
+                                        &mut latest_z,
+                                    );
+                                    last_z_poll = Instant::now() - Duration::from_secs(1);
+                                }
+                            } else if (rising_mask & remote_buttons::GUIDE) != 0 {
+                                let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let next_red = if new_st.red_pointer_on { 0 } else { 1 };
+                                let pkt_red = Packet::write_request(s, 2050, vec![next_red]);
+                                let _ = socket.send_to(&pkt_red.encode(), target_addr);
+                            }
+
                             let remote_jog = decode_remote_jog(new_st.remote_button_mask);
                             if remote_jog != active_remote_jog {
                                 // Stop previous remote jog if one was active
@@ -469,21 +581,36 @@ impl LaserController {
                                             last_z_poll = Instant::now() - Duration::from_secs(1);
                                         }
                                     } else {
-                                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                        let p1 = Packet::write_request(
-                                            s,
-                                            registers::REG_JOG_RAMP,
-                                            vec![118_000, 1_180_000],
-                                        );
-                                        let _ = socket.send_to(&p1.encode(), target_addr);
-                                        pending_stop_p2_at =
-                                            Some(Instant::now() + Duration::from_millis(140));
+                                        // If the user tapped a remote XY button very briefly (< 150ms) and released to Idle,
+                                        // schedule the stop ramp at started_at + 150ms so short taps still move a clean step.
+                                        let min_tap_window = Duration::from_millis(150);
+                                        if remote_jog.is_none()
+                                            && remote_jog_started_at
+                                                .map_or(false, |t0| t0.elapsed() < min_tap_window)
+                                        {
+                                            pending_remote_stop_at = Some(
+                                                remote_jog_started_at.unwrap() + min_tap_window,
+                                            );
+                                        } else {
+                                            pending_remote_stop_at = None;
+                                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                            let p1 = Packet::write_request(
+                                                s,
+                                                registers::REG_JOG_RAMP,
+                                                vec![118_000, 1_180_000],
+                                            );
+                                            let _ = socket.send_to(&p1.encode(), target_addr);
+                                            pending_stop_p2_at =
+                                                Some(Instant::now() + Duration::from_millis(140));
+                                        }
                                     }
                                 }
 
-                                // Start new remote jog if a button is now held
+                                // Start new remote jog if a directional button is now held
                                 if let Some((axis, dir)) = remote_jog {
                                     active_remote_jog = Some((axis, dir));
+                                    remote_jog_started_at = Some(Instant::now());
+                                    pending_remote_stop_at = None;
                                     if axis == Axis::Z {
                                         if let Some(ref zs) = z_socket {
                                             let raw = build_z_jog_packet(
@@ -513,12 +640,34 @@ impl LaserController {
                                             let _ = send_and_wait_ack(&socket, &p2, &mut buf);
                                             thread::sleep(Duration::from_millis(25));
                                         }
+                                        // Matching SC2000 Frame 957 ([5900, 5900, 59000]), wireless remote XY jogs
+                                        // start directly at jog_speed (min_speed == jog_speed) so there is no lag,
+                                        // and scale up when the remote's Fast flag (0x0200_0000) is active.
+                                        let is_fast = (new_st.remote_button_mask
+                                            & remote_buttons::FAST_FLAG)
+                                            != 0;
+                                        let base_speed = jog_cfg.jog_speed.max(3000);
+                                        let rem_speed = if is_fast {
+                                            base_speed.saturating_mul(2)
+                                        } else {
+                                            base_speed
+                                        };
+                                        let rem_accel = if is_fast {
+                                            jog_cfg.accel.max(30000).saturating_mul(2)
+                                        } else {
+                                            jog_cfg.accel.max(30000)
+                                        };
+                                        let rem_jog_cfg = JogConfig {
+                                            min_speed: rem_speed,
+                                            jog_speed: rem_speed,
+                                            accel: rem_accel,
+                                        };
                                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                                         let pkt = build_jog_packet(
                                             s,
                                             axis,
                                             dir * CONTINUOUS_JOG_PULSES_XY,
-                                            &jog_cfg,
+                                            &rem_jog_cfg,
                                         );
                                         let _ = socket.send_to(&pkt.encode(), target_addr);
                                     }
@@ -563,9 +712,11 @@ impl LaserController {
                             {
                                 z_status_seen = true;
                                 latest_z = (pos_z, raw_cap, state_code);
-                                connected_clone.store(true, Ordering::Relaxed);
                                 let mut st = status_clone.lock().unwrap();
-                                st.is_connected = true;
+                                if board_initialized {
+                                    connected_clone.store(true, Ordering::Relaxed);
+                                    st.is_connected = true;
+                                }
                                 st.apply_z_status(pos_z, raw_cap, state_code);
                             }
                         }
@@ -645,6 +796,9 @@ impl LaserController {
 impl Drop for LaserController {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(worker) = self._worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
