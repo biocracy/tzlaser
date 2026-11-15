@@ -3,7 +3,8 @@ use crate::packet::Packet;
 
 /// Registers discovered from Wireshark captures of TZLASER (Port 502)
 pub mod registers {
-    pub const REG_COMMAND: u32 = 104;      // 0x0068: 2 = Stop/Cancel, 3 = Init
+    pub const REG_FIFO_DATA: u32 = 100;    // 0x0064: Motion FIFO stream [fifo_seq, (tick_word0, tick_word1)...]
+    pub const REG_COMMAND: u32 = 104;      // 0x0068: 1 = Start FIFO, 2 = Stop/Cancel, 3 = Init, 4 = FIFO Run/End
     pub const REG_MODE_CTRL: u32 = 108;    // 0x006C: 2 DWORDs mode/reset flags
     pub const REG_HOME_CMD: u32 = 112;     // 0x0070: 9 DWORDs XY homing parameters & trigger
     pub const REG_JOG_MOTION: u32 = 116;   // 0x0074: 7 DWORDs [vmin, vjog, accel, dx, dy, dz, dw]
@@ -453,6 +454,51 @@ pub fn build_xy_move_packet(seq: u16, dx: i32, dy: i32, config: &JogConfig) -> P
         0,
     ];
     Packet::write_request(seq, registers::REG_JOG_MOTION, payload)
+}
+
+/// Pack a single 1 ms FIFO motion tick `[dx, dy, dz, flags]` into a little-endian `u32`.
+pub fn encode_fifo_tick(dx: i8, dy: i8, dz: i8, flags: u8) -> u32 {
+    u32::from_le_bytes([dx as u8, dy as u8, dz as u8, flags])
+}
+
+/// Build a Port 502 Motion FIFO packet (`REG_FIFO_DATA = 100`) containing up to 60 1-ms ticks.
+pub fn build_fifo_packet(seq: u16, fifo_seq: u32, ticks: &[(i8, i8, u8)]) -> Packet {
+    let mut payload = Vec::with_capacity(1 + ticks.len() * 2);
+    payload.push(fifo_seq);
+    for &(dx, dy, flags) in ticks {
+        payload.push(encode_fifo_tick(dx, dy, 0, flags));
+        payload.push(0);
+    }
+    Packet::write_request(seq, registers::REG_FIFO_DATA, payload)
+}
+
+/// Build the Port 502 setup sequence to enter continuous Motion FIFO mode (`REG_FIFO_DATA = 100`).
+pub fn build_fifo_start_packets(
+    mut seq_gen: impl FnMut() -> u16,
+    pos_x: i32,
+    pos_y: i32,
+) -> Vec<Packet> {
+    let px = pos_x as u32;
+    let py = pos_y as u32;
+    vec![
+        Packet::write_request(seq_gen(), 1388, vec![px, py, px, py]),
+        Packet::write_request(seq_gen(), 1376, vec![0xFFFF_FFFF]),
+        Packet::write_request(seq_gen(), 1244, vec![24820]),
+        Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![2]),
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![3]),
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![1]),
+        Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![3]),
+    ]
+}
+
+/// Build the Port 502 teardown sequence after all FIFO ticks have finished executing.
+pub fn build_fifo_finish_packets(mut seq_gen: impl FnMut() -> u16) -> Vec<Packet> {
+    vec![
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![4]),
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![2]),
+        Packet::write_request(seq_gen(), 1344, vec![0]),
+        Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![1]),
+    ]
 }
 
 /// Build packets to stop motion on Port 502 (`p1` = deceleration ramp, `p2` = stop command 2).

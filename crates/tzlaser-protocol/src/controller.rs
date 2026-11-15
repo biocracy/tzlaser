@@ -5,12 +5,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::motion::{
-    build_init_packets, build_initial_enable_packets, build_jog_packet, build_stop_packets,
-    build_xy_home_packets, build_xy_move_packet, build_z_handshake_packets, build_z_home_packet,
-    build_z_jog_packet, build_z_poll_packet, build_z_stop_packet, decode_remote_jog,
-    decode_z_homed_from_poll, decode_z_poll_response, decode_z_sensors_from_poll, registers,
-    remote_buttons, Axis, HomeConfig, JogConfig, MachineStatus, CONTINUOUS_JOG_PULSES_XY,
-    CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
+    build_fifo_finish_packets, build_fifo_packet, build_fifo_start_packets, build_init_packets,
+    build_initial_enable_packets, build_jog_packet, build_stop_packets, build_xy_home_packets,
+    build_xy_move_packet, build_z_handshake_packets, build_z_home_packet, build_z_jog_packet,
+    build_z_poll_packet, build_z_stop_packet, decode_remote_jog, decode_z_homed_from_poll,
+    decode_z_poll_response, decode_z_sensors_from_poll, registers, remote_buttons, Axis,
+    HomeConfig, JogConfig, MachineStatus, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z,
+    DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
 
@@ -18,6 +19,7 @@ pub enum Command {
     Jog { axis: Axis, pulses: i32 },
     JogWithConfig { axis: Axis, pulses: i32, config: JogConfig, auto_stop: bool },
     MoveXY { dx: i32, dy: i32, config: JogConfig },
+    StartFifoStream { ticks: Vec<(i8, i8, u8)> },
     StartContinuousJog { axis: Axis, direction: i32 },
     Stop,
     HomeAll(HomeConfig),
@@ -92,7 +94,19 @@ impl LaserController {
             let mut pending_remote_stop_at: Option<Instant> = None;
             let mut prev_remote_mask: u32 = 0;
             let mut last_r1004: u32 = 0;
+            let mut last_r1006: u32 = 8000;
+            let mut last_r1022: u32 = 0;
             let mut pending_xy_home_after_z: Option<(HomeConfig, Instant, Instant)> = None;
+            struct FifoStreamState {
+                ticks: Vec<(i8, i8, u8)>,
+                cursor: usize,
+                fifo_seq: u32,
+                estimated_free: u32,
+                started_at: Instant,
+                sent_run_flag: bool,
+                seen_moving: bool,
+            }
+            let mut active_fifo: Option<FifoStreamState> = None;
 
             // Helper to send a Port 502 packet and wait briefly for its ACK during initialization
             let send_and_wait_ack = |sock: &UdpSocket, pkt: &Packet, recv_buf: &mut [u8]| -> bool {
@@ -440,6 +454,45 @@ impl LaserController {
                             let pkt = build_xy_move_packet(s, dx, dy, &config);
                             let _ = socket.send_to(&pkt.encode(), target_addr);
                         }
+                        Command::StartFifoStream { ticks } => {
+                            if ticks.is_empty() {
+                                continue;
+                            }
+                            pending_xy_home_after_z = None;
+                            auto_stop_at = None;
+                            active_step_watch = None;
+                            active_remote_jog = None;
+                            if pending_stop_p2_at.take().is_some() {
+                                let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let p2 = Packet::write_request(
+                                    s_rst,
+                                    registers::REG_COMMAND,
+                                    vec![2],
+                                );
+                                let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                thread::sleep(Duration::from_millis(25));
+                            }
+                            let (px, py) = {
+                                let st = status_clone.lock().unwrap();
+                                (st.pos_x, st.pos_y)
+                            };
+                            for spkt in build_fifo_start_packets(
+                                || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                px,
+                                py,
+                            ) {
+                                let _ = send_and_wait_ack(&socket, &spkt, &mut buf);
+                            }
+                            active_fifo = Some(FifoStreamState {
+                                ticks,
+                                cursor: 0,
+                                fifo_seq: last_r1022.wrapping_add(1),
+                                estimated_free: 8000,
+                                started_at: Instant::now(),
+                                sent_run_flag: false,
+                                seen_moving: false,
+                            });
+                        }
                         Command::StartContinuousJog { axis, direction } => {
                             let sign = if direction >= 0 { 1 } else { -1 };
                             if axis == Axis::Z {
@@ -496,6 +549,7 @@ impl LaserController {
                             active_z_step_watch = None;
                             active_remote_jog = None;
                             pending_xy_home_after_z = None;
+                            active_fifo = None;
                             let (p1, _p2) = build_stop_packets(|| {
                                 seq_clone.fetch_add(1, Ordering::Relaxed)
                             });
@@ -710,6 +764,14 @@ impl LaserController {
                             && pkt.data.len() >= 24
                         {
                             last_r1004 = pkt.data.get(4).copied().unwrap_or(0);
+                            last_r1006 = pkt.data.get(6).copied().unwrap_or(last_r1006);
+                            last_r1022 = pkt.data.get(22).copied().unwrap_or(last_r1022);
+                            if let Some(ref mut fifo) = active_fifo {
+                                fifo.estimated_free = last_r1006;
+                                if pkt.data.get(7).copied().unwrap_or(0) != 0 {
+                                    fifo.seen_moving = true;
+                                }
+                            }
                             // Ensure hardware soft limits R1063..R1070 (addr = 1252) remain unbounded
                             // ([0x7FFFFFFF, 0x80000000, ...]) so ±472,000 continuous & remote jogs are never blocked.
                             if pkt.data.get(5).copied().unwrap_or(0) != 1
@@ -1000,6 +1062,61 @@ impl LaserController {
                         }
                     }
                 }
+
+                // 8. Stream 1-ms Motion FIFO ticks (`REG_FIFO_DATA = 100`) when active
+                if let Some(mut fifo) = active_fifo.take() {
+                    let mut sent_this_iter = 0;
+                    while fifo.cursor < fifo.ticks.len()
+                        && fifo.estimated_free > 120
+                        && sent_this_iter < 16
+                    {
+                        let avail = (fifo.estimated_free - 60) as usize;
+                        let take = (fifo.ticks.len() - fifo.cursor).min(60).min(avail);
+                        if take == 0 {
+                            break;
+                        }
+                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                        let pkt = build_fifo_packet(
+                            s,
+                            fifo.fifo_seq,
+                            &fifo.ticks[fifo.cursor..fifo.cursor + take],
+                        );
+                        let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
+                        fifo.cursor += take;
+                        fifo.fifo_seq = fifo.fifo_seq.wrapping_add(1);
+                        fifo.estimated_free = fifo.estimated_free.saturating_sub(take as u32);
+                        sent_this_iter += 1;
+                    }
+
+                    if !fifo.sent_run_flag
+                        && (fifo.cursor >= fifo.ticks.len() || fifo.estimated_free < 500)
+                    {
+                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                        let pkt = Packet::write_request(s, registers::REG_COMMAND, vec![4]);
+                        let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
+                        fifo.sent_run_flag = true;
+                    }
+
+                    let is_moving_now = status_clone.lock().unwrap().is_moving;
+                    if is_moving_now {
+                        fifo.seen_moving = true;
+                    }
+                    let est_secs = (fifo.ticks.len() as f64 / 1000.0) + 0.5;
+                    let fifo_done = fifo.cursor >= fifo.ticks.len()
+                        && ((fifo.seen_moving && !is_moving_now)
+                            || (!is_moving_now
+                                && fifo.started_at.elapsed() >= Duration::from_secs_f64(est_secs)));
+
+                    if fifo_done {
+                        for fpkt in build_fifo_finish_packets(|| {
+                            seq_clone.fetch_add(1, Ordering::Relaxed)
+                        }) {
+                            let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                        }
+                    } else {
+                        active_fifo = Some(fifo);
+                    }
+                }
             }
         });
 
@@ -1029,6 +1146,10 @@ impl LaserController {
 
     pub fn move_xy(&self, dx: i32, dy: i32, config: JogConfig) {
         let _ = self.command_tx.send(Command::MoveXY { dx, dy, config });
+    }
+
+    pub fn start_fifo_stream(&self, ticks: Vec<(i8, i8, u8)>) {
+        let _ = self.command_tx.send(Command::StartFifoStream { ticks });
     }
 
     pub fn start_continuous_jog(&self, axis: Axis, direction: i32) {

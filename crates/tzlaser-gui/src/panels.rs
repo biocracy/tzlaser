@@ -45,6 +45,9 @@ pub struct PanelState {
     pub last_hw_dispatched_seg: Option<usize>,
     pub hw_seg_dispatched_at: Option<std::time::Instant>,
     pub hw_seg_seen_moving: bool,
+    pub hw_fifo_active: bool,
+    pub hw_fifo_started_at: Option<std::time::Instant>,
+    pub hw_fifo_total_secs: f64,
     pub paused_checkpoint: Option<PauseCheckpoint>,
     pub pause_buffer: Vec<PauseCheckpoint>,
     pub material_db: MaterialLibrary,
@@ -77,6 +80,9 @@ impl Default for PanelState {
             last_hw_dispatched_seg: None,
             hw_seg_dispatched_at: None,
             hw_seg_seen_moving: false,
+            hw_fifo_active: false,
+            hw_fifo_started_at: None,
+            hw_fifo_total_secs: 0.0,
             paused_checkpoint: None,
             pause_buffer: Vec::new(),
             material_db: MaterialLibrary::with_default_presets(),
@@ -114,6 +120,63 @@ pub fn head_world_mm(status: &MachineStatus, pulse_config: &PulseConfig) -> kurb
         origin.x + pulse_config.pulses_to_mm_x(status.pos_x),
         origin.y + pulse_config.pulses_to_mm_y(status.pos_y),
     )
+}
+
+/// Convert a `MotionSegment` trajectory into a continuous 1-ms Motion FIFO tick stream `(dx, dy, flags)`.
+/// Uses exact integer accumulator rounding so consecutive curve chords flow seamlessly without stopping
+/// or accumulating quantization drift.
+pub fn build_trajectory_fifo_ticks(
+    traj: &[MotionSegment],
+    origin_world: kurbo::Point,
+    pulses_cfg: &PulseConfig,
+    start_px: i32,
+    start_py: i32,
+) -> Vec<(i8, i8, u8)> {
+    let mut ticks = Vec::new();
+    let mut cur_px = start_px;
+    let mut cur_py = start_py;
+
+    for seg in traj {
+        let target_px = pulses_cfg.mm_to_pulses_x(seg.end.x - origin_world.x);
+        let target_py = pulses_cfg.mm_to_pulses_y(seg.end.y - origin_world.y);
+        let dx_total = target_px - cur_px;
+        let dy_total = target_py - cur_py;
+        if dx_total == 0 && dy_total == 0 {
+            continue;
+        }
+        let speed = if seg.is_rapid {
+            seg.speed_mm_s.clamp(1.0, 120.0)
+        } else {
+            seg.speed_mm_s.max(0.5)
+        };
+        let secs = (seg.length_mm / speed).max(0.001);
+        let min_ticks_for_step =
+            ((dx_total.abs().max(dy_total.abs()) as usize) + 126) / 127;
+        let n_ticks = ((secs * 1000.0).ceil() as usize)
+            .max(min_ticks_for_step)
+            .max(1);
+
+        let seg_start_px = cur_px;
+        let seg_start_py = cur_py;
+        for i in 1..=n_ticks {
+            let t = i as f64 / n_ticks as f64;
+            let next_px = seg_start_px + ((dx_total as f64) * t).round() as i32;
+            let next_py = seg_start_py + ((dy_total as f64) * t).round() as i32;
+            let tick_dx = (next_px - cur_px).clamp(-127, 127) as i8;
+            let tick_dy = (next_py - cur_py).clamp(-127, 127) as i8;
+            cur_px += tick_dx as i32;
+            cur_py += tick_dy as i32;
+            let flags = if ticks.is_empty() {
+                0x30
+            } else if seg.is_rapid {
+                0x03
+            } else {
+                0x01
+            };
+            ticks.push((tick_dx, tick_dy, flags));
+        }
+    }
+    ticks
 }
 
 /// Build `HomeConfig` matching the selected `origin_corner` and pulse scaling in `PulseConfig`.
@@ -216,6 +279,9 @@ impl PanelState {
         self.last_hw_dispatched_seg = None;
         self.hw_seg_dispatched_at = None;
         self.hw_seg_seen_moving = false;
+        self.hw_fifo_active = false;
+        self.hw_fifo_started_at = None;
+        self.hw_fifo_total_secs = 0.0;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
 
@@ -242,8 +308,42 @@ impl PanelState {
         }
     }
 
+    /// Convert the active trajectory into a 1-ms Motion FIFO tick stream and dispatch it
+    /// to the connected controller for continuous, stutter-free Dry-Cut curve tracing.
+    pub fn start_hw_dry_cut_fifo(
+        &mut self,
+        controller: &Option<LaserController>,
+        status: &MachineStatus,
+        pulses_cfg: &PulseConfig,
+    ) {
+        let Some(ref c) = controller else {
+            return;
+        };
+        if !c.is_connected() || self.trajectory.is_empty() {
+            return;
+        }
+        let ticks = build_trajectory_fifo_ticks(
+            &self.trajectory,
+            origin_world_mm(pulses_cfg),
+            pulses_cfg,
+            status.pos_x,
+            status.pos_y,
+        );
+        if ticks.is_empty() {
+            return;
+        }
+        self.hw_fifo_total_secs = ticks.len() as f64 / 1000.0;
+        self.hw_fifo_started_at = Some(std::time::Instant::now());
+        self.hw_fifo_active = true;
+        self.hw_seg_seen_moving = false;
+        c.start_fifo_stream(ticks);
+    }
+
     pub fn stop_run(&mut self, controller: &Option<LaserController>, status: &mut MachineStatus) {
         let was_dry = self.run_mode == RunMode::DryCut;
+        self.hw_fifo_active = false;
+        self.hw_fifo_started_at = None;
+        self.hw_seg_seen_moving = false;
         self.run_mode = RunMode::Idle;
         self.is_paused = false;
         self.last_tick = None;
@@ -871,7 +971,34 @@ impl PanelState {
         self.last_tick = Some(now);
 
         let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
-        if hw_connected {
+        if hw_connected && self.hw_fifo_active {
+            if status.is_moving {
+                self.hw_seg_seen_moving = true;
+            }
+            let head_world = head_world_mm(status, pulses_cfg);
+            while self.current_seg_idx < self.trajectory.len() {
+                let seg = self.trajectory[self.current_seg_idx];
+                if head_world.distance(seg.end) <= 0.8 {
+                    self.traveled_length_mm += seg.length_mm;
+                    self.seg_progress_mm = 0.0;
+                    self.current_seg_idx += 1;
+                } else {
+                    self.seg_progress_mm = (seg.length_mm - head_world.distance(seg.end)).clamp(0.0, seg.length_mm);
+                    break;
+                }
+            }
+            let elapsed = self
+                .hw_fifo_started_at
+                .map(|t| (now - t).as_secs_f64())
+                .unwrap_or(0.0);
+            let fifo_done = (self.hw_seg_seen_moving && !status.is_moving)
+                || (!status.is_moving && elapsed >= self.hw_fifo_total_secs + 0.5);
+            if fifo_done {
+                self.current_seg_idx = self.trajectory.len();
+                self.traveled_length_mm = self.total_length_mm;
+                self.hw_fifo_active = false;
+            }
+        } else if hw_connected {
             while self.current_seg_idx < self.trajectory.len() {
                 let seg = self.trajectory[self.current_seg_idx];
                 let head_world = head_world_mm(status, pulses_cfg);
@@ -1575,6 +1702,7 @@ pub fn render_right_panels(
                         match check_cut_area_bounds(doc, pulses_cfg) {
                             Ok(()) => {
                                 *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
+                                panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
                             }
                             Err(msg) => {
                                 *status_message = msg;
