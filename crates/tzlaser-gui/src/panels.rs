@@ -237,10 +237,12 @@ pub fn build_trajectory_fifo_ticks(
             let wy = seg.start.y + (seg.end.y - seg.start.y) * frac;
             let next_px = pulses_cfg.mm_to_pulses_x(wx - origin_world.x);
             let next_py = pulses_cfg.mm_to_pulses_y(wy - origin_world.y);
-            let tick_dx = (next_px - cur_px).clamp(-127, 127) as i8;
-            let tick_dy = (next_py - cur_py).clamp(-127, 127) as i8;
-            cur_px += tick_dx as i32;
-            cur_py += tick_dy as i32;
+            // SC2000 Motion FIFO ticks are subtracted from R1008/R1009 by the controller
+            // (positive FIFO dx/dy moves R1008/R1009 in the negative direction).
+            let tick_dx = (cur_px - next_px).clamp(-127, 127) as i8;
+            let tick_dy = (cur_py - next_py).clamp(-127, 127) as i8;
+            cur_px -= tick_dx as i32;
+            cur_py -= tick_dy as i32;
             let flags = if ticks.is_empty() {
                 0x30
             } else if is_rapid {
@@ -253,10 +255,10 @@ pub fn build_trajectory_fifo_ticks(
 
         // Flush any remaining quantized pulse difference at the chain end
         while cur_px != end_px || cur_py != end_py {
-            let tick_dx = (end_px - cur_px).clamp(-127, 127) as i8;
-            let tick_dy = (end_py - cur_py).clamp(-127, 127) as i8;
-            cur_px += tick_dx as i32;
-            cur_py += tick_dy as i32;
+            let tick_dx = (cur_px - end_px).clamp(-127, 127) as i8;
+            let tick_dy = (cur_py - end_py).clamp(-127, 127) as i8;
+            cur_px -= tick_dx as i32;
+            cur_py -= tick_dy as i32;
             let flags = if ticks.is_empty() {
                 0x30
             } else if is_rapid {
@@ -2636,9 +2638,9 @@ mod tests {
         let ticks = build_trajectory_fifo_ticks(&traj, origin, &cfg, 0, 0);
         assert!(!ticks.is_empty());
         assert_eq!(ticks[0].2, 0x30);
-        // Total pulses should match 20.0 mm * pulses_per_mm_x
+        // Total FIFO pulses are negated relative to R1008 target position
         let sum_x: i32 = ticks.iter().map(|t| t.0 as i32).sum();
-        assert_eq!(sum_x, cfg.mm_to_pulses_x(20.0));
+        assert_eq!(sum_x, -cfg.mm_to_pulses_x(20.0));
         // First tick velocity should be small (accelerating from rest, not jumping straight to cruise)
         assert!(ticks[0].0.abs() <= 2);
     }
