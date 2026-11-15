@@ -52,6 +52,7 @@ pub struct PanelState {
     pub new_mat_thickness: f64,
     pub show_home_prompt: bool,
     pub prompted_home_this_connection: bool,
+    pub job_start_pos: kurbo::Point,
 }
 
 impl Default for PanelState {
@@ -81,6 +82,7 @@ impl Default for PanelState {
             new_mat_thickness: 2.0,
             show_home_prompt: false,
             prompted_home_this_connection: false,
+            job_start_pos: kurbo::Point::ZERO,
         }
     }
 }
@@ -171,6 +173,7 @@ impl PanelState {
             return "No active toolpaths to run on visible layers.".to_string();
         }
         self.total_length_mm = traj.iter().map(|s| s.length_mm).sum();
+        self.job_start_pos = current_head;
         let est = doc.estimate_job_time(current_head);
         self.estimated_job_secs = est.total_s;
         self.full_trajectory = traj.clone();
@@ -878,18 +881,86 @@ impl PanelState {
         }
 
         if self.current_seg_idx >= self.trajectory.len() {
-            if let Some(last) = self.trajectory.last() {
-                status.pos_x = pulses_cfg.mm_to_pulses_x(last.end.x);
-                status.pos_y = pulses_cfg.mm_to_pulses_y(last.end.y);
-            }
+            let end_pos = self
+                .trajectory
+                .last()
+                .map(|last| last.end)
+                .unwrap_or(self.job_start_pos);
+            status.pos_x = pulses_cfg.mm_to_pulses_x(end_pos.x);
+            status.pos_y = pulses_cfg.mm_to_pulses_y(end_pos.y);
+
             let finished_label = if self.run_mode == RunMode::DryCut {
                 "Dry-Cut simulation"
             } else {
                 "Cutting job"
             };
             let total = self.total_length_mm;
+            let start_pos = self.job_start_pos;
             self.stop_run(controller, status);
-            return Some(format!("{} completed ({:.1} mm total travel).", finished_label, total));
+
+            // Execute configured After-Job Z-Home & XY return motion
+            if pulses_cfg.post_job_z_home {
+                if let Some(ref c) = controller {
+                    if c.is_connected() {
+                        c.home_z();
+                    } else {
+                        status.pos_z = 0;
+                        status.capacitive_height_mm = 0.0;
+                    }
+                } else {
+                    status.pos_z = 0;
+                    status.capacitive_height_mm = 0.0;
+                }
+            }
+
+            let target_pos = match pulses_cfg.post_job_action {
+                tzlaser_core::PostJobAction::ToStartPosition => Some(start_pos),
+                tzlaser_core::PostJobAction::ToEndPosition => None,
+                tzlaser_core::PostJobAction::ToOrigin => Some(kurbo::Point::ZERO),
+                tzlaser_core::PostJobAction::ToCoordinates => {
+                    let tx = if pulses_cfg.soft_limits_enabled {
+                        pulses_cfg.post_job_x_mm.clamp(0.0, pulses_cfg.cut_width_mm())
+                    } else {
+                        pulses_cfg.post_job_x_mm
+                    };
+                    let ty = if pulses_cfg.soft_limits_enabled {
+                        pulses_cfg.post_job_y_mm.clamp(0.0, pulses_cfg.cut_height_mm())
+                    } else {
+                        pulses_cfg.post_job_y_mm
+                    };
+                    Some(kurbo::Point::new(tx, ty))
+                }
+            };
+
+            if let Some(tp) = target_pos {
+                let dx_p = pulses_cfg.mm_to_pulses_x(tp.x - end_pos.x);
+                let dy_p = pulses_cfg.mm_to_pulses_y(tp.y - end_pos.y);
+                if let Some(ref c) = controller {
+                    if c.is_connected() {
+                        if dx_p != 0 {
+                            c.jog(Axis::X, dx_p);
+                        }
+                        if dy_p != 0 {
+                            c.jog(Axis::Y, dy_p);
+                        }
+                    }
+                }
+                status.pos_x = pulses_cfg.mm_to_pulses_x(tp.x);
+                status.pos_y = pulses_cfg.mm_to_pulses_y(tp.y);
+            }
+
+            let z_note = if pulses_cfg.post_job_z_home {
+                ", Z-Home"
+            } else {
+                ""
+            };
+            return Some(format!(
+                "{} completed ({:.1} mm total travel; post-job: {}{}).",
+                finished_label,
+                total,
+                pulses_cfg.post_job_action.label(),
+                z_note
+            ));
         }
 
         let seg = self.trajectory[self.current_seg_idx];
@@ -1445,6 +1516,68 @@ pub fn render_right_panels(
                         }
                     }
                 });
+
+                ui.add_space(4.0);
+
+                // Row 5: 🔲 Frame Job (trace job bounding box with red guide pointer)
+                let frame_btn = Button::new(
+                    RichText::new("🔲 Frame Job")
+                        .size(12.5)
+                        .color(Color32::from_rgb(255, 200, 50))
+                        .strong(),
+                )
+                .fill(Color32::from_rgb(48, 42, 22));
+                if ui
+                    .add_sized([ui.available_width().max(120.0), 28.0], frame_btn)
+                    .on_hover_text("Trace the active job bounding box with the red guide pointer (laser off)")
+                    .clicked()
+                {
+                    let mut bbox: Option<kurbo::Rect> = None;
+                    for layer in &doc.layers {
+                        if !layer.visible || layer.is_obstacle {
+                            continue;
+                        }
+                        for ent in &layer.entities {
+                            let b = ent.bounding_box();
+                            bbox = Some(match bbox {
+                                Some(acc) => acc.union(b),
+                                None => b,
+                            });
+                        }
+                    }
+                    if let Some(b) = bbox {
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_red_pointer(true);
+                                let corners = [
+                                    kurbo::Point::new(b.x0, b.y0),
+                                    kurbo::Point::new(b.x1, b.y0),
+                                    kurbo::Point::new(b.x1, b.y1),
+                                    kurbo::Point::new(b.x0, b.y1),
+                                    kurbo::Point::new(b.x0, b.y0),
+                                ];
+                                let mut prev = current_head;
+                                for pt in corners {
+                                    let dx = pulses_cfg.mm_to_pulses_x(pt.x - prev.x);
+                                    let dy = pulses_cfg.mm_to_pulses_y(pt.y - prev.y);
+                                    if dx != 0 {
+                                        c.jog(Axis::X, dx);
+                                    }
+                                    if dy != 0 {
+                                        c.jog(Axis::Y, dy);
+                                    }
+                                    prev = pt;
+                                }
+                            }
+                        }
+                        *status_message = format!(
+                            "Framing job bounds [{:.1}..{:.1}, {:.1}..{:.1}] mm with red guide pointer.",
+                            b.x0, b.x1, b.y0, b.y1
+                        );
+                    } else {
+                        *status_message = "No active cuttable geometry to frame.".to_string();
+                    }
+                }
 
                 // Pause Buffer Card (visible when a paused checkpoint is active)
                 if let Some(cp) = panel_state.paused_checkpoint {

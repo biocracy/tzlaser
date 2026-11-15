@@ -53,6 +53,31 @@ fn default_retract_z_mm() -> f64 {
     5.0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PostJobAction {
+    ToStartPosition,
+    ToEndPosition,
+    ToOrigin,
+    ToCoordinates,
+}
+
+impl Default for PostJobAction {
+    fn default() -> Self {
+        Self::ToEndPosition
+    }
+}
+
+impl PostJobAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ToStartPosition => "To Starting Position",
+            Self::ToEndPosition => "To End Position",
+            Self::ToOrigin => "To Origin",
+            Self::ToCoordinates => "To Coordinates",
+        }
+    }
+}
+
 /// Persistent Table & Machine Properties configuration (pulses/mm, table dimensions,
 /// jog speeds/accelerations, axis polarity, and controller network endpoints).
 /// Automatically saved to disk when edited and recalled on startup.
@@ -110,6 +135,16 @@ pub struct PulseConfig {
     #[serde(default = "default_z_follower_port")]
     pub z_follower_port: u16,
 
+    // 5. Post-Job Behavior
+    #[serde(default)]
+    pub post_job_action: PostJobAction,
+    #[serde(default)]
+    pub post_job_x_mm: f64,
+    #[serde(default)]
+    pub post_job_y_mm: f64,
+    #[serde(default)]
+    pub post_job_z_home: bool,
+
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
 }
@@ -139,6 +174,10 @@ impl Default for PulseConfig {
             default_step_mm: default_step_mm(),
             controller_ip: default_controller_ip(),
             z_follower_port: default_z_follower_port(),
+            post_job_action: PostJobAction::default(),
+            post_job_x_mm: 0.0,
+            post_job_y_mm: 0.0,
+            post_job_z_home: false,
             config_path: None,
         }
     }

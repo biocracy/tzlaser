@@ -10,5 +10,5 @@ pub use dxf_importer::{DxfError, DxfImporter};
 pub use history::HistoryManager;
 pub use lead_line::{apply_lead_lines, LeadConfig, LeadType};
 pub use material_library::{LayerConfigEntry, MaterialLibrary, MaterialPreset, SavedLayerSpec};
-pub use units::PulseConfig;
+pub use units::{PostJobAction, PulseConfig};
 

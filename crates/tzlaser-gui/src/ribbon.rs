@@ -6,7 +6,7 @@ use kurbo::Point;
 use std::net::SocketAddr;
 use tzlaser_core::{
     apply_lead_lines, Color, Document, DxfImporter, Entity, HistoryManager, Layer, LeadConfig,
-    LeadType, PulseConfig, SortMode,
+    LeadType, PostJobAction, PulseConfig, SortMode,
 };
 use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 
@@ -1074,7 +1074,7 @@ fn render_profiles_tab(
 fn render_laser_tab(
     ui: &mut Ui,
     state: &mut RibbonState,
-    pulse_config: &PulseConfig,
+    pulse_config: &mut PulseConfig,
     controller: &mut Option<LaserController>,
     status: &MachineStatus,
     status_message: &mut String,
@@ -1177,8 +1177,8 @@ fn render_laser_tab(
 
         ui.add_space(4.0);
 
-        // 3. Work Origin, Homing & Framing
-        ribbon_group(ui, "Origin, Homing & Framing", |ui| {
+        // 3. Work Origin & Homing
+        ribbon_group(ui, "Origin & Homing", |ui| {
             let is_conn = controller.as_ref().map_or(false, |c| c.is_connected());
             if ui.add_enabled(is_conn, Button::new(RichText::new("🏠 Home All").size(12.0).color(Color32::from_rgb(130, 235, 180))).fill(Color32::from_rgb(24, 65, 50))).on_hover_text(format!("Home all 3 axes (Z up, then X/Y toward {})", pulse_config.origin_corner)).clicked() {
                 if let Some(ref c) = controller {
@@ -1197,11 +1197,79 @@ fn render_laser_tab(
             if ui.add(Button::new(RichText::new("📍 Set Origin").size(12.0).color(Color32::from_rgb(0, 230, 230))).fill(Color32::from_rgb(20, 48, 55))).on_hover_text("Zero Workpiece Origin (G54 X0 Y0) at current head position").clicked() {
                 *status_message = format!("Workpiece Origin set at current position (X: {}, Y: {})", status.pos_x, status.pos_y);
             }
+        });
 
-            let frame_btn = Button::new(RichText::new("🔲 Frame Job").size(12.0).color(Color32::from_rgb(255, 200, 50)))
-                .fill(Color32::from_rgb(45, 40, 20));
-            if ui.add(frame_btn).on_hover_text("Dry-run trace the bounding box with red pointer (laser off) to verify sheet positioning").clicked() {
-                *status_message = "Framing boundary rectangle with red guide pointer...".to_string();
+        ui.add_space(4.0);
+
+        // 3b. After Job Behavior
+        ribbon_group(ui, "After Job", |ui| {
+            let mut post_changed = false;
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Return:").size(11.5));
+                    egui::ComboBox::from_id_salt("post_job_action_combo")
+                        .width(138.0)
+                        .selected_text(pulse_config.post_job_action.label())
+                        .show_ui(ui, |ui| {
+                            for opt in [
+                                PostJobAction::ToStartPosition,
+                                PostJobAction::ToEndPosition,
+                                PostJobAction::ToOrigin,
+                                PostJobAction::ToCoordinates,
+                            ] {
+                                if ui
+                                    .selectable_value(
+                                        &mut pulse_config.post_job_action,
+                                        opt,
+                                        opt.label(),
+                                    )
+                                    .changed()
+                                {
+                                    post_changed = true;
+                                }
+                            }
+                        });
+
+                    if ui
+                        .checkbox(&mut pulse_config.post_job_z_home, "⬆ Z-Home")
+                        .on_hover_text("Lift head to Z=0 (upper sensor touch off) after job finishes")
+                        .changed()
+                    {
+                        post_changed = true;
+                    }
+                });
+
+                if pulse_config.post_job_action == PostJobAction::ToCoordinates {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("X:").size(11.0));
+                        if ui
+                            .add(
+                                DragValue::new(&mut pulse_config.post_job_x_mm)
+                                    .range(0.0..=10_000.0)
+                                    .speed(1.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            post_changed = true;
+                        }
+                        ui.label(RichText::new("Y:").size(11.0));
+                        if ui
+                            .add(
+                                DragValue::new(&mut pulse_config.post_job_y_mm)
+                                    .range(0.0..=10_000.0)
+                                    .speed(1.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            post_changed = true;
+                        }
+                    });
+                }
+            });
+            if post_changed {
+                let _ = pulse_config.save();
             }
         });
 
@@ -1309,73 +1377,7 @@ fn render_properties_tab(
 
         ui.add_space(2.0);
 
-        // 2. Quick Axis Calibration (Pulses / mm)
-        ribbon_group(ui, "Axis Scaling (Pulses / mm)", |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("X:").color(Color32::from_rgb(255, 100, 100)).strong().size(11.5));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut pulse_config.pulses_per_mm_x)
-                                .range(1.0..=100_000.0)
-                                .speed(1.0)
-                                .suffix(" pls/mm"),
-                        )
-                        .on_hover_text("X-axis pulses per millimeter (auto-saved immediately)")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-
-                    ui.add_space(4.0);
-
-                    ui.label(RichText::new("Y:").color(Color32::from_rgb(100, 230, 100)).strong().size(11.5));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut pulse_config.pulses_per_mm_y)
-                                .range(1.0..=100_000.0)
-                                .speed(1.0)
-                                .suffix(" pls/mm"),
-                        )
-                        .on_hover_text("Y-axis pulses per millimeter (auto-saved immediately)")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Z:").color(Color32::from_rgb(100, 175, 255)).strong().size(11.5));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut pulse_config.pulses_per_mm_z)
-                                .range(1.0..=100_000.0)
-                                .speed(1.0)
-                                .suffix(" pls/mm"),
-                        )
-                        .on_hover_text("Z-axis pulses per millimeter on Port 999 (auto-saved immediately)")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-
-                    ui.add_space(6.0);
-                    if ui.checkbox(&mut pulse_config.invert_x, "Inv X").changed() {
-                        changed = true;
-                    }
-                    if ui.checkbox(&mut pulse_config.invert_y, "Inv Y").changed() {
-                        changed = true;
-                    }
-                    if ui.checkbox(&mut pulse_config.invert_z, "Inv Z").changed() {
-                        changed = true;
-                    }
-                });
-            });
-        });
-
-        ui.add_space(2.0);
-
-        // 3. Quick Jog Speed & Presets
+        // 2. Quick Jog Speed & Presets
         ribbon_group(ui, "Jog Speed & Presets (Auto-Saved)", |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
