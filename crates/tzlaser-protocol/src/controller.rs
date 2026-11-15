@@ -10,8 +10,8 @@ use crate::motion::{
     build_xy_move_packet, build_z_handshake_packets, build_z_home_packet, build_z_jog_packet,
     build_z_poll_packet, build_z_stop_packet, decode_remote_jog, decode_z_homed_from_poll,
     decode_z_poll_response, decode_z_sensors_from_poll, registers, remote_buttons, Axis,
-    HomeConfig, JogConfig, MachineStatus, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z,
-    DEFAULT_Z_JOG_SPEED,
+    HomeConfig, JogConfig, MachineStatus, SignalTelemetry, CONTINUOUS_JOG_PULSES_XY,
+    CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
 
@@ -39,6 +39,7 @@ pub enum Command {
 pub struct LaserController {
     target_addr: SocketAddr,
     status: Arc<Mutex<MachineStatus>>,
+    telemetry: Arc<Mutex<SignalTelemetry>>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     _seq: Arc<AtomicU16>,
@@ -50,11 +51,13 @@ impl LaserController {
     pub fn new(target_addr: SocketAddr) -> Self {
         let (command_tx, command_rx) = std::sync::mpsc::channel::<Command>();
         let status = Arc::new(Mutex::new(MachineStatus::default()));
+        let telemetry = Arc::new(Mutex::new(SignalTelemetry::new()));
         let running = Arc::new(AtomicBool::new(true));
         let connected = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU16::new(0));
 
         let status_clone = Arc::clone(&status);
+        let telemetry_clone = Arc::clone(&telemetry);
         let running_clone = Arc::clone(&running);
         let connected_clone = Arc::clone(&connected);
         let seq_clone = Arc::clone(&seq);
@@ -243,6 +246,7 @@ impl LaserController {
                         );
                         let _ = socket.send_to(&p1.encode(), target_addr);
                         pending_stop_p2_at = Some(Instant::now() + Duration::from_millis(140));
+                        telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, None);
                     }
                 }
 
@@ -259,6 +263,7 @@ impl LaserController {
                         );
                         let _ = socket.send_to(&p1.encode(), target_addr);
                         pending_stop_p2_at = Some(Instant::now() + Duration::from_millis(140));
+                        telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, None);
                     }
                 }
 
@@ -294,6 +299,8 @@ impl LaserController {
                                         Instant::now() + Duration::from_millis(2500),
                                     ));
                                     last_z_poll = Instant::now() - Duration::from_secs(1);
+                                    let z_rate = (pulses.signum() as f32) * ((z_jog_speed.max(10) as f32) * 100.0);
+                                    telemetry_clone.lock().unwrap().push_command(0.0, 0.0, z_rate, 0.0, false, Some("Jog Z"));
                                 }
                             } else {
                                 if pending_stop_p2_at.take().is_some() {
@@ -328,6 +335,14 @@ impl LaserController {
                                 let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                                 let pkt = build_jog_packet(s, axis, pulses, &jog_cfg);
                                 let _ = socket.send_to(&pkt.encode(), target_addr);
+                                let rate = (pulses.signum() as f32) * (jog_cfg.jog_speed as f32);
+                                let (xr, yr, wr) = match axis {
+                                    Axis::X => (rate, 0.0, 0.0),
+                                    Axis::Y => (0.0, rate, 0.0),
+                                    Axis::W => (0.0, 0.0, rate),
+                                    Axis::Z => (0.0, 0.0, 0.0),
+                                };
+                                telemetry_clone.lock().unwrap().push_command(xr, yr, 0.0, wr, false, Some("Jog"));
 
                                 active_step_watch =
                                     Some((axis, cur_pos, pulses.unsigned_abs() as i32));
@@ -373,6 +388,8 @@ impl LaserController {
                                         Instant::now() + Duration::from_secs_f64(z_timeout_secs),
                                     ));
                                     last_z_poll = Instant::now() - Duration::from_secs(1);
+                                    let z_rate = (pulses.signum() as f32) * ((z_jog_speed.max(10) as f32) * 100.0);
+                                    telemetry_clone.lock().unwrap().push_command(0.0, 0.0, z_rate, 0.0, false, Some("Jog Z"));
                                 }
                                 continue;
                             }
@@ -408,6 +425,14 @@ impl LaserController {
                             let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                             let pkt = build_jog_packet(s, axis, pulses, &config);
                             let _ = socket.send_to(&pkt.encode(), target_addr);
+                            let rate = (pulses.signum() as f32) * (config.jog_speed as f32);
+                            let (xr, yr, wr) = match axis {
+                                Axis::X => (rate, 0.0, 0.0),
+                                Axis::Y => (0.0, rate, 0.0),
+                                Axis::W => (0.0, 0.0, rate),
+                                Axis::Z => (0.0, 0.0, 0.0),
+                            };
+                            telemetry_clone.lock().unwrap().push_command(xr, yr, 0.0, wr, false, Some("JogCfg"));
 
                             active_step_watch =
                                 Some((axis, cur_pos, pulses.unsigned_abs() as i32));
@@ -453,6 +478,10 @@ impl LaserController {
                             let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                             let pkt = build_xy_move_packet(s, dx, dy, &config);
                             let _ = socket.send_to(&pkt.encode(), target_addr);
+                            let mag = ((dx as f64).hypot(dy as f64)).max(1.0);
+                            let vx = ((dx as f64 / mag) * (config.jog_speed as f64)) as f32;
+                            let vy = ((dy as f64 / mag) * (config.jog_speed as f64)) as f32;
+                            telemetry_clone.lock().unwrap().push_command(vx, vy, 0.0, 0.0, false, Some("MoveXY"));
                         }
                         Command::StartFifoStream { ticks } => {
                             if ticks.is_empty() {
@@ -509,6 +538,8 @@ impl LaserController {
                                         &mut latest_z,
                                     );
                                     last_z_poll = Instant::now() - Duration::from_secs(1);
+                                    let z_rate = (sign.signum() as f32) * ((z_jog_speed.max(10) as f32) * 100.0);
+                                    telemetry_clone.lock().unwrap().push_command(0.0, 0.0, z_rate, 0.0, false, Some("Jog Z"));
                                 }
                             } else {
                                 auto_stop_at = None;
@@ -541,6 +572,14 @@ impl LaserController {
                                     &jog_cfg,
                                 );
                                 let _ = socket.send_to(&pkt.encode(), target_addr);
+                                let rate = (sign as f32) * (jog_cfg.jog_speed as f32);
+                                let (xr, yr, wr) = match axis {
+                                    Axis::X => (rate, 0.0, 0.0),
+                                    Axis::Y => (0.0, rate, 0.0),
+                                    Axis::W => (0.0, 0.0, rate),
+                                    Axis::Z => (0.0, 0.0, 0.0),
+                                };
+                                telemetry_clone.lock().unwrap().push_command(xr, yr, 0.0, wr, false, Some("ContJog"));
                             }
                         }
                         Command::Stop => {
@@ -549,6 +588,7 @@ impl LaserController {
                             active_z_step_watch = None;
                             active_remote_jog = None;
                             pending_xy_home_after_z = None;
+                            telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Stop"));
                             if active_fifo.take().is_some() {
                                 for fpkt in build_fifo_finish_packets(|| {
                                     seq_clone.fetch_add(1, Ordering::Relaxed)
@@ -840,6 +880,7 @@ impl LaserController {
                                         &mut latest_z,
                                     );
                                     last_z_poll = Instant::now() - Duration::from_secs(1);
+                                    telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Stop Z"));
                                 }
                             } else if (rising_mask & remote_buttons::GUIDE) != 0 {
                                 let s = seq_clone.fetch_add(1, Ordering::Relaxed);
@@ -1076,13 +1117,26 @@ impl LaserController {
                         if take == 0 {
                             break;
                         }
+                        let chunk = &fifo.ticks[fifo.cursor..fifo.cursor + take];
                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                         let pkt = build_fifo_packet(
                             s,
                             fifo.fifo_seq,
-                            &fifo.ticks[fifo.cursor..fifo.cursor + take],
+                            chunk,
                         );
                         let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
+                        let (sum_x, sum_y, any_laser) = chunk.iter().fold((0i32, 0i32, false), |acc, &(dx, dy, fl)| {
+                            (acc.0 + dx as i32, acc.1 + dy as i32, acc.2 || (fl != 0))
+                        });
+                        let dt_s = (take as f32) * 0.001;
+                        telemetry_clone.lock().unwrap().push_command(
+                            (sum_x as f32) / dt_s,
+                            (sum_y as f32) / dt_s,
+                            0.0,
+                            0.0,
+                            any_laser,
+                            if sent_this_iter == 0 { Some("FIFO") } else { None },
+                        );
                         fifo.cursor += take;
                         fifo.fifo_seq = fifo.fifo_seq.wrapping_add(1);
                         fifo.estimated_free = fifo.estimated_free.saturating_sub(take as u32);
@@ -1114,9 +1168,12 @@ impl LaserController {
                         }) {
                             let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
                         }
+                        telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Done"));
                     } else {
                         active_fifo = Some(fifo);
                     }
+                } else {
+                    telemetry_clone.lock().unwrap().tick_sample(50);
                 }
             }
         });
@@ -1124,6 +1181,7 @@ impl LaserController {
         Self {
             target_addr,
             status,
+            telemetry,
             running,
             connected,
             _seq: seq,
@@ -1207,6 +1265,10 @@ impl LaserController {
 
     pub fn get_status(&self) -> MachineStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    pub fn telemetry(&self) -> Arc<Mutex<SignalTelemetry>> {
+        Arc::clone(&self.telemetry)
     }
 
     pub fn target_addr(&self) -> SocketAddr {

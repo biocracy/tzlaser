@@ -1297,6 +1297,7 @@ pub fn render_right_panels(
     pulses_cfg: &PulseConfig,
     doc: &mut Document,
     status_message: &mut String,
+    signal_graph: &mut crate::signal_graph::SignalGraphState,
 ) {
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // ==========================================
@@ -1676,15 +1677,27 @@ pub fn render_right_panels(
                             c.jog(axis, clamped_pulses);
                         }
                     } else {
+                        let est_dt = 0.05_f32;
+                        let rate = (clamped_pulses as f32) / est_dt;
                         match axis {
-                            Axis::X => status.pos_x += clamped_pulses,
-                            Axis::Y => status.pos_y += clamped_pulses,
+                            Axis::X => {
+                                status.pos_x += clamped_pulses;
+                                signal_graph.record_offline(rate, 0.0, 0.0, 0.0, false, Some("Jog X"));
+                            }
+                            Axis::Y => {
+                                status.pos_y += clamped_pulses;
+                                signal_graph.record_offline(0.0, rate, 0.0, 0.0, false, Some("Jog Y"));
+                            }
                             Axis::Z => {
                                 status.pos_z += clamped_pulses;
                                 status.capacitive_height_mm =
                                     ((status.pos_z as f32) / (pulses_cfg.pulses_per_mm_z as f32)).max(0.0);
+                                signal_graph.record_offline(0.0, 0.0, rate, 0.0, false, Some("Jog Z"));
                             }
-                            Axis::W => status.pos_w += clamped_pulses,
+                            Axis::W => {
+                                status.pos_w += clamped_pulses;
+                                signal_graph.record_offline(0.0, 0.0, 0.0, rate, false, Some("Jog W"));
+                            }
                         }
                     }
                 }

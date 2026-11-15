@@ -10,12 +10,14 @@ mod panels;
 mod properties_window;
 mod ribbon;
 mod selection_hud;
+mod signal_graph;
 
 use canvas::{render_canvas, CanvasState};
 use panels::{render_right_panels, PanelState};
 use properties_window::PropertiesWindowState;
 use ribbon::{render_ribbon, RibbonState};
 use selection_hud::{render_selection_hud, SelectionHudState};
+use signal_graph::{render_signal_graph, SignalGraphState};
 
 struct TzlaserApp {
     document: Document,
@@ -26,6 +28,7 @@ struct TzlaserApp {
     hud_state: SelectionHudState,
     ribbon_state: RibbonState,
     props_window_state: PropertiesWindowState,
+    signal_graph: SignalGraphState,
     pulse_config: PulseConfig,
     controller: Option<LaserController>,
     status: MachineStatus,
@@ -94,6 +97,7 @@ impl Default for TzlaserApp {
             hud_state: SelectionHudState::default(),
             ribbon_state: RibbonState::default(),
             props_window_state: PropertiesWindowState::default(),
+            signal_graph: SignalGraphState::default(),
             pulse_config,
             controller,
             status: MachineStatus::default(),
@@ -257,6 +261,7 @@ impl eframe::App for TzlaserApp {
         }
 
         // Advance active Start / Dry-Cut simulation along toolpaths
+        let hw_connected = self.controller.as_ref().map_or(false, |c| c.is_connected());
         if self.panel_state.run_mode != panels::RunMode::Idle && !self.panel_state.is_paused {
             if let Some(done_msg) = self.panel_state.tick_simulation(
                 &self.controller,
@@ -264,8 +269,40 @@ impl eframe::App for TzlaserApp {
                 &self.pulse_config,
             ) {
                 self.status_message = done_msg;
+                if !hw_connected {
+                    self.signal_graph.record_offline(0.0, 0.0, 0.0, 0.0, false, Some("Done"));
+                }
+            } else if !hw_connected {
+                if let Some(seg) = self.panel_state.trajectory.get(self.panel_state.current_seg_idx) {
+                    let speed_mult = if self.panel_state.run_mode != panels::RunMode::DryCut {
+                        1.0
+                    } else {
+                        self.panel_state.sim_speed_multiplier
+                    };
+                    let eff_speed = (seg.speed_mm_s * speed_mult).max(0.5);
+                    let len = seg.length_mm.max(1e-9);
+                    let vx_pls = ((seg.end.x - seg.start.x) / len) * eff_speed * self.pulse_config.pulses_per_mm_x;
+                    let vy_pls = ((seg.end.y - seg.start.y) / len) * eff_speed * self.pulse_config.pulses_per_mm_y;
+                    let tag = if self.panel_state.run_mode == panels::RunMode::DryCut {
+                        "Dry-Cut"
+                    } else if seg.is_rapid {
+                        "Rapid"
+                    } else {
+                        "Cut"
+                    };
+                    self.signal_graph.record_offline(
+                        vx_pls as f32,
+                        vy_pls as f32,
+                        0.0,
+                        0.0,
+                        self.status.laser_on,
+                        Some(tag),
+                    );
+                }
             }
             ctx.request_repaint();
+        } else if !hw_connected {
+            self.signal_graph.tick_offline();
         }
 
         // Prompt to home machine on first connection to controller board
@@ -339,6 +376,29 @@ impl eframe::App for TzlaserApp {
             .frame(Frame::new().fill(status_bar_fill).inner_margin(Margin::symmetric(10, 4)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let arrow = if self.signal_graph.expanded { "▼" } else { "▲" };
+                    let toggle_btn = egui::Button::new(
+                        RichText::new(format!("{} Signal Graph", arrow))
+                            .size(11.0)
+                            .color(if self.signal_graph.expanded {
+                                Color32::from_rgb(0, 220, 255)
+                            } else {
+                                Color32::from_rgb(190, 200, 215)
+                            }),
+                    )
+                    .fill(if self.signal_graph.expanded {
+                        Color32::from_rgb(24, 52, 68)
+                    } else {
+                        Color32::from_rgb(42, 46, 56)
+                    });
+                    if ui
+                        .add(toggle_btn)
+                        .on_hover_text("Show/hide real-time axis command signal graph")
+                        .clicked()
+                    {
+                        self.signal_graph.expanded = !self.signal_graph.expanded;
+                    }
+                    ui.separator();
                     ui.label(RichText::new(&self.status_message).size(12.0).color(status_text_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -386,8 +446,23 @@ impl eframe::App for TzlaserApp {
                     &self.pulse_config,
                     &mut self.document,
                     &mut self.status_message,
+                    &mut self.signal_graph,
                 );
             });
+
+        // 3b. Collapsible & Resizable Real-Time Axis Signal Graph (spans width minus right panel)
+        if self.signal_graph.expanded {
+            let graph_fill = Color32::from_rgb(20, 23, 29);
+            egui::TopBottomPanel::bottom("motion_telemetry_panel")
+                .resizable(true)
+                .min_height(90.0)
+                .default_height(165.0)
+                .max_height(420.0)
+                .frame(Frame::new().fill(graph_fill).inner_margin(Margin::symmetric(8, 6)))
+                .show(ctx, |ui| {
+                    render_signal_graph(ui, &mut self.signal_graph, &self.controller);
+                });
+        }
 
         // 4. Central 2D Vector CAD Canvas
         egui::CentralPanel::default().show(ctx, |ui| {

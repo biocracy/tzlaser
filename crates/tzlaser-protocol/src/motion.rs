@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use crate::crc::modbus_crc16;
 use crate::packet::Packet;
 
@@ -146,6 +149,103 @@ impl Default for JogConfig {
             jog_speed: 2000,
             accel: 16000,
         }
+    }
+}
+
+/// Time-stamped snapshot of motion commands sent to each axis (in pulses/sec).
+#[derive(Debug, Clone)]
+pub struct AxisSignalSample {
+    pub timestamp_secs: f64,
+    pub x_rate: f32,
+    pub y_rate: f32,
+    pub z_rate: f32,
+    pub w_rate: f32,
+    pub laser_on: bool,
+    pub tag: Option<String>,
+}
+
+/// Ring-buffer of axis command telemetry for real-time time-series plotting.
+pub struct SignalTelemetry {
+    start: Instant,
+    samples: VecDeque<AxisSignalSample>,
+    last_rates: (f32, f32, f32, f32, bool),
+    last_push: Instant,
+}
+
+impl Default for SignalTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SignalTelemetry {
+    pub fn new() -> Self {
+        let now = Instant::now();
+        let mut samples = VecDeque::with_capacity(4096);
+        samples.push_back(AxisSignalSample {
+            timestamp_secs: 0.0,
+            x_rate: 0.0,
+            y_rate: 0.0,
+            z_rate: 0.0,
+            w_rate: 0.0,
+            laser_on: false,
+            tag: None,
+        });
+        Self {
+            start: now,
+            samples,
+            last_rates: (0.0, 0.0, 0.0, 0.0, false),
+            last_push: now,
+        }
+    }
+
+    pub fn elapsed_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    pub fn push_command(
+        &mut self,
+        x_rate: f32,
+        y_rate: f32,
+        z_rate: f32,
+        w_rate: f32,
+        laser_on: bool,
+        tag: Option<&str>,
+    ) {
+        let now = Instant::now();
+        let t = (now - self.start).as_secs_f64();
+        self.last_rates = (x_rate, y_rate, z_rate, w_rate, laser_on);
+        self.last_push = now;
+        self.samples.push_back(AxisSignalSample {
+            timestamp_secs: t,
+            x_rate,
+            y_rate,
+            z_rate,
+            w_rate,
+            laser_on,
+            tag: tag.map(|s| s.to_string()),
+        });
+        while self.samples.len() > 4000 {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Extend the waveform smoothly to the current time while idle or holding a steady rate.
+    pub fn tick_sample(&mut self, min_interval_ms: u64) {
+        if self.last_push.elapsed().as_millis() as u64 >= min_interval_ms {
+            let (x, y, z, w, l) = self.last_rates;
+            self.push_command(x, y, z, w, l, None);
+        }
+    }
+
+    pub fn snapshot(&self) -> (f64, Vec<AxisSignalSample>) {
+        (self.elapsed_secs(), self.samples.iter().cloned().collect())
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.last_rates = (0.0, 0.0, 0.0, 0.0, false);
+        self.push_command(0.0, 0.0, 0.0, 0.0, false, None);
     }
 }
 
