@@ -1282,8 +1282,8 @@ pub fn render_right_panels(
                 ui.separator();
                 ui.add_space(4.0);
 
-                // Job Execution & Dry-Cut Simulation (2x2 Pendant Grid + Pause Buffer)
-                ui.label(RichText::new("Job Execution & Dry-Cut:").strong().size(12.0));
+                // Job Execution (2x2 Pendant Grid + Aux Toggles + Pause Buffer)
+                ui.label(RichText::new("Job Execution:").strong().size(12.0));
                 ui.add_space(3.0);
 
                 let current_head = kurbo::Point::new(
@@ -1578,6 +1578,106 @@ pub fn render_right_panels(
                         *status_message = "No active cuttable geometry to frame.".to_string();
                     }
                 }
+
+                ui.add_space(4.0);
+
+                // Row 6: Follower  |  Red Dot  |  Gas
+                ui.horizontal(|ui| {
+                    let aux_w = ((ui.available_width() - 8.0) / 3.0).max(58.0);
+
+                    let fol_bg = if status.follower_active {
+                        Color32::from_rgb(20, 75, 42)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let fol_fg = if status.follower_active {
+                        Color32::from_rgb(0, 255, 130)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [aux_w, 26.0],
+                            Button::new(RichText::new("🛡 Follower").size(11.5).color(fol_fg).strong())
+                                .fill(fol_bg),
+                        )
+                        .on_hover_text("Toggle capacitive height tracking follower servo")
+                        .clicked()
+                    {
+                        status.follower_active = !status.follower_active;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_follower_servo(status.follower_active);
+                            }
+                        }
+                        *status_message = format!(
+                            "Height follower servo: {}",
+                            if status.follower_active { "ON" } else { "OFF" }
+                        );
+                    }
+
+                    let red_bg = if status.red_pointer_on {
+                        Color32::from_rgb(85, 28, 28)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let red_fg = if status.red_pointer_on {
+                        Color32::from_rgb(255, 115, 115)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [aux_w, 26.0],
+                            Button::new(RichText::new("🔴 Red Dot").size(11.5).color(red_fg).strong())
+                                .fill(red_bg),
+                        )
+                        .on_hover_text("Toggle 650nm visible red laser guide pointer")
+                        .clicked()
+                    {
+                        status.red_pointer_on = !status.red_pointer_on;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_red_pointer(status.red_pointer_on);
+                            }
+                        }
+                        *status_message = format!(
+                            "Red Dot guide: {}",
+                            if status.red_pointer_on { "ON" } else { "OFF" }
+                        );
+                    }
+
+                    let gas_bg = if status.gas_valve_open {
+                        Color32::from_rgb(24, 68, 92)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let gas_fg = if status.gas_valve_open {
+                        Color32::from_rgb(90, 225, 255)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [aux_w, 26.0],
+                            Button::new(RichText::new("💨 Gas").size(11.5).color(gas_fg).strong())
+                                .fill(gas_bg),
+                        )
+                        .on_hover_text("Toggle assist gas valve")
+                        .clicked()
+                    {
+                        status.gas_valve_open = !status.gas_valve_open;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_gas(3, status.gas_valve_open);
+                            }
+                        }
+                        *status_message = format!(
+                            "Assist gas valve: {}",
+                            if status.gas_valve_open { "OPEN" } else { "CLOSED" }
+                        );
+                    }
+                });
 
                 // Pause Buffer Card (visible when a paused checkpoint is active)
                 if let Some(cp) = panel_state.paused_checkpoint {

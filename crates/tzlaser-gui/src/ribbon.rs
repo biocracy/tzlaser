@@ -34,9 +34,6 @@ pub struct RibbonState {
     pub lead_config: LeadConfig,
     pub pulse_duration_ms: u32,
     pub pulse_power_pct: f32,
-    pub follower_enabled: bool,
-    pub red_pointer_enabled: bool,
-    pub gas_open: bool,
     pub pending_sort_action: Option<PendingSortAction>,
     // Dimensioned shape placement fields for the Draw tab
     pub draw_place_x: f64,
@@ -57,9 +54,6 @@ impl Default for RibbonState {
             lead_config: LeadConfig::default(),
             pulse_duration_ms: 50,
             pulse_power_pct: 20.0,
-            follower_enabled: false,
-            red_pointer_enabled: false,
-            gas_open: false,
             pending_sort_action: None,
             draw_place_x: 150.0,
             draw_place_y: 150.0,
@@ -1103,48 +1097,12 @@ fn render_laser_tab(
                     *status_message = "Controller offline.".to_string();
                 }
             }
-
-            let servo_bg = if state.follower_enabled {
-                Color32::from_rgb(20, 70, 40)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            let servo_text = if state.follower_enabled {
-                RichText::new("🛡 Follower ON").color(Color32::from_rgb(0, 255, 120)).size(12.0)
-            } else {
-                RichText::new("🛡 Follower OFF").color(Color32::WHITE).size(12.0)
-            };
-            if ui.add(Button::new(servo_text).fill(servo_bg)).on_hover_text("Toggle capacitive height tracking follower servo").clicked() {
-                state.follower_enabled = !state.follower_enabled;
-                if let Some(ref c) = controller {
-                    c.set_follower_servo(state.follower_enabled);
-                }
-                *status_message = format!("Height follower servo: {}", if state.follower_enabled { "ENABLED" } else { "DISABLED" });
-            }
         });
 
         ui.add_space(4.0);
 
         // 2. Optics & Test Pulse
         ribbon_group(ui, "Laser & Optics", |ui| {
-            let red_bg = if state.red_pointer_enabled {
-                Color32::from_rgb(80, 25, 25)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            let red_text = if state.red_pointer_enabled {
-                RichText::new("🔴 Red Guide ON").color(Color32::from_rgb(255, 100, 100)).size(12.0)
-            } else {
-                RichText::new("🔴 Red Guide OFF").size(12.0)
-            };
-            if ui.add(Button::new(red_text).fill(red_bg)).on_hover_text("Toggle 650nm visible red laser guide pointer").clicked() {
-                state.red_pointer_enabled = !state.red_pointer_enabled;
-                if let Some(ref c) = controller {
-                    c.set_red_pointer(state.red_pointer_enabled);
-                }
-                *status_message = format!("Red pointer: {}", if state.red_pointer_enabled { "ON" } else { "OFF" });
-            }
-
             let pulse_btn = Button::new(RichText::new(format!("⚡ Pulse {}ms", state.pulse_duration_ms)).size(12.0).color(Color32::from_rgb(255, 230, 80)))
                 .fill(Color32::from_rgb(48, 42, 24));
             if ui.add(pulse_btn).on_hover_text(format!("Fire laser test burst: {}ms at {:.0}% power", state.pulse_duration_ms, state.pulse_power_pct)).clicked() {
@@ -1154,24 +1112,6 @@ fn render_laser_tab(
                 } else {
                     *status_message = "Controller offline.".to_string();
                 }
-            }
-
-            let gas_bg = if state.gas_open {
-                Color32::from_rgb(25, 60, 85)
-            } else {
-                Color32::from_rgb(38, 42, 50)
-            };
-            let gas_text = if state.gas_open {
-                RichText::new("💨 Gas ON").color(Color32::from_rgb(0, 220, 255)).size(12.0)
-            } else {
-                RichText::new("💨 Gas Purge").size(12.0)
-            };
-            if ui.add(Button::new(gas_text).fill(gas_bg)).on_hover_text("Open assist gas valve to purge line").clicked() {
-                state.gas_open = !state.gas_open;
-                if let Some(ref c) = controller {
-                    c.set_gas(3, state.gas_open); // 3 = Air
-                }
-                *status_message = format!("Assist gas valve: {}", if state.gas_open { "OPEN (Purging)" } else { "CLOSED" });
             }
         });
 
