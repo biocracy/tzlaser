@@ -970,10 +970,7 @@ impl PanelState {
 
         let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
         if self.run_mode == RunMode::Idle || self.full_trajectory.is_empty() {
-            let origin_head = kurbo::Point::new(
-                pulses_cfg.pulses_to_mm_x(status.pos_x),
-                pulses_cfg.pulses_to_mm_y(status.pos_y),
-            );
+            let origin_head = head_world_mm(status, pulses_cfg);
             let traj = doc.build_motion_trajectory(origin_head, 200.0);
             if traj.is_empty() {
                 return None;
@@ -1007,24 +1004,11 @@ impl PanelState {
             + best_prog_mm;
         let full_total: f64 = self.full_trajectory.iter().map(|s| s.length_mm).sum();
 
-        let origin_world = origin_world_mm(pulses_cfg);
-        let new_px = pulses_cfg.mm_to_pulses_x(best_pt.x - origin_world.x);
-        let new_py = pulses_cfg.mm_to_pulses_y(best_pt.y - origin_world.y);
         if let Some(ref c) = controller {
             if c.is_connected() {
                 c.stop();
-                let dx_p = new_px - status.pos_x;
-                let dy_p = new_py - status.pos_y;
-                if dx_p != 0 {
-                    c.jog(Axis::X, dx_p);
-                }
-                if dy_p != 0 {
-                    c.jog(Axis::Y, dy_p);
-                }
             }
         }
-        status.pos_x = new_px;
-        status.pos_y = new_py;
         status.laser_on = false;
 
         if self.run_mode == RunMode::Idle {
@@ -1064,7 +1048,7 @@ impl PanelState {
         self.pause_buffer.push(cp);
 
         Some(format!(
-            "Head moved to Path #{} @ X: {:.2}, Y: {:.2} mm (Pause mode). Press Continue or step along path.",
+            "Resume point set on Path #{} @ X: {:.2}, Y: {:.2} mm. Press Continue to traverse and resume.",
             best_seg.path_index_1based, best_pt.x, best_pt.y
         ))
     }
@@ -1899,6 +1883,9 @@ pub fn render_right_panels(
                             Ok(()) => {
                                 if let Some(msg) = panel_state.continue_run(doc, current_head, controller) {
                                     *status_message = msg;
+                                    if panel_state.run_mode == RunMode::DryCut {
+                                        panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
+                                    }
                                 }
                             }
                             Err(msg) => {
@@ -2658,27 +2645,26 @@ mod tests {
         assert!((snapped_pt.x - 100.0).abs() < 1e-6 && (snapped_pt.y - 50.0).abs() < 1e-6);
         assert!((dist - 2.0).abs() < 1e-6);
 
-        // From stopped (Idle) state, move head to clicked path point and enter Pause mode
+        // From stopped (Idle) state, set resume target on path WITHOUT teleporting the head
         assert_eq!(state.run_mode, RunMode::Idle);
         let msg = state.set_pause_at_path_point(&doc, snapped_pt, &None, &mut status, &pulses);
         assert!(msg.is_some());
         assert!(state.is_paused);
         assert_eq!(state.run_mode, RunMode::DryCut);
         assert!(!status.laser_on);
-        assert!((pulses.pulses_to_mm_x(status.pos_x) - 100.0).abs() < 0.05);
-        assert!((pulses.pulses_to_mm_y(status.pos_y) - 50.0).abs() < 0.05);
+        assert_eq!(status.pos_x, 0);
+        assert_eq!(status.pos_y, 0);
         assert_eq!(state.pause_buffer.len(), 1);
         let cp = state.paused_checkpoint.unwrap();
         assert!((cp.point_mm.x - 100.0).abs() < 1e-6 && (cp.point_mm.y - 50.0).abs() < 1e-6);
 
-        // Stepping forward and continuing from this paused point work seamlessly
-        assert!(state.step_along_path(true, 10.0, &None, &mut status, &pulses).is_some());
-        let stepped = state.paused_checkpoint.unwrap().point_mm;
-        assert!((stepped.x - 110.0).abs() < 1e-6 && (stepped.y - 50.0).abs() < 1e-6);
-
-        assert!(state.continue_run(&doc, stepped, &None).is_some());
+        // Continuing from current head (0, 0) must traverse the span to the resume point (100, 50)
+        let cur_head = head_world_mm(&status, &pulses);
+        assert!(state.continue_run(&doc, cur_head, &None).is_some());
         assert!(!state.is_paused);
-        assert!((state.trajectory[0].start.x - 110.0).abs() < 1e-6);
+        assert!(state.trajectory[0].is_rapid);
+        assert!((state.trajectory[0].start.x - 0.0).abs() < 1e-6 && (state.trajectory[0].start.y - 0.0).abs() < 1e-6);
+        assert!((state.trajectory[0].end.x - 100.0).abs() < 1e-6 && (state.trajectory[0].end.y - 50.0).abs() < 1e-6);
 
         // Active unpaused state must reject right-click jump-to-pause
         assert!(state.set_pause_at_path_point(&doc, snapped_pt, &None, &mut status, &pulses).is_none());
