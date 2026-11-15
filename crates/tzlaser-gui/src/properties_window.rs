@@ -128,6 +128,7 @@ impl MeasureAxisState {
 pub struct AxisPulseCalibState {
     pub axis: Axis,
     pub step_mm: f64,
+    pub speed_mm_s: f64,
     pub commanded_pulses_total: i32,
     pub commanded_signed_mm: f64,
     pub micrometer_reading_mm: f64,
@@ -138,6 +139,7 @@ impl AxisPulseCalibState {
         Self {
             axis,
             step_mm: 1.0,
+            speed_mm_s: 0.2,
             commanded_pulses_total: 0,
             commanded_signed_mm: 0.0,
             micrometer_reading_mm: 1.0,
@@ -1027,6 +1029,18 @@ fn axis_mm_to_pulses(pulse_config: &PulseConfig, axis: Axis, mm: f64) -> i32 {
     }
 }
 
+fn calib_jog_cfg_for_speed(pulse_config: &PulseConfig, axis: Axis, speed_mm_s: f64) -> JogConfig {
+    let ppm = axis_ppm(pulse_config, axis);
+    let spd = (speed_mm_s.max(0.01) * ppm).round().max(1.0) as u32;
+    let vmin = (spd / 2).max(1);
+    let accel = ((pulse_config.jog_accel_mm_s2.max(10.0) * ppm).round() as u32).max(100);
+    JogConfig {
+        min_speed: vmin,
+        jog_speed: spd,
+        accel,
+    }
+}
+
 fn jog_cfg_for_speed(pulse_config: &PulseConfig, axis: Axis, speed_mm_s: f64) -> JogConfig {
     let ppm = axis_ppm(pulse_config, axis);
     let spd = (speed_mm_s.max(0.5) * ppm).round() as u32;
@@ -1682,6 +1696,23 @@ fn render_axis_calib_dialog(
                 }
             });
 
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Step Speed:");
+                ui.add(
+                    DragValue::new(&mut d.speed_mm_s)
+                        .range(0.01..=100.0)
+                        .speed(0.02)
+                        .max_decimals(2)
+                        .suffix(format!(" {}/s", unit)),
+                );
+                for preset in [0.1, 0.2, 0.5, 1.0, 5.0] {
+                    if ui.small_button(format!("{}", preset)).clicked() {
+                        d.speed_mm_s = preset;
+                    }
+                }
+            });
+
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let neg_lbl = format!("{} -{:.2} {}", neg_arrow, d.step_mm, unit);
@@ -1699,7 +1730,8 @@ fn render_axis_calib_dialog(
                 {
                     if let Some(ref c) = controller {
                         let pulses = axis_mm_to_pulses(pulse_config, d.axis, -d.step_mm);
-                        c.jog(d.axis, pulses);
+                        let cfg = calib_jog_cfg_for_speed(pulse_config, d.axis, d.speed_mm_s);
+                        c.jog_with_config(d.axis, pulses, cfg, true);
                         d.commanded_pulses_total += pulses;
                         d.commanded_signed_mm -= d.step_mm;
                     }
@@ -1717,7 +1749,8 @@ fn render_axis_calib_dialog(
                 {
                     if let Some(ref c) = controller {
                         let pulses = axis_mm_to_pulses(pulse_config, d.axis, d.step_mm);
-                        c.jog(d.axis, pulses);
+                        let cfg = calib_jog_cfg_for_speed(pulse_config, d.axis, d.speed_mm_s);
+                        c.jog_with_config(d.axis, pulses, cfg, true);
                         d.commanded_pulses_total += pulses;
                         d.commanded_signed_mm += d.step_mm;
                     }

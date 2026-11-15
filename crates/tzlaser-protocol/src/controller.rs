@@ -318,7 +318,34 @@ impl LaserController {
                             config,
                             auto_stop,
                         } => {
-                            if pulses == 0 || axis == Axis::Z {
+                            if pulses == 0 {
+                                continue;
+                            }
+                            if axis == Axis::Z {
+                                if let Some(ref zs) = z_socket {
+                                    let custom_z_speed = ((config.jog_speed as f64) / 200.0)
+                                        .round()
+                                        .clamp(1.0, 500.0)
+                                        as u32;
+                                    let raw = build_z_jog_packet(pulses, custom_z_speed);
+                                    send_z_cmd_with_ack(
+                                        zs,
+                                        &raw,
+                                        &mut z_buf,
+                                        &mut z_status_seen,
+                                        &mut latest_z,
+                                    );
+                                    let z_timeout_secs = ((pulses.unsigned_abs() as f64)
+                                        / config.jog_speed.max(1) as f64
+                                        + 1.0)
+                                        .clamp(2.5, 120.0);
+                                    active_z_step_watch = Some((
+                                        latest_z.0,
+                                        pulses.unsigned_abs() as i32,
+                                        Instant::now() + Duration::from_secs_f64(z_timeout_secs),
+                                    ));
+                                    last_z_poll = Instant::now() - Duration::from_secs(1);
+                                }
                                 continue;
                             }
                             if pending_stop_p2_at.take().is_some() {
