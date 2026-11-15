@@ -391,9 +391,10 @@ impl eframe::App for TzlaserApp {
 
         // 4. Central 2D Vector CAD Canvas
         egui::CentralPanel::default().show(ctx, |ui| {
+            let (origin_world, _, _) = self.canvas_state.origin_world_and_axes();
             let laser_pos = Point::new(
-                self.pulse_config.pulses_to_mm_x(self.status.pos_x),
-                self.pulse_config.pulses_to_mm_y(self.status.pos_y),
+                origin_world.x + self.pulse_config.pulses_to_mm_x(self.status.pos_x),
+                origin_world.y + self.pulse_config.pulses_to_mm_y(self.status.pos_y),
             );
             let paused_points_mm: Vec<Point> = self
                 .panel_state
