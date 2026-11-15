@@ -615,8 +615,9 @@ pub fn decode_z_homed_from_poll(bytes: &[u8]) -> Option<bool> {
 }
 
 /// Decode `(z_pos_upper_limit_sensor, z_neg_collision_sensor)` from Port 999 64-word status response.
-/// - `D5` bit 0 (`(d5 & 1) != 0`) is set when the Z+ upper limit sensor is triggered.
-/// - `D2` / `D3` / `D4` non-zero (or capacitive spike `D7 > 650_000`) indicates a Z- / touch-off alarm.
+/// - `D2` bit 0 (`(d2 & 1) != 0`) is set while the Z+ upper limit sensor is triggered (and clears immediately on release).
+/// - `D3` non-zero or capacitive spike (`D7 > 650_000`) indicates a Z- / touch-off alarm.
+///   (`D4` latches after a Z+ limit hit and `D5 == 0x8000_0001` indicates Z-homed, so neither is treated as a sensor trigger.)
 pub fn decode_z_sensors_from_poll(bytes: &[u8]) -> Option<(bool, bool)> {
     if bytes.len() < 133 || bytes[0] != 0x01 || bytes[1] != 0x03 || bytes[2] != 0x80 {
         return None;
@@ -633,11 +634,9 @@ pub fn decode_z_sensors_from_poll(bytes: &[u8]) -> Option<(bool, bool)> {
     };
     let d2 = read_dword_ws(2);
     let d3 = read_dword_ws(3);
-    let d4 = read_dword_ws(4);
-    let d5 = read_dword_ws(5);
     let d7 = read_dword_ws(7);
-    let z_pos = (d5 & 0x0000_0001) != 0;
-    let z_neg = (d2 | d3 | d4) != 0 || d7 > 650_000;
+    let z_pos = (d2 & 0x0000_0001) != 0;
+    let z_neg = d3 != 0 || d7 > 650_000;
     Some((z_pos, z_neg))
 }
 
@@ -769,6 +768,56 @@ mod tests {
         assert_eq!(tl[3].data[0], 291); // 0x0123
         let tr = build_xy_home_packets(|| 0, HomeConfig { x_dir: 1, y_dir: 1, fast_speed_pls_s: 1000, slow_speed_pls_s: 200, max_search_pulses: 10_000 });
         assert_eq!(tr[3].data[0], 307); // 0x0133
+    }
+
+    #[test]
+    fn test_decode_z_sensors_from_poll() {
+        let make_poll = |d2: u32, d3: u32, d4: u32, d5: u32, d7: u32| -> Vec<u8> {
+            let mut buf = vec![0u8; 133];
+            buf[0] = 0x01;
+            buf[1] = 0x03;
+            buf[2] = 0x80;
+            let mut write_dw = |idx: usize, val: u32| {
+                let base = 3 + idx * 4;
+                let w0 = (val & 0xFFFF) as u16;
+                let w1 = ((val >> 16) & 0xFFFF) as u16;
+                buf[base..base + 2].copy_from_slice(&w0.to_be_bytes());
+                buf[base + 2..base + 4].copy_from_slice(&w1.to_be_bytes());
+            };
+            write_dw(2, d2);
+            write_dw(3, d3);
+            write_dw(4, d4);
+            write_dw(5, d5);
+            write_dw(7, d7);
+            let crc = modbus_crc16(&buf[..131]);
+            buf[131..133].copy_from_slice(&crc.to_le_bytes());
+            buf
+        };
+
+        // Open air, homed (D5=0x8000_0001, D7=383_162): neither Z+ nor Z- triggered
+        assert_eq!(
+            decode_z_sensors_from_poll(&make_poll(0, 0, 0, 0x8000_0001, 383_162)),
+            Some((false, false))
+        );
+        // Z+ upper limit touched (D2=1, D4=1): Z+ is true, Z- stays false
+        assert_eq!(
+            decode_z_sensors_from_poll(&make_poll(1, 0, 1, 0x8000_0000, 383_359)),
+            Some((true, false))
+        );
+        // Z+ released while D4 remains latched (D2=0, D4=1): both false
+        assert_eq!(
+            decode_z_sensors_from_poll(&make_poll(0, 0, 1, 0x8000_0000, 383_356)),
+            Some((false, false))
+        );
+        // Z- capacitive spike / collision (D7 > 650_000 or D3 != 0): Z- is true
+        assert_eq!(
+            decode_z_sensors_from_poll(&make_poll(0, 0, 0, 0x8000_0001, 700_000)),
+            Some((false, true))
+        );
+        assert_eq!(
+            decode_z_sensors_from_poll(&make_poll(0, 1, 0, 0x8000_0001, 383_162)),
+            Some((false, true))
+        );
     }
 }
 
