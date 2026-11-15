@@ -91,6 +91,7 @@ impl LaserController {
             let mut pending_remote_stop_at: Option<Instant> = None;
             let mut prev_remote_mask: u32 = 0;
             let mut last_r1004: u32 = 0;
+            let mut pending_xy_home_after_z: Option<(HomeConfig, Instant, Instant)> = None;
 
             // Helper to send a Port 502 packet and wait briefly for its ACK during initialization
             let send_and_wait_ack = |sock: &UdpSocket, pkt: &Packet, recv_buf: &mut [u8]| -> bool {
@@ -462,6 +463,7 @@ impl LaserController {
                             active_step_watch = None;
                             active_z_step_watch = None;
                             active_remote_jog = None;
+                            pending_xy_home_after_z = None;
                             let (p1, _p2) = build_stop_packets(|| {
                                 seq_clone.fetch_add(1, Ordering::Relaxed)
                             });
@@ -486,7 +488,8 @@ impl LaserController {
                             active_z_step_watch = None;
                             active_remote_jog = None;
 
-                            // 1. Home Z up first so the nozzle clears the sheet before XY moves
+                            // 1. Home Z up first so the nozzle clears the sheet before XY moves.
+                            //    XY homing will be triggered once Z homing completes (matching SC2000).
                             if let Some(ref zs) = z_socket {
                                 let raw_z_home = build_z_home_packet();
                                 send_z_cmd_with_ack(
@@ -496,19 +499,46 @@ impl LaserController {
                                     &mut z_status_seen,
                                     &mut latest_z,
                                 );
+                                {
+                                    let mut st = status_clone.lock().unwrap();
+                                    st.is_homing_z = true;
+                                }
                                 last_z_poll = Instant::now() - Duration::from_secs(1);
-                            }
-
-                            // 2. Home X and Y toward the selected origin corner
-                            for hpkt in build_xy_home_packets(
-                                || seq_clone.fetch_add(1, Ordering::Relaxed),
-                                home_cfg,
-                            ) {
-                                let _ = send_and_wait_ack(&socket, &hpkt, &mut buf);
+                                pending_xy_home_after_z = Some((
+                                    home_cfg,
+                                    Instant::now(),
+                                    Instant::now() + Duration::from_secs(15),
+                                ));
+                            } else {
+                                if pending_stop_p2_at.take().is_some() {
+                                    let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let p2 = Packet::write_request(
+                                        s_rst,
+                                        registers::REG_COMMAND,
+                                        vec![2],
+                                    );
+                                    let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                    thread::sleep(Duration::from_millis(25));
+                                }
+                                let s_en = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let en = Packet::write_request(
+                                    s_en,
+                                    registers::REG_ENABLE_FLAG,
+                                    vec![1],
+                                );
+                                let _ = send_and_wait_ack(&socket, &en, &mut buf);
+                                last_r1004 = 0;
+                                for hpkt in build_xy_home_packets(
+                                    || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                    home_cfg,
+                                ) {
+                                    let _ = send_and_wait_ack(&socket, &hpkt, &mut buf);
+                                }
                             }
                         }
                         Command::HomeZ => {
                             active_z_step_watch = None;
+                            pending_xy_home_after_z = None;
                             if let Some(ref zs) = z_socket {
                                 let raw_z_home = build_z_home_packet();
                                 send_z_cmd_with_ack(
@@ -594,6 +624,7 @@ impl LaserController {
 
                 // 4. Poll Port 999 Z-axis & height controller status (80ms during Z motion, 300ms idle)
                 let z_poll_interval = if active_z_step_watch.is_some()
+                    || pending_xy_home_after_z.is_some()
                     || matches!(active_remote_jog, Some((Axis::Z, _)))
                 {
                     Duration::from_millis(80)
@@ -897,6 +928,43 @@ impl LaserController {
                                 }
                                 st.is_homing_z = state_code == 2 && !st.z_homed;
                             }
+                        }
+                    }
+                }
+
+                // 7. Trigger deferred XY homing once Z homing has completed
+                if let Some((home_cfg, started_at, deadline)) = pending_xy_home_after_z {
+                    let z_done = {
+                        let st = status_clone.lock().unwrap();
+                        started_at.elapsed() >= Duration::from_millis(500)
+                            && !st.is_homing_z
+                            && (st.z_homed || latest_z.2 == 0)
+                    };
+                    if z_done || Instant::now() >= deadline {
+                        pending_xy_home_after_z = None;
+                        if pending_stop_p2_at.take().is_some() {
+                            let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let p2 = Packet::write_request(
+                                s_rst,
+                                registers::REG_COMMAND,
+                                vec![2],
+                            );
+                            let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        let s_en = seq_clone.fetch_add(1, Ordering::Relaxed);
+                        let en = Packet::write_request(
+                            s_en,
+                            registers::REG_ENABLE_FLAG,
+                            vec![1],
+                        );
+                        let _ = send_and_wait_ack(&socket, &en, &mut buf);
+                        last_r1004 = 0;
+                        for hpkt in build_xy_home_packets(
+                            || seq_clone.fetch_add(1, Ordering::Relaxed),
+                            home_cfg,
+                        ) {
+                            let _ = send_and_wait_ack(&socket, &hpkt, &mut buf);
                         }
                     }
                 }
