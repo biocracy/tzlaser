@@ -171,6 +171,10 @@ pub struct MachineStatus {
     pub z_homed: bool,
     pub is_homing_xy: bool,
     pub is_homing_z: bool,
+    pub is_moving: bool,
+    /// Upper byte of `R1002` (`(regs[2] >> 16) & 0xFF`): hardware limit sensor bitmask
+    /// (observed: `0x01` = X+, `0x02` = X-, `0x90` = Y1-/Y2- dual-drive).
+    pub limit_sensor_mask: u32,
     pub raw_registers: Vec<u32>,
 }
 
@@ -197,6 +201,8 @@ impl Default for MachineStatus {
             z_homed: false,
             is_homing_xy: false,
             is_homing_z: false,
+            is_moving: false,
+            limit_sensor_mask: 0,
             raw_registers: Vec::new(),
         }
     }
@@ -242,6 +248,8 @@ impl MachineStatus {
         let follower_active = regs.get(36).copied().unwrap_or(0) != 0;
         let xy_homed = (regs.get(3).copied().unwrap_or(0) & 0x03) == 0x03;
         let is_homing_xy = regs.get(5).copied().unwrap_or(0) == 1;
+        let is_moving = regs.get(7).copied().unwrap_or(0) != 0;
+        let limit_sensor_mask = (regs.get(2).copied().unwrap_or(0) >> 16) & 0xFF;
 
         Self {
             pos_x,
@@ -264,7 +272,18 @@ impl MachineStatus {
             z_homed: false,
             is_homing_xy,
             is_homing_z: false,
+            is_moving,
+            limit_sensor_mask,
             raw_registers: regs.to_vec(),
+        }
+    }
+
+    /// Returns true if any limit sensor on `axis` is currently active in `R1002`.
+    pub fn axis_limit_active(&self, axis: Axis) -> bool {
+        match axis {
+            Axis::X => (self.limit_sensor_mask & 0x03) != 0,
+            Axis::Y => (self.limit_sensor_mask & 0xFC) != 0,
+            Axis::Z | Axis::W => false,
         }
     }
 

@@ -236,6 +236,16 @@ impl PulseConfig {
         let accel = (self.jog_accel_mm_s2.max(1.0) * scale).round() as u32;
         (min_speed.max(50), jog_speed.max(50), accel.max(200))
     }
+
+    /// Effective X cutting width (physical table width minus homing retraction).
+    pub fn cut_width_mm(&self) -> f64 {
+        (self.table_width_mm - self.home_retract_x_mm.max(0.0)).max(10.0)
+    }
+
+    /// Effective Y cutting height (physical table height minus homing retraction).
+    pub fn cut_height_mm(&self) -> f64 {
+        (self.table_height_mm - self.home_retract_y_mm.max(0.0)).max(10.0)
+    }
 }
 
 #[cfg(test)]

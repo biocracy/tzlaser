@@ -1,9 +1,11 @@
+use std::time::{Duration, Instant};
+
 use eframe::egui::{
     self, Button, Color32, ComboBox, Context, DragValue, Frame, Grid, RichText, TextEdit, Vec2,
     Window,
 };
 use tzlaser_core::PulseConfig;
-use tzlaser_protocol::{JogConfig, LaserController};
+use tzlaser_protocol::{Axis, JogConfig, LaserController, MachineStatus};
 
 use crate::canvas::CanvasState;
 use crate::panels::{JogMode, PanelState};
@@ -16,11 +18,119 @@ pub enum CalibAxisTarget {
     Z,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasureApplyChoice {
+    Average,
+    OriginToMax,
+    MaxToOrigin,
+    Custom,
+}
+
+impl MeasureApplyChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Average => "AVG",
+            Self::OriginToMax => "0->MX",
+            Self::MaxToOrigin => "MX->0",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurePhase {
+    Confirm,
+    /// If already on origin sensor at start, back off 5mm first before touching off.
+    PreClearOrigin,
+    SeekOrigin,
+    SeekMax,
+    RetractFromMax,
+    RetouchMax,
+    ReturnFast,
+    ReturnSlow,
+    Done,
+    Stopped,
+}
+
+pub struct MeasureAxisState {
+    pub axis: Axis,
+    pub phase: MeasurePhase,
+    pub slow_speed_mm_s: f64,
+    pub fast_return_speed_mm_s: f64,
+    pub phase_entered_at: Instant,
+    pub motion_seen: bool,
+    pub phase_start_pulses: i32,
+    pub expected_move_mm: f64,
+    pub origin_pos_1: i32,
+    pub max_pos_1: i32,
+    pub max_pos_2: i32,
+    pub origin_pos_2: i32,
+    pub meas_origin_to_max_mm: Option<f64>,
+    pub meas_max_to_origin_mm: Option<f64>,
+    pub apply_choice: MeasureApplyChoice,
+    pub custom_mm: f64,
+    pub status_note: String,
+}
+
+impl MeasureAxisState {
+    pub fn new(axis: Axis, initial_table_mm: f64) -> Self {
+        Self {
+            axis,
+            phase: MeasurePhase::Confirm,
+            slow_speed_mm_s: 5.0,
+            fast_return_speed_mm_s: 10.0,
+            phase_entered_at: Instant::now(),
+            motion_seen: false,
+            phase_start_pulses: 0,
+            expected_move_mm: 0.0,
+            origin_pos_1: 0,
+            max_pos_1: 0,
+            max_pos_2: 0,
+            origin_pos_2: 0,
+            meas_origin_to_max_mm: None,
+            meas_max_to_origin_mm: None,
+            apply_choice: MeasureApplyChoice::Average,
+            custom_mm: initial_table_mm,
+            status_note: "Ready to measure physical table travel.".to_string(),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.phase,
+            MeasurePhase::PreClearOrigin
+                | MeasurePhase::SeekOrigin
+                | MeasurePhase::SeekMax
+                | MeasurePhase::RetractFromMax
+                | MeasurePhase::RetouchMax
+                | MeasurePhase::ReturnFast
+                | MeasurePhase::ReturnSlow
+        )
+    }
+
+    pub fn avg_mm(&self) -> Option<f64> {
+        match (self.meas_origin_to_max_mm, self.meas_max_to_origin_mm) {
+            (Some(a), Some(b)) => Some(0.5 * (a + b)),
+            _ => None,
+        }
+    }
+
+    pub fn selected_apply_mm(&self) -> Option<f64> {
+        match self.apply_choice {
+            MeasureApplyChoice::Average => self.avg_mm(),
+            MeasureApplyChoice::OriginToMax => self.meas_origin_to_max_mm,
+            MeasureApplyChoice::MaxToOrigin => self.meas_max_to_origin_mm,
+            MeasureApplyChoice::Custom => Some(self.custom_mm),
+        }
+    }
+}
+
 pub struct PropertiesWindowState {
     pub open: bool,
     pub calib_target: CalibAxisTarget,
     pub calib_commanded_mm: f64,
     pub calib_measured_mm: f64,
+    pub measure_axis: Option<MeasureAxisState>,
 }
 
 impl Default for PropertiesWindowState {
@@ -30,6 +140,7 @@ impl Default for PropertiesWindowState {
             calib_target: CalibAxisTarget::XY,
             calib_commanded_mm: 10.0,
             calib_measured_mm: 10.0,
+            measure_axis: None,
         }
     }
 }
@@ -42,8 +153,8 @@ pub fn sync_and_save_properties(
     controller: &Option<LaserController>,
     status_message: &mut String,
 ) {
-    canvas_state.bed_width_mm = pulse_config.table_width_mm.max(10.0) as f32;
-    canvas_state.bed_height_mm = pulse_config.table_height_mm.max(10.0) as f32;
+    canvas_state.bed_width_mm = pulse_config.cut_width_mm() as f32;
+    canvas_state.bed_height_mm = pulse_config.cut_height_mm() as f32;
     canvas_state.origin_corner = pulse_config.origin_corner.clone();
     canvas_state.home_retract_x_mm = pulse_config.home_retract_x_mm.max(0.0);
     canvas_state.home_retract_y_mm = pulse_config.home_retract_y_mm.max(0.0);
@@ -85,8 +196,36 @@ pub fn render_properties_window(
     canvas_state: &mut CanvasState,
     panel_state: &mut PanelState,
     controller: &Option<LaserController>,
+    status: &MachineStatus,
     status_message: &mut String,
 ) {
+    canvas_state.bed_width_mm = pulse_config.cut_width_mm() as f32;
+    canvas_state.bed_height_mm = pulse_config.cut_height_mm() as f32;
+    canvas_state.origin_corner = pulse_config.origin_corner.clone();
+    canvas_state.home_retract_x_mm = pulse_config.home_retract_x_mm.max(0.0);
+    canvas_state.home_retract_y_mm = pulse_config.home_retract_y_mm.max(0.0);
+
+    let mut measure_applied = false;
+    if state.measure_axis.is_some() {
+        measure_applied = render_measure_axis_dialog(
+            ctx,
+            state,
+            pulse_config,
+            controller,
+            status,
+            status_message,
+        );
+    }
+    if measure_applied {
+        sync_and_save_properties(
+            pulse_config,
+            canvas_state,
+            panel_state,
+            controller,
+            status_message,
+        );
+    }
+
     if !state.open {
         return;
     }
@@ -197,30 +336,60 @@ pub fn render_properties_window(
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
                     ui.label("Table Width (X):");
-                    if ui
-                        .add(
-                            DragValue::new(&mut pulse_config.table_width_mm)
-                                .range(50.0..=10_000.0)
-                                .speed(5.0)
-                                .suffix(" mm"),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                DragValue::new(&mut pulse_config.table_width_mm)
+                                    .range(50.0..=10_000.0)
+                                    .speed(5.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .add(
+                                Button::new(RichText::new("📏 Measure X").size(11.0).strong())
+                                    .fill(Color32::from_rgb(30, 75, 115)),
+                            )
+                            .on_hover_text("Measure physical X-axis table length between origin and max limit sensors")
+                            .clicked()
+                        {
+                            state.measure_axis = Some(MeasureAxisState::new(
+                                Axis::X,
+                                pulse_config.table_width_mm,
+                            ));
+                        }
+                    });
 
                     ui.label("Table Length (Y):");
-                    if ui
-                        .add(
-                            DragValue::new(&mut pulse_config.table_height_mm)
-                                .range(50.0..=10_000.0)
-                                .speed(5.0)
-                                .suffix(" mm"),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                DragValue::new(&mut pulse_config.table_height_mm)
+                                    .range(50.0..=10_000.0)
+                                    .speed(5.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .add(
+                                Button::new(RichText::new("📏 Measure Y").size(11.0).strong())
+                                    .fill(Color32::from_rgb(30, 75, 115)),
+                            )
+                            .on_hover_text("Measure physical Y-axis table length between origin and max limit sensors")
+                            .clicked()
+                        {
+                            state.measure_axis = Some(MeasureAxisState::new(
+                                Axis::Y,
+                                pulse_config.table_height_mm,
+                            ));
+                        }
+                    });
                     ui.end_row();
 
                     ui.label("Z Max Travel:");
@@ -307,6 +476,16 @@ pub fn render_properties_window(
                     ui.end_row();
                 });
 
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Effective Cut Area (Table − Retract): {:.1} × {:.1} mm",
+                    pulse_config.cut_width_mm(),
+                    pulse_config.cut_height_mm()
+                ))
+                .size(11.5)
+                .color(Color32::from_rgb(130, 225, 175)),
+            );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
@@ -721,4 +900,614 @@ pub fn render_properties_window(
     if close_clicked || !is_open {
         state.open = false;
     }
+}
+
+fn axis_origin_dir(pulse_config: &PulseConfig, axis: Axis) -> i32 {
+    let oc = pulse_config.origin_corner.as_str();
+    let x_dir = if oc.starts_with("Bottom-Right") || oc.starts_with("Top-Right") {
+        1
+    } else {
+        -1
+    };
+    let y_dir = if oc.starts_with("Top-Left") || oc.starts_with("Top-Right") {
+        1
+    } else {
+        -1
+    };
+    match axis {
+        Axis::X => x_dir,
+        Axis::Y => y_dir,
+        _ => -1,
+    }
+}
+
+fn axis_pos_pulses(status: &MachineStatus, axis: Axis) -> i32 {
+    match axis {
+        Axis::X => status.pos_x,
+        Axis::Y => status.pos_y,
+        Axis::Z => status.pos_z,
+        Axis::W => status.pos_w,
+    }
+}
+
+fn axis_ppm(pulse_config: &PulseConfig, axis: Axis) -> f64 {
+    match axis {
+        Axis::X => pulse_config.pulses_per_mm_x.max(0.001),
+        Axis::Y => pulse_config.pulses_per_mm_y.max(0.001),
+        Axis::Z => pulse_config.pulses_per_mm_z.max(0.001),
+        Axis::W => pulse_config.pulses_per_deg_w.max(0.001),
+    }
+}
+
+fn axis_mm_to_pulses(pulse_config: &PulseConfig, axis: Axis, mm: f64) -> i32 {
+    match axis {
+        Axis::X => pulse_config.mm_to_pulses_x(mm),
+        Axis::Y => pulse_config.mm_to_pulses_y(mm),
+        Axis::Z => pulse_config.mm_to_pulses_z(mm),
+        Axis::W => (mm * pulse_config.pulses_per_deg_w.max(0.001)).round() as i32,
+    }
+}
+
+fn jog_cfg_for_speed(pulse_config: &PulseConfig, axis: Axis, speed_mm_s: f64) -> JogConfig {
+    let ppm = axis_ppm(pulse_config, axis);
+    let spd = (speed_mm_s.max(0.5) * ppm).round() as u32;
+    let vmin = (spd / 2).max(50);
+    let accel = ((pulse_config.jog_accel_mm_s2.max(10.0) * ppm).round() as u32).max(500);
+    JogConfig {
+        min_speed: vmin,
+        jog_speed: spd.max(50),
+        accel,
+    }
+}
+
+fn command_axis_move(
+    controller: &LaserController,
+    pulse_config: &PulseConfig,
+    axis: Axis,
+    dir: i32,
+    dist_mm: f64,
+    speed_mm_s: f64,
+    auto_stop: bool,
+) {
+    let pulses = axis_mm_to_pulses(pulse_config, axis, dist_mm * (dir as f64));
+    let cfg = jog_cfg_for_speed(pulse_config, axis, speed_mm_s);
+    controller.jog_with_config(axis, pulses, cfg, auto_stop);
+}
+
+fn tick_measure_axis(
+    m: &mut MeasureAxisState,
+    pulse_config: &PulseConfig,
+    controller: &LaserController,
+    status: &MachineStatus,
+) {
+    if !m.is_running() {
+        return;
+    }
+
+    if status.is_moving {
+        m.motion_seen = true;
+    }
+
+    let elapsed = m.phase_entered_at.elapsed();
+    if elapsed < Duration::from_millis(180) {
+        return;
+    }
+
+    let axis = m.axis;
+    let origin_dir = axis_origin_dir(pulse_config, axis);
+    let max_dir = -origin_dir;
+    let ppm = axis_ppm(pulse_config, axis);
+    let cur_pos = axis_pos_pulses(status, axis);
+    let traveled_mm = ((cur_pos - m.phase_start_pulses).abs() as f64) / ppm;
+    let expected_table_mm = match axis {
+        Axis::X => pulse_config.table_width_mm,
+        Axis::Y => pulse_config.table_height_mm,
+        _ => 1500.0,
+    };
+    let max_search_mm = (expected_table_mm + 500.0).max(2000.0);
+    let sensor_triggered =
+        (status.axis_limit_active(axis) && !status.is_moving) || (m.motion_seen && !status.is_moving);
+
+    match m.phase {
+        MeasurePhase::PreClearOrigin => {
+            if (m.motion_seen && !status.is_moving)
+                || (traveled_mm >= m.expected_move_mm - 0.5 && !status.is_moving)
+            {
+                m.phase = MeasurePhase::SeekOrigin;
+                m.phase_entered_at = Instant::now();
+                m.motion_seen = false;
+                m.phase_start_pulses = cur_pos;
+                m.expected_move_mm = max_search_mm;
+                m.status_note = format!(
+                    "Phase 1/5: Seeking {:?} origin sensor at {:.1} mm/s...",
+                    axis, m.slow_speed_mm_s
+                );
+                command_axis_move(
+                    controller,
+                    pulse_config,
+                    axis,
+                    origin_dir,
+                    max_search_mm,
+                    m.slow_speed_mm_s,
+                    false,
+                );
+            }
+        }
+        MeasurePhase::SeekOrigin => {
+            if sensor_triggered {
+                m.origin_pos_1 = cur_pos;
+                m.phase = MeasurePhase::SeekMax;
+                m.phase_entered_at = Instant::now();
+                m.motion_seen = false;
+                m.phase_start_pulses = cur_pos;
+                m.expected_move_mm = max_search_mm;
+                m.status_note = format!(
+                    "Phase 2/5: Measuring 0 → MX at {:.1} mm/s until max sensor...",
+                    m.slow_speed_mm_s
+                );
+                command_axis_move(
+                    controller,
+                    pulse_config,
+                    axis,
+                    max_dir,
+                    max_search_mm,
+                    m.slow_speed_mm_s,
+                    false,
+                );
+            }
+        }
+        MeasurePhase::SeekMax => {
+            if sensor_triggered && traveled_mm > 1.0 {
+                m.max_pos_1 = cur_pos;
+                m.meas_origin_to_max_mm = Some(((m.max_pos_1 - m.origin_pos_1).abs() as f64) / ppm);
+                m.phase = MeasurePhase::RetractFromMax;
+                m.phase_entered_at = Instant::now();
+                m.motion_seen = false;
+                m.phase_start_pulses = cur_pos;
+                m.expected_move_mm = 10.0;
+                m.status_note = "Phase 3/5: Retracting 10.0 mm from max sensor...".to_string();
+                command_axis_move(
+                    controller,
+                    pulse_config,
+                    axis,
+                    origin_dir,
+                    10.0,
+                    m.slow_speed_mm_s,
+                    true,
+                );
+            }
+        }
+        MeasurePhase::RetractFromMax => {
+            if (m.motion_seen && !status.is_moving)
+                || (traveled_mm >= 9.0 && !status.is_moving)
+            {
+                m.phase = MeasurePhase::RetouchMax;
+                m.phase_entered_at = Instant::now();
+                m.motion_seen = false;
+                m.phase_start_pulses = cur_pos;
+                m.expected_move_mm = 30.0;
+                m.status_note = format!(
+                    "Phase 4/5: Re-touching max sensor at {:.1} mm/s...",
+                    m.slow_speed_mm_s
+                );
+                command_axis_move(
+                    controller,
+                    pulse_config,
+                    axis,
+                    max_dir,
+                    30.0,
+                    m.slow_speed_mm_s,
+                    false,
+                );
+            }
+        }
+        MeasurePhase::RetouchMax => {
+            if sensor_triggered && traveled_mm > 0.5 {
+                m.max_pos_2 = cur_pos;
+                let fast_dist = (expected_table_mm - 100.0).max(0.0);
+                if fast_dist > 1.0 {
+                    m.phase = MeasurePhase::ReturnFast;
+                    m.phase_entered_at = Instant::now();
+                    m.motion_seen = false;
+                    m.phase_start_pulses = cur_pos;
+                    m.expected_move_mm = fast_dist;
+                    m.status_note = format!(
+                        "Phase 5/5: Measuring MX → 0 at {:.1} mm/s (slowdown 100 mm before origin)...",
+                        m.fast_return_speed_mm_s
+                    );
+                    command_axis_move(
+                        controller,
+                        pulse_config,
+                        axis,
+                        origin_dir,
+                        fast_dist,
+                        m.fast_return_speed_mm_s,
+                        true,
+                    );
+                } else {
+                    m.phase = MeasurePhase::ReturnSlow;
+                    m.phase_entered_at = Instant::now();
+                    m.motion_seen = false;
+                    m.phase_start_pulses = cur_pos;
+                    m.expected_move_mm = max_search_mm;
+                    m.status_note = format!(
+                        "Phase 5/5: Approaching origin sensor at {:.1} mm/s...",
+                        m.slow_speed_mm_s
+                    );
+                    command_axis_move(
+                        controller,
+                        pulse_config,
+                        axis,
+                        origin_dir,
+                        max_search_mm,
+                        m.slow_speed_mm_s,
+                        false,
+                    );
+                }
+            }
+        }
+        MeasurePhase::ReturnFast => {
+            if status.axis_limit_active(axis) && !status.is_moving && traveled_mm > 5.0 {
+                // Origin sensor reached earlier than expected
+                m.origin_pos_2 = cur_pos;
+                let d2 = ((m.max_pos_2 - m.origin_pos_2).abs() as f64) / ppm;
+                m.meas_max_to_origin_mm = Some(d2);
+                if let Some(avg) = m.avg_mm() {
+                    m.custom_mm = avg;
+                }
+                m.phase = MeasurePhase::Done;
+                m.status_note = "Measurement complete!".to_string();
+            } else if (m.motion_seen && !status.is_moving)
+                || (traveled_mm >= m.expected_move_mm - 1.0 && !status.is_moving)
+            {
+                m.phase = MeasurePhase::ReturnSlow;
+                m.phase_entered_at = Instant::now();
+                m.motion_seen = false;
+                m.phase_start_pulses = cur_pos;
+                m.expected_move_mm = max_search_mm;
+                m.status_note = format!(
+                    "Phase 5/5: Final 100 mm slowdown at {:.1} mm/s until origin sensor...",
+                    m.slow_speed_mm_s
+                );
+                command_axis_move(
+                    controller,
+                    pulse_config,
+                    axis,
+                    origin_dir,
+                    max_search_mm,
+                    m.slow_speed_mm_s,
+                    false,
+                );
+            }
+        }
+        MeasurePhase::ReturnSlow => {
+            if sensor_triggered && traveled_mm > 0.5 {
+                m.origin_pos_2 = cur_pos;
+                let d2 = ((m.max_pos_2 - m.origin_pos_2).abs() as f64) / ppm;
+                m.meas_max_to_origin_mm = Some(d2);
+                if let Some(avg) = m.avg_mm() {
+                    m.custom_mm = avg;
+                }
+                m.phase = MeasurePhase::Done;
+                m.status_note = "Measurement complete!".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_measure_axis_dialog(
+    ctx: &Context,
+    state: &mut PropertiesWindowState,
+    pulse_config: &mut PulseConfig,
+    controller: &Option<LaserController>,
+    status: &MachineStatus,
+    status_message: &mut String,
+) -> bool {
+    let Some(mut m) = state.measure_axis.take() else {
+        return false;
+    };
+
+    if m.is_running() {
+        if let Some(ref c) = controller {
+            if c.is_connected() {
+                tick_measure_axis(&mut m, pulse_config, c, status);
+                ctx.request_repaint_after(Duration::from_millis(30));
+            } else {
+                m.phase = MeasurePhase::Stopped;
+                m.status_note = "Controller disconnected during measurement.".to_string();
+            }
+        } else {
+            m.phase = MeasurePhase::Stopped;
+            m.status_note = "No controller available.".to_string();
+        }
+    }
+
+    let axis_name = match m.axis {
+        Axis::X => "X",
+        Axis::Y => "Y",
+        _ => "Axis",
+    };
+    let is_connected = controller.as_ref().is_some_and(|c| c.is_connected());
+    let mut keep_open = true;
+    let mut applied = false;
+
+    Window::new(format!("📏 Measure Table {} Axis", axis_name))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(430.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_min_width(410.0);
+
+            match m.phase {
+                MeasurePhase::Confirm => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Perform physical {}-axis table length measurement?",
+                            axis_name
+                        ))
+                        .size(13.0)
+                        .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Sequence:\n\
+                             1. Touch off origin sensor at slow speed\n\
+                             2. Advance to opposite (MX) sensor at slow speed (0 → MX)\n\
+                             3. Retract 10 mm and re-touch MX sensor\n\
+                             4. Return at 10 mm/s, slowing to 5 mm/s 100 mm before origin (MX → 0)",
+                        )
+                        .size(11.5)
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Slow Touch Speed:");
+                        ui.add(
+                            DragValue::new(&mut m.slow_speed_mm_s)
+                                .range(1.0..=50.0)
+                                .speed(0.5)
+                                .suffix(" mm/s"),
+                        );
+                    });
+                }
+                _ => {
+                    ui.label(RichText::new(&m.status_note).size(12.5).strong());
+                    ui.add_space(6.0);
+                    let ppm = axis_ppm(pulse_config, m.axis);
+                    let live_mm = (axis_pos_pulses(status, m.axis) as f64) / ppm;
+                    ui.label(
+                        RichText::new(format!(
+                            "Live {} Position: {:.2} mm  |  Moving: {}  |  Sensor: {}",
+                            axis_name,
+                            live_mm,
+                            if status.is_moving { "Yes" } else { "No" },
+                            if status.axis_limit_active(m.axis) {
+                                "TRIGGERED"
+                            } else {
+                                "Clear"
+                            }
+                        ))
+                        .size(11.0)
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+
+                    Frame::group(ui.style()).show(ui, |ui| {
+                        Grid::new("measure_results_grid")
+                            .num_columns(2)
+                            .spacing([16.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("1st Measurement (0 → MX):");
+                                ui.label(match m.meas_origin_to_max_mm {
+                                    Some(v) => RichText::new(format!("{:.2} mm", v))
+                                        .strong()
+                                        .color(Color32::from_rgb(120, 220, 255)),
+                                    None => RichText::new("Pending...").weak(),
+                                });
+                                ui.end_row();
+
+                                ui.label("2nd Measurement (MX → 0):");
+                                ui.label(match m.meas_max_to_origin_mm {
+                                    Some(v) => RichText::new(format!("{:.2} mm", v))
+                                        .strong()
+                                        .color(Color32::from_rgb(120, 240, 180)),
+                                    None => RichText::new("Pending...").weak(),
+                                });
+                                ui.end_row();
+
+                                ui.label("Average (AVG):");
+                                ui.label(match m.avg_mm() {
+                                    Some(v) => RichText::new(format!("{:.2} mm", v))
+                                        .strong()
+                                        .color(Color32::from_rgb(255, 220, 120)),
+                                    None => RichText::new("—").weak(),
+                                });
+                                ui.end_row();
+                            });
+                    });
+                }
+            }
+
+            if m.phase == MeasurePhase::Done {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let apply_enabled = m.selected_apply_mm().is_some();
+                    if ui
+                        .add_enabled(
+                            apply_enabled,
+                            Button::new(
+                                RichText::new("✓ Apply to Table")
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(28, 125, 78))
+                            .min_size(Vec2::new(120.0, 26.0)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(val) = m.selected_apply_mm() {
+                            let clamped = val.clamp(50.0, 10_000.0);
+                            match m.axis {
+                                Axis::X => pulse_config.table_width_mm = clamped,
+                                Axis::Y => pulse_config.table_height_mm = clamped,
+                                _ => {}
+                            }
+                            *status_message = format!(
+                                "Applied measured {} table dimension: {:.2} mm ({}).",
+                                axis_name,
+                                clamped,
+                                m.apply_choice.label()
+                            );
+                            applied = true;
+                            keep_open = false;
+                        }
+                    }
+
+                    ComboBox::from_id_salt("measure_apply_choice_combo")
+                        .width(90.0)
+                        .selected_text(m.apply_choice.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut m.apply_choice,
+                                MeasureApplyChoice::Average,
+                                "AVG",
+                            );
+                            ui.selectable_value(
+                                &mut m.apply_choice,
+                                MeasureApplyChoice::OriginToMax,
+                                "0->MX",
+                            );
+                            ui.selectable_value(
+                                &mut m.apply_choice,
+                                MeasureApplyChoice::MaxToOrigin,
+                                "MX->0",
+                            );
+                            ui.selectable_value(
+                                &mut m.apply_choice,
+                                MeasureApplyChoice::Custom,
+                                "Custom",
+                            );
+                        });
+
+                    if m.apply_choice == MeasureApplyChoice::Custom {
+                        ui.add(
+                            DragValue::new(&mut m.custom_mm)
+                                .range(50.0..=10_000.0)
+                                .speed(1.0)
+                                .suffix(" mm"),
+                        );
+                    }
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                if m.phase == MeasurePhase::Confirm {
+                    if ui
+                        .add_enabled(
+                            is_connected,
+                            Button::new(
+                                RichText::new("▶ Start Measurement")
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(28, 125, 78))
+                            .min_size(Vec2::new(140.0, 26.0)),
+                        )
+                        .on_disabled_hover_text("Connect to controller board first")
+                        .clicked()
+                    {
+                        if let Some(ref c) = controller {
+                            let origin_dir = axis_origin_dir(pulse_config, m.axis);
+                            let max_dir = -origin_dir;
+                            let cur_pos = axis_pos_pulses(status, m.axis);
+                            let expected_table_mm = match m.axis {
+                                Axis::X => pulse_config.table_width_mm,
+                                Axis::Y => pulse_config.table_height_mm,
+                                _ => 1500.0,
+                            };
+                            let max_search_mm = (expected_table_mm + 500.0).max(2000.0);
+                            m.phase_entered_at = Instant::now();
+                            m.motion_seen = false;
+                            m.phase_start_pulses = cur_pos;
+                            if status.axis_limit_active(m.axis) {
+                                m.phase = MeasurePhase::PreClearOrigin;
+                                m.expected_move_mm = 5.0;
+                                m.status_note =
+                                    "Backing off 5 mm from active sensor before touch-off..."
+                                        .to_string();
+                                command_axis_move(
+                                    c,
+                                    pulse_config,
+                                    m.axis,
+                                    max_dir,
+                                    5.0,
+                                    m.slow_speed_mm_s,
+                                    true,
+                                );
+                            } else {
+                                m.phase = MeasurePhase::SeekOrigin;
+                                m.expected_move_mm = max_search_mm;
+                                m.status_note = format!(
+                                    "Phase 1/5: Seeking {:?} origin sensor at {:.1} mm/s...",
+                                    m.axis, m.slow_speed_mm_s
+                                );
+                                command_axis_move(
+                                    c,
+                                    pulse_config,
+                                    m.axis,
+                                    origin_dir,
+                                    max_search_mm,
+                                    m.slow_speed_mm_s,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if ui
+                    .add_enabled(
+                        m.is_running(),
+                        Button::new(RichText::new("⏹ Stop").color(Color32::WHITE).strong())
+                            .fill(Color32::from_rgb(175, 42, 42))
+                            .min_size(Vec2::new(78.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(ref c) = controller {
+                        c.stop();
+                    }
+                    m.phase = MeasurePhase::Stopped;
+                    m.status_note = "Measurement stopped by user.".to_string();
+                    *status_message = format!("{} axis measurement stopped.", axis_name);
+                }
+
+                if ui
+                    .add(
+                        Button::new(RichText::new("Cancel").size(12.0))
+                            .min_size(Vec2::new(78.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    if m.is_running() {
+                        if let Some(ref c) = controller {
+                            c.stop();
+                        }
+                    }
+                    keep_open = false;
+                }
+            });
+        });
+
+    if keep_open {
+        state.measure_axis = Some(m);
+    }
+    applied
 }

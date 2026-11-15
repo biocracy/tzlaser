@@ -115,6 +115,32 @@ pub fn home_config_from_pulse(pulse_config: &PulseConfig) -> tzlaser_protocol::H
 }
 
 /// Format a duration in seconds into a compact human-readable string (e.g. `23.0s`, `01:45`, `1:02:15`).
+/// Verify all active cuttable toolpaths fit within the effective cutting area
+/// (`table_width_mm - home_retract_x_mm` × `table_height_mm - home_retract_y_mm`) when soft limits are enabled.
+pub fn check_cut_area_bounds(doc: &Document, pulses_cfg: &PulseConfig) -> Result<(), String> {
+    if !pulses_cfg.soft_limits_enabled {
+        return Ok(());
+    }
+    let cut_w = pulses_cfg.cut_width_mm();
+    let cut_h = pulses_cfg.cut_height_mm();
+    let tol = 0.05;
+    for layer in &doc.layers {
+        if !layer.visible || layer.is_obstacle {
+            continue;
+        }
+        for ent in &layer.entities {
+            let bb = ent.bounding_box();
+            if bb.x0 < -tol || bb.x1 > cut_w + tol || bb.y0 < -tol || bb.y1 > cut_h + tol {
+                return Err(format!(
+                    "Toolpath exceeds effective cut area ({:.1} × {:.1} mm after homing retract). Reposition geometry inside the cut area or disable Soft Limits.",
+                    cut_w, cut_h
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn format_duration_secs(secs: f64) -> String {
     let s = secs.max(0.0);
     if s < 60.0 {
@@ -1136,20 +1162,47 @@ pub fn render_right_panels(
                     panel_state.stop_run(controller, status);
                     *status_message = "Motion stopped.".to_string();
                 } else if let Some((axis, pulses)) = jog_cmd {
-                    if is_connected {
+                    let mut clamped_pulses = pulses;
+                    let mut limit_msg: Option<String> = None;
+                    if pulses_cfg.soft_limits_enabled && (axis == Axis::X || axis == Axis::Y) {
+                        let (cur_mm, delta_mm, max_mm) = match axis {
+                            Axis::X => (
+                                pulses_cfg.pulses_to_mm_x(status.pos_x).abs(),
+                                pulses_cfg.pulses_to_mm_x(pulses),
+                                pulses_cfg.cut_width_mm(),
+                            ),
+                            Axis::Y => (
+                                pulses_cfg.pulses_to_mm_y(status.pos_y).abs(),
+                                pulses_cfg.pulses_to_mm_y(pulses),
+                                pulses_cfg.cut_height_mm(),
+                            ),
+                            _ => (0.0, 0.0, 0.0),
+                        };
+                        let next_mm = cur_mm + delta_mm;
+                        if next_mm < -0.01 || next_mm > max_mm + 0.01 {
+                            clamped_pulses = 0;
+                            limit_msg = Some(format!(
+                                "Soft limit: {:?} target {:.1} mm outside effective cut area [0.0..{:.1} mm].",
+                                axis, next_mm, max_mm
+                            ));
+                        }
+                    }
+                    if let Some(msg) = limit_msg {
+                        *status_message = msg;
+                    } else if is_connected {
                         if let Some(c) = controller {
-                            c.jog(axis, pulses);
+                            c.jog(axis, clamped_pulses);
                         }
                     } else {
                         match axis {
-                            Axis::X => status.pos_x += pulses,
-                            Axis::Y => status.pos_y += pulses,
+                            Axis::X => status.pos_x += clamped_pulses,
+                            Axis::Y => status.pos_y += clamped_pulses,
                             Axis::Z => {
-                                status.pos_z += pulses;
+                                status.pos_z += clamped_pulses;
                                 status.capacitive_height_mm =
                                     ((status.pos_z as f32) / (pulses_cfg.pulses_per_mm_z as f32)).max(0.0);
                             }
-                            Axis::W => status.pos_w += pulses,
+                            Axis::W => status.pos_w += clamped_pulses,
                         }
                     }
                 }
@@ -1193,7 +1246,14 @@ pub fn render_right_panels(
                         .on_disabled_hover_text("Controller not connected (Start disabled offline)")
                         .clicked()
                     {
-                        *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
+                        match check_cut_area_bounds(doc, pulses_cfg) {
+                            Ok(()) => {
+                                *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
+                            }
+                            Err(msg) => {
+                                *status_message = msg;
+                            }
+                        }
                     }
 
                     let is_dry = panel_state.run_mode == RunMode::DryCut && !panel_state.is_paused;
@@ -1218,7 +1278,14 @@ pub fn render_right_panels(
                         })
                         .clicked()
                     {
-                        *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
+                        match check_cut_area_bounds(doc, pulses_cfg) {
+                            Ok(()) => {
+                                *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
+                            }
+                            Err(msg) => {
+                                *status_message = msg;
+                            }
+                        }
                     }
                 });
 

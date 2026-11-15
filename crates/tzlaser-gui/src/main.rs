@@ -55,8 +55,8 @@ impl Default for TzlaserApp {
         let pulse_config = PulseConfig::load_or_init(PulseConfig::default_config_path());
 
         let mut canvas_state = CanvasState::default();
-        canvas_state.bed_width_mm = pulse_config.table_width_mm as f32;
-        canvas_state.bed_height_mm = pulse_config.table_height_mm as f32;
+        canvas_state.bed_width_mm = pulse_config.cut_width_mm() as f32;
+        canvas_state.bed_height_mm = pulse_config.cut_height_mm() as f32;
         canvas_state.origin_corner = pulse_config.origin_corner.clone();
         canvas_state.home_retract_x_mm = pulse_config.home_retract_x_mm.max(0.0);
         canvas_state.home_retract_y_mm = pulse_config.home_retract_y_mm.max(0.0);
@@ -309,7 +309,17 @@ impl eframe::App for TzlaserApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.status_message).size(12.0).color(status_text_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("Bed: {:.0} x {:.0} mm", self.canvas_state.bed_width_mm, self.canvas_state.bed_height_mm)).size(11.0).weak());
+                        ui.label(
+                            RichText::new(format!(
+                                "Cut Area: {:.0} x {:.0} mm (Table: {:.0} x {:.0} mm)",
+                                self.canvas_state.bed_width_mm,
+                                self.canvas_state.bed_height_mm,
+                                self.pulse_config.table_width_mm,
+                                self.pulse_config.table_height_mm
+                            ))
+                            .size(11.0)
+                            .weak(),
+                        );
                         ui.separator();
                         ui.label(RichText::new(format!("Entities: {}", self.document.entity_count())).size(11.0).weak());
                         ui.separator();
@@ -418,6 +428,7 @@ impl eframe::App for TzlaserApp {
             &mut self.canvas_state,
             &mut self.panel_state,
             &self.controller,
+            &self.status,
             &mut self.status_message,
         );
 

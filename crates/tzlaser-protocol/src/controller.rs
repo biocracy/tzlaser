@@ -15,6 +15,7 @@ use crate::packet::{Opcode, Packet};
 
 pub enum Command {
     Jog { axis: Axis, pulses: i32 },
+    JogWithConfig { axis: Axis, pulses: i32, config: JogConfig, auto_stop: bool },
     StartContinuousJog { axis: Axis, direction: i32 },
     Stop,
     HomeAll(HomeConfig),
@@ -309,6 +310,52 @@ impl LaserController {
                                     Instant::now()
                                         + Duration::from_secs_f64(move_secs.clamp(0.06, 15.0)),
                                 );
+                            }
+                        }
+                        Command::JogWithConfig {
+                            axis,
+                            pulses,
+                            config,
+                            auto_stop,
+                        } => {
+                            if pulses == 0 || axis == Axis::Z {
+                                continue;
+                            }
+                            if pending_stop_p2_at.take().is_some() {
+                                let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let p2 = Packet::write_request(
+                                    s_rst,
+                                    registers::REG_COMMAND,
+                                    vec![2],
+                                );
+                                let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                thread::sleep(Duration::from_millis(25));
+                            }
+                            let cur_pos = {
+                                let st = status_clone.lock().unwrap();
+                                match axis {
+                                    Axis::X => st.pos_x,
+                                    Axis::Y => st.pos_y,
+                                    Axis::Z => st.pos_z,
+                                    Axis::W => st.pos_w,
+                                }
+                            };
+                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let pkt = build_jog_packet(s, axis, pulses, &config);
+                            let _ = socket.send_to(&pkt.encode(), target_addr);
+
+                            active_step_watch =
+                                Some((axis, cur_pos, pulses.unsigned_abs() as i32));
+                            if auto_stop {
+                                let move_secs = (pulses.unsigned_abs() as f64
+                                    / config.jog_speed.max(1) as f64)
+                                    + 0.25;
+                                auto_stop_at = Some(
+                                    Instant::now()
+                                        + Duration::from_secs_f64(move_secs.max(0.08)),
+                                );
+                            } else {
+                                auto_stop_at = None;
                             }
                         }
                         Command::StartContinuousJog { axis, direction } => {
@@ -791,6 +838,15 @@ impl LaserController {
 
     pub fn jog(&self, axis: Axis, pulses: i32) {
         let _ = self.command_tx.send(Command::Jog { axis, pulses });
+    }
+
+    pub fn jog_with_config(&self, axis: Axis, pulses: i32, config: JogConfig, auto_stop: bool) {
+        let _ = self.command_tx.send(Command::JogWithConfig {
+            axis,
+            pulses,
+            config,
+            auto_stop,
+        });
     }
 
     pub fn start_continuous_jog(&self, axis: Axis, direction: i32) {
