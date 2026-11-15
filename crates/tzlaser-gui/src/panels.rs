@@ -1290,7 +1290,9 @@ pub fn render_right_panels(
                     pulses_cfg.pulses_to_mm_x(status.pos_x),
                     pulses_cfg.pulses_to_mm_y(status.pos_y),
                 );
-                let run_btn_w = ((ui.available_width() - 8.0) / 2.0).max(95.0);
+                let spacing_x = ui.spacing().item_spacing.x;
+                let run_btn_w = ((ui.available_width() - spacing_x) / 2.0).floor().max(95.0);
+                let full_row_w = (run_btn_w * 2.0 + spacing_x).max(190.0);
                 let has_pause = panel_state.paused_checkpoint.is_some();
 
                 // Row 1: ▶ Start / 🔄 Restart  |  🧭 Dry-Cut
@@ -1528,7 +1530,7 @@ pub fn render_right_panels(
                 )
                 .fill(Color32::from_rgb(48, 42, 22));
                 if ui
-                    .add_sized([ui.available_width().max(120.0), 28.0], frame_btn)
+                    .add_sized([full_row_w, 28.0], frame_btn)
                     .on_hover_text("Trace the active job bounding box with the red guide pointer (laser off)")
                     .clicked()
                 {
@@ -1583,7 +1585,7 @@ pub fn render_right_panels(
 
                 // Row 6: Follower  |  Red Dot  |  Gas
                 ui.horizontal(|ui| {
-                    let aux_w = ((ui.available_width() - 8.0) / 3.0).max(58.0);
+                    let aux_w = ((full_row_w - 2.0 * spacing_x) / 3.0).floor().max(58.0);
 
                     let fol_bg = if status.follower_active {
                         Color32::from_rgb(20, 75, 42)
