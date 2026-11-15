@@ -61,6 +61,19 @@ pub enum Entity {
     Group { children: Vec<Entity> },
 }
 
+/// Compute smooth adaptive segment count for a circular arc of `radius` (mm) and `sweep_rad` (rad),
+/// keeping chord sagitta error <= 0.002 mm and arc step <= 0.20 mm so motion commands glide smoothly.
+fn adaptive_arc_segments(radius: f64, sweep_rad: f64, min_segs: usize) -> usize {
+    let r = radius.abs().max(0.1);
+    let sweep = sweep_rad.abs().max(1e-6);
+    let max_sagitta = 0.002_f64;
+    let max_step_mm = 0.20_f64;
+    let dtheta_sagitta = 2.0 * (1.0 - (max_sagitta / r).min(0.5)).acos().max(1e-4);
+    let by_sagitta = (sweep / dtheta_sagitta).ceil() as usize;
+    let by_step = ((r * sweep) / max_step_mm).ceil() as usize;
+    by_sagitta.max(by_step).clamp(min_segs, 1440)
+}
+
 impl Entity {
     pub fn bounding_box(&self) -> Rect {
         match self {
@@ -274,7 +287,7 @@ impl Entity {
                 pts
             }
             Entity::Circle { center, radius } => {
-                let segments = 64usize;
+                let segments = adaptive_arc_segments(*radius, std::f64::consts::TAU, 180);
                 let mut pts = Vec::with_capacity(segments + 1);
                 for i in 0..=segments {
                     let ang = if i == segments {
@@ -295,12 +308,14 @@ impl Entity {
                 start_angle,
                 end_angle,
             } => {
-                let segments = 32usize;
                 let s = *start_angle;
                 let mut e = *end_angle;
                 if e < s {
                     e += 360.0;
                 }
+                let sweep_rad = (e - s).to_radians().abs();
+                let min_segs = ((sweep_rad / std::f64::consts::TAU) * 180.0).ceil().max(48.0) as usize;
+                let segments = adaptive_arc_segments(*radius, sweep_rad, min_segs);
                 let mut pts = Vec::with_capacity(segments + 1);
                 for i in 0..=segments {
                     let ang = (s + (e - s) * (i as f64) / (segments as f64)).to_radians();
@@ -3065,7 +3080,7 @@ mod tests {
 
         // Path 1 is the interior circle (start at x=60, y=35), Path 2 is outer box (4 cutting segments)
         let cut_segs: Vec<&MotionSegment> = traj.iter().filter(|s| !s.is_rapid).collect();
-        assert_eq!(cut_segs.iter().filter(|s| s.path_index_1based == 1).count(), 64);
+        assert!(cut_segs.iter().filter(|s| s.path_index_1based == 1).count() >= 180);
         assert_eq!(cut_segs.iter().filter(|s| s.path_index_1based == 2).count(), 4);
     }
 
