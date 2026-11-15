@@ -305,6 +305,28 @@ impl eframe::App for TzlaserApp {
             self.signal_graph.tick_offline();
         }
 
+        // Enforce cutting-area bounds on the head position every frame
+        if self.status.pos_x != 0 || self.status.pos_y != 0 {
+            let head_world = panels::head_world_mm(&self.status, &self.pulse_config);
+            if !panels::point_within_cut_area(head_world, &self.pulse_config) {
+                let reason = format!(
+                    "Head position jumped outside the effective cutting area ({:.1}, {:.1} mm vs {:.1} × {:.1} mm).",
+                    head_world.x,
+                    head_world.y,
+                    self.pulse_config.cut_width_mm(),
+                    self.pulse_config.cut_height_mm()
+                );
+                self.status_message = self.panel_state.trigger_out_of_bounds_recovery(
+                    &reason,
+                    &self.controller,
+                    &mut self.status,
+                );
+                if !hw_connected {
+                    self.signal_graph.record_offline(0.0, 0.0, 0.0, 0.0, false, Some("OOB Reset"));
+                }
+            }
+        }
+
         // Prompt to home machine on first connection to controller board
         let is_connected = self.controller.as_ref().map_or(false, |c| c.is_connected());
         if !is_connected {
@@ -607,6 +629,56 @@ impl eframe::App for TzlaserApp {
                 });
             if close_prompt {
                 self.panel_state.show_home_prompt = false;
+            }
+        }
+
+        // 9. Out-of-Bounds / Cutting Area Limit Alert
+        if let Some((alert_msg, needs_rehome)) = self.panel_state.oob_alert.clone() {
+            let mut dismiss = false;
+            egui::Window::new("⚠ Cutting Area Limit Exceeded")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(380.0);
+                    ui.label(
+                        RichText::new(alert_msg)
+                            .size(12.5)
+                            .color(Color32::from_rgb(255, 205, 110)),
+                    );
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if needs_rehome {
+                            let rehome_btn = egui::Button::new(
+                                RichText::new("🏠 Re-Home All Axes").color(Color32::WHITE).strong(),
+                            )
+                            .fill(Color32::from_rgb(28, 125, 78))
+                            .min_size(egui::Vec2::new(140.0, 28.0));
+                            if ui.add(rehome_btn).clicked() {
+                                if let Some(ref c) = self.controller {
+                                    c.home_all(panels::home_config_from_pulse(&self.pulse_config));
+                                    self.status_message = format!(
+                                        "Re-homing Z (up) and X/Y toward {}...",
+                                        self.pulse_config.origin_corner
+                                    );
+                                }
+                                self.panel_state.show_home_prompt = false;
+                                dismiss = true;
+                            }
+                        }
+                        let ok_label = if needs_rehome { "Dismiss" } else { "OK" };
+                        let ok_btn = egui::Button::new(RichText::new(ok_label).size(12.0))
+                            .fill(Color32::from_rgb(55, 60, 72))
+                            .min_size(egui::Vec2::new(80.0, 28.0));
+                        if ui.add(ok_btn).clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            if dismiss {
+                self.panel_state.oob_alert = None;
             }
         }
     }

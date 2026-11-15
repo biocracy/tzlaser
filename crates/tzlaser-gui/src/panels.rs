@@ -57,6 +57,7 @@ pub struct PanelState {
     pub new_mat_thickness: f64,
     pub show_home_prompt: bool,
     pub prompted_home_this_connection: bool,
+    pub oob_alert: Option<(String, bool)>,
     pub job_start_pos: kurbo::Point,
 }
 
@@ -92,6 +93,7 @@ impl Default for PanelState {
             new_mat_thickness: 2.0,
             show_home_prompt: false,
             prompted_home_this_connection: false,
+            oob_alert: None,
             job_start_pos: kurbo::Point::ZERO,
         }
     }
@@ -296,12 +298,20 @@ pub fn home_config_from_pulse(pulse_config: &PulseConfig) -> tzlaser_protocol::H
 /// Format a duration in seconds into a compact human-readable string (e.g. `23.0s`, `01:45`, `1:02:15`).
 /// Verify all active cuttable toolpaths fit within the effective cutting area
 /// (`table_width_mm - home_retract_x_mm` × `table_height_mm - home_retract_y_mm`) when soft limits are enabled.
-pub fn check_cut_area_bounds(doc: &Document, pulses_cfg: &PulseConfig) -> Result<(), String> {
-    if !pulses_cfg.soft_limits_enabled {
-        return Ok(());
+/// Return true if a world-coordinate point (mm) lies within the effective cutting area `[0..cut_w] x [0..cut_h]`.
+pub fn point_within_cut_area(pt: kurbo::Point, pulses_cfg: &PulseConfig) -> bool {
+    if !pt.x.is_finite() || !pt.y.is_finite() {
+        return false;
     }
-    let cut_w = pulses_cfg.cut_width_mm();
-    let cut_h = pulses_cfg.cut_height_mm();
+    let cut_w = pulses_cfg.cut_width_mm().max(1.0);
+    let cut_h = pulses_cfg.cut_height_mm().max(1.0);
+    let tol = 0.05;
+    pt.x >= -tol && pt.x <= cut_w + tol && pt.y >= -tol && pt.y <= cut_h + tol
+}
+
+pub fn check_cut_area_bounds(doc: &Document, pulses_cfg: &PulseConfig) -> Result<(), String> {
+    let cut_w = pulses_cfg.cut_width_mm().max(1.0);
+    let cut_h = pulses_cfg.cut_height_mm().max(1.0);
     let tol = 0.05;
     for layer in &doc.layers {
         if !layer.visible || layer.is_obstacle {
@@ -311,8 +321,8 @@ pub fn check_cut_area_bounds(doc: &Document, pulses_cfg: &PulseConfig) -> Result
             let bb = ent.bounding_box();
             if bb.x0 < -tol || bb.x1 > cut_w + tol || bb.y0 < -tol || bb.y1 > cut_h + tol {
                 return Err(format!(
-                    "Toolpath exceeds effective cut area ({:.1} × {:.1} mm after homing retract). Reposition geometry inside the cut area or disable Soft Limits.",
-                    cut_w, cut_h
+                    "Graphics extend outside the effective cutting area ({:.1} × {:.1} mm). Bounding box: X [{:.1}..{:.1}], Y [{:.1}..{:.1}] mm.",
+                    cut_w, cut_h, bb.x0, bb.x1, bb.y0, bb.y1
                 ));
             }
         }
@@ -338,6 +348,67 @@ pub fn format_duration_secs(secs: f64) -> String {
 }
 
 impl PanelState {
+    /// Stop any active motion, reset head position to origin (0, 0), show an alert message,
+    /// and prompt for re-homing if connected to physical hardware (offline requires no re-homing).
+    pub fn trigger_out_of_bounds_recovery(
+        &mut self,
+        reason: &str,
+        controller: &Option<LaserController>,
+        status: &mut MachineStatus,
+    ) -> String {
+        self.stop_run(controller, status);
+        status.pos_x = 0;
+        status.pos_y = 0;
+        let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
+        if hw_connected {
+            status.xy_homed = false;
+            self.show_home_prompt = true;
+            self.oob_alert = Some((
+                format!(
+                    "{}\n\nThe head position has been reset to Origin (0, 0). Please re-home the machine before continuing.",
+                    reason
+                ),
+                true,
+            ));
+            format!("⚠️ {} Head reset to Origin — re-homing required!", reason)
+        } else {
+            self.oob_alert = Some((
+                format!(
+                    "{}\n\nThe head position has been reset to Origin (0, 0). (Offline simulation: no re-homing necessary.)",
+                    reason
+                ),
+                false,
+            ));
+            format!("⚠️ {} Head reset to Origin (0, 0).", reason)
+        }
+    }
+
+    /// Validate that both the current head position and all visible graphics lie inside the cutting area.
+    /// If not, triggers out-of-bounds recovery and returns Err(status_message).
+    pub fn validate_motion_bounds(
+        &mut self,
+        doc: &Document,
+        current_head: kurbo::Point,
+        controller: &Option<LaserController>,
+        status: &mut MachineStatus,
+        pulses_cfg: &PulseConfig,
+    ) -> Result<(), String> {
+        if !point_within_cut_area(current_head, pulses_cfg) {
+            let msg = format!(
+                "Cutting head position ({:.1}, {:.1} mm) is outside the effective cutting area ({:.1} × {:.1} mm).",
+                current_head.x,
+                current_head.y,
+                pulses_cfg.cut_width_mm(),
+                pulses_cfg.cut_height_mm()
+            );
+            return Err(self.trigger_out_of_bounds_recovery(&msg, controller, status));
+        }
+        if let Err(err) = check_cut_area_bounds(doc, pulses_cfg) {
+            return Err(self.trigger_out_of_bounds_recovery(&err, controller, status));
+        }
+        Ok(())
+    }
+
     pub fn start_run(
         &mut self,
         mode: RunMode,
@@ -477,8 +548,9 @@ impl PanelState {
             seg.start.y + (seg.end.y - seg.start.y) * frac,
         );
 
-        status.pos_x = pulses_cfg.mm_to_pulses_x(point_mm.x);
-        status.pos_y = pulses_cfg.mm_to_pulses_y(point_mm.y);
+        let origin_world = origin_world_mm(pulses_cfg);
+        status.pos_x = pulses_cfg.mm_to_pulses_x(point_mm.x - origin_world.x);
+        status.pos_y = pulses_cfg.mm_to_pulses_y(point_mm.y - origin_world.y);
         status.laser_on = false;
 
         if let Some(ref c) = controller {
@@ -662,8 +734,9 @@ impl PanelState {
             t_seg.start.y + (t_seg.end.y - t_seg.start.y) * frac,
         );
 
-        let new_px = pulses_cfg.mm_to_pulses_x(point_mm.x);
-        let new_py = pulses_cfg.mm_to_pulses_y(point_mm.y);
+        let origin_world = origin_world_mm(pulses_cfg);
+        let new_px = pulses_cfg.mm_to_pulses_x(point_mm.x - origin_world.x);
+        let new_py = pulses_cfg.mm_to_pulses_y(point_mm.y - origin_world.y);
         if let Some(ref c) = controller {
             if c.is_connected() {
                 let dx_p = new_px - status.pos_x;
@@ -934,8 +1007,9 @@ impl PanelState {
             + best_prog_mm;
         let full_total: f64 = self.full_trajectory.iter().map(|s| s.length_mm).sum();
 
-        let new_px = pulses_cfg.mm_to_pulses_x(best_pt.x);
-        let new_py = pulses_cfg.mm_to_pulses_y(best_pt.y);
+        let origin_world = origin_world_mm(pulses_cfg);
+        let new_px = pulses_cfg.mm_to_pulses_x(best_pt.x - origin_world.x);
+        let new_py = pulses_cfg.mm_to_pulses_y(best_pt.y - origin_world.y);
         if let Some(ref c) = controller {
             if c.is_connected() {
                 c.stop();
@@ -1742,7 +1816,7 @@ pub fn render_right_panels(
                         .on_disabled_hover_text("Controller not connected (Start disabled offline)")
                         .clicked()
                     {
-                        match check_cut_area_bounds(doc, pulses_cfg) {
+                        match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
                             Ok(()) => {
                                 *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
                             }
@@ -1797,7 +1871,7 @@ pub fn render_right_panels(
                         })
                         .clicked()
                     {
-                        match check_cut_area_bounds(doc, pulses_cfg) {
+                        match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
                             Ok(()) => {
                                 *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
                                 panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
@@ -1821,8 +1895,15 @@ pub fn render_right_panels(
                         .on_hover_text("Return from current position to recorded pause point and continue")
                         .clicked()
                     {
-                        if let Some(msg) = panel_state.continue_run(doc, current_head, controller) {
-                            *status_message = msg;
+                        match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
+                            Ok(()) => {
+                                if let Some(msg) = panel_state.continue_run(doc, current_head, controller) {
+                                    *status_message = msg;
+                                }
+                            }
+                            Err(msg) => {
+                                *status_message = msg;
+                            }
                         }
                     }
                 });
@@ -1843,6 +1924,9 @@ pub fn render_right_panels(
                         .on_hover_text("Trace the active job bounding box with the red guide pointer (laser off)")
                         .clicked()
                     {
+                        if let Err(msg) = panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
+                            *status_message = msg;
+                        } else {
                         let mut bbox: Option<kurbo::Rect> = None;
                         for layer in &doc.layers {
                             if !layer.visible || layer.is_obstacle {
@@ -1887,6 +1971,7 @@ pub fn render_right_panels(
                             );
                         } else {
                             *status_message = "No active cuttable geometry to frame.".to_string();
+                        }
                         }
                     }
 
@@ -2648,5 +2733,47 @@ mod tests {
         assert_eq!(sum_x, -cfg.mm_to_pulses_x(20.0));
         // First motion tick velocity should be small (accelerating gently from rest at 5 mm/s)
         assert!(ticks[59].0.abs() <= 1);
+    }
+
+    #[test]
+    fn test_pause_bottom_right_origin_no_jump_and_oob_recovery() {
+        let mut cfg = PulseConfig::default();
+        cfg.table_width_mm = 2000.0;
+        cfg.table_height_mm = 1500.0;
+        cfg.home_retract_x_mm = 10.0;
+        cfg.home_retract_y_mm = 10.0;
+        cfg.origin_corner = "Bottom-Right (Xmax, Y0)".to_string();
+
+        let mut doc = Document::new();
+        doc.layers[0].entities.push(tzlaser_core::Entity::Polyline {
+            points: vec![kurbo::Point::new(1900.0, 50.0), kurbo::Point::new(1800.0, 50.0)],
+            closed: false,
+        });
+
+        let mut state = PanelState::default();
+        let mut status = MachineStatus::default();
+        let origin = origin_world_mm(&cfg);
+        assert!((origin.x - 1990.0).abs() < 1e-6);
+
+        state.start_run(RunMode::DryCut, &doc, origin, &None);
+        state.seg_progress_mm = 40.0;
+        state.pause_run(&None, &mut status, &cfg);
+        let head_after_pause = head_world_mm(&status, &cfg);
+        let cp = state.paused_checkpoint.expect("checkpoint");
+        // Head must remain at the exact pause checkpoint (no 1990 mm jump!)
+        assert!(head_after_pause.distance(cp.point_mm) < 0.05);
+
+        // Out-of-bounds graphics must fail validation and reset head to origin without requiring rehome offline
+        doc.layers[0].entities.push(tzlaser_core::Entity::Polyline {
+            points: vec![kurbo::Point::new(2500.0, 50.0), kurbo::Point::new(2600.0, 50.0)],
+            closed: false,
+        });
+        let res = state.validate_motion_bounds(&doc, head_after_pause, &None, &mut status, &cfg);
+        assert!(res.is_err());
+        assert_eq!(status.pos_x, 0);
+        assert_eq!(status.pos_y, 0);
+        assert!(!state.show_home_prompt);
+        let (_, needs_rehome) = state.oob_alert.as_ref().expect("oob_alert");
+        assert!(!needs_rehome);
     }
 }
