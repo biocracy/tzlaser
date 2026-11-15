@@ -1183,6 +1183,42 @@ pub fn render_right_panels(
                 let mut jog_cmd: Option<(Axis, i32)> = None;
                 let mut stop_clicked = false;
 
+                let jog_dot_btn = |ui: &mut Ui,
+                                   label: &str,
+                                   text_color: Option<Color32>,
+                                   fill: Option<Color32>,
+                                   limit_active: bool,
+                                   hover: &str|
+                 -> bool {
+                    let mut rt = RichText::new(label).size(13.0);
+                    if let Some(c) = text_color {
+                        rt = rt.color(c);
+                    }
+                    let mut btn = Button::new(rt);
+                    if let Some(bg) = fill {
+                        btn = btn.fill(bg);
+                    }
+                    let resp = ui.add_sized(btn_size, btn).on_hover_text(hover);
+                    let dot_center = egui::pos2(resp.rect.right() - 7.5, resp.rect.top() + 7.5);
+                    if limit_active {
+                        ui.painter().circle_filled(
+                            dot_center,
+                            5.0,
+                            Color32::from_rgba_unmultiplied(255, 95, 70, 85),
+                        );
+                        ui.painter()
+                            .circle_filled(dot_center, 3.0, Color32::from_rgb(255, 75, 65));
+                    } else {
+                        ui.painter().circle(
+                            dot_center,
+                            2.8,
+                            Color32::from_rgb(52, 58, 70),
+                            egui::Stroke::new(1.0, Color32::from_rgb(95, 102, 118)),
+                        );
+                    }
+                    resp.clicked()
+                };
+
                 ui.horizontal(|ui| {
                     ui.add_space((ui.available_width() - pad_width).max(0.0) / 2.0);
                     Grid::new("jog_pad_3x3")
@@ -1191,18 +1227,49 @@ pub fn render_right_panels(
                         .show(ui, |ui| {
                             // Row 1: [empty] | Y+ | Z+
                             ui.allocate_exact_size(egui::vec2(btn_size[0], btn_size[1]), egui::Sense::hover());
-                            if ui.add_sized(btn_size, Button::new(RichText::new("Y+ ▲").size(13.0))).clicked() {
+                            if jog_dot_btn(
+                                ui,
+                                "Y+ ▲",
+                                None,
+                                None,
+                                status.y_pos_limit(),
+                                if status.y_pos_limit() {
+                                    "Jog Y+ (Y+ limit switch TRIGGERED)"
+                                } else {
+                                    "Jog Y+"
+                                },
+                            ) {
                                 jog_cmd = Some((Axis::Y, step_pulses_y));
                             }
-                            let z_plus_btn = Button::new(RichText::new("Z+ ▲").size(13.0).color(Color32::from_rgb(130, 195, 255)))
-                                .fill(Color32::from_rgb(28, 38, 56));
-                            if ui.add_sized(btn_size, z_plus_btn).on_hover_text("Raise cutting head (Z+)").clicked() {
+                            if jog_dot_btn(
+                                ui,
+                                "Z+ ▲",
+                                Some(Color32::from_rgb(130, 195, 255)),
+                                Some(Color32::from_rgb(28, 38, 56)),
+                                status.z_pos_limit(),
+                                if status.z_pos_limit() {
+                                    "Raise cutting head (Z+ upper limit switch TRIGGERED)"
+                                } else {
+                                    "Raise cutting head (Z+)"
+                                },
+                            ) {
                                 jog_cmd = Some((Axis::Z, step_pulses_z));
                             }
                             ui.end_row();
 
                             // Row 2: X- | STOP | X+ (middle between Z+ and Z-)
-                            if ui.add_sized(btn_size, Button::new(RichText::new("◄ X-").size(13.0))).clicked() {
+                            if jog_dot_btn(
+                                ui,
+                                "◄ X-",
+                                None,
+                                None,
+                                status.x_neg_limit(),
+                                if status.x_neg_limit() {
+                                    "Jog X- (X- limit switch TRIGGERED)"
+                                } else {
+                                    "Jog X-"
+                                },
+                            ) {
                                 jog_cmd = Some((Axis::X, -step_pulses_x));
                             }
                             let stop_btn = Button::new(RichText::new("STOP").color(Color32::WHITE).strong())
@@ -1210,19 +1277,50 @@ pub fn render_right_panels(
                             if ui.add_sized(btn_size, stop_btn).clicked() {
                                 stop_clicked = true;
                             }
-                            if ui.add_sized(btn_size, Button::new(RichText::new("X+ ►").size(13.0))).clicked() {
+                            if jog_dot_btn(
+                                ui,
+                                "X+ ►",
+                                None,
+                                None,
+                                status.x_pos_limit(),
+                                if status.x_pos_limit() {
+                                    "Jog X+ (X+ limit switch TRIGGERED)"
+                                } else {
+                                    "Jog X+"
+                                },
+                            ) {
                                 jog_cmd = Some((Axis::X, step_pulses_x));
                             }
                             ui.end_row();
 
                             // Row 3: [empty] | Y- | Z-
                             ui.allocate_exact_size(egui::vec2(btn_size[0], btn_size[1]), egui::Sense::hover());
-                            if ui.add_sized(btn_size, Button::new(RichText::new("Y- ▼").size(13.0))).clicked() {
+                            if jog_dot_btn(
+                                ui,
+                                "Y- ▼",
+                                None,
+                                None,
+                                status.y_neg_limit(),
+                                if status.y_neg_limit() {
+                                    "Jog Y- (Y- limit switch TRIGGERED)"
+                                } else {
+                                    "Jog Y-"
+                                },
+                            ) {
                                 jog_cmd = Some((Axis::Y, -step_pulses_y));
                             }
-                            let z_minus_btn = Button::new(RichText::new("Z- ▼").size(13.0).color(Color32::from_rgb(130, 195, 255)))
-                                .fill(Color32::from_rgb(28, 38, 56));
-                            if ui.add_sized(btn_size, z_minus_btn).on_hover_text("Lower cutting head (Z-)").clicked() {
+                            if jog_dot_btn(
+                                ui,
+                                "Z- ▼",
+                                Some(Color32::from_rgb(130, 195, 255)),
+                                Some(Color32::from_rgb(28, 38, 56)),
+                                status.z_neg_cap_limit(),
+                                if status.z_neg_cap_limit() {
+                                    "Lower cutting head (Capacitive sensor limit TRIGGERED)"
+                                } else {
+                                    "Lower cutting head (Z-, capacitive sensor limit)"
+                                },
+                            ) {
                                 jog_cmd = Some((Axis::Z, -step_pulses_z));
                             }
                             ui.end_row();
@@ -1292,10 +1390,12 @@ pub fn render_right_panels(
                 );
                 let spacing_x = ui.spacing().item_spacing.x;
                 let run_btn_w = ((ui.available_width() - spacing_x) / 2.0).floor().max(95.0);
-                let full_row_w = (run_btn_w * 2.0 + spacing_x).max(190.0);
                 let has_pause = panel_state.paused_checkpoint.is_some();
+                let can_pause = panel_state.run_mode != RunMode::Idle && !panel_state.is_paused;
+                let can_continue = panel_state.is_paused && has_pause;
+                let can_step = panel_state.is_paused && has_pause;
 
-                // Row 1: ▶ Start / 🔄 Restart  |  🧭 Dry-Cut
+                // Row 1: (Start, Pause)
                 ui.horizontal(|ui| {
                     let is_cutting = panel_state.run_mode == RunMode::Cutting && !panel_state.is_paused;
                     let start_fill = if !is_connected {
@@ -1309,7 +1409,7 @@ pub fn render_right_panels(
                     let start_btn = Button::new(RichText::new(start_label).size(13.0).color(Color32::WHITE).strong())
                         .fill(start_fill);
                     if ui
-                        .add_enabled_ui(is_connected, |ui| ui.add_sized([run_btn_w, 32.0], start_btn))
+                        .add_enabled_ui(is_connected, |ui| ui.add_sized([run_btn_w, 30.0], start_btn))
                         .inner
                         .on_hover_text(if has_pause {
                             "Restart cutting job from the beginning (discards pause checkpoint)"
@@ -1329,46 +1429,6 @@ pub fn render_right_panels(
                         }
                     }
 
-                    let is_dry = panel_state.run_mode == RunMode::DryCut && !panel_state.is_paused;
-                    let dry_fill = if is_dry {
-                        Color32::from_rgb(20, 130, 165)
-                    } else {
-                        Color32::from_rgb(24, 72, 95)
-                    };
-                    let dry_btn = Button::new(
-                        RichText::new("🧭 Dry-Cut")
-                            .size(13.0)
-                            .color(Color32::from_rgb(130, 240, 255))
-                            .strong(),
-                    )
-                    .fill(dry_fill);
-                    if ui
-                        .add_sized([run_btn_w, 32.0], dry_btn)
-                        .on_hover_text(if is_connected {
-                            "Move physical cutting head along toolpaths without firing the laser"
-                        } else {
-                            "Simulate pointer movement along toolpaths offline (with fast-forward)"
-                        })
-                        .clicked()
-                    {
-                        match check_cut_area_bounds(doc, pulses_cfg) {
-                            Ok(()) => {
-                                *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
-                            }
-                            Err(msg) => {
-                                *status_message = msg;
-                            }
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-
-                // Row 2: ⏸ Pause  |  ⏯ Continue
-                ui.horizontal(|ui| {
-                    let can_pause = panel_state.run_mode != RunMode::Idle && !panel_state.is_paused;
-                    let can_continue = panel_state.is_paused && has_pause;
-
                     let pause_fill = if can_pause {
                         Color32::from_rgb(175, 115, 22)
                     } else {
@@ -1384,6 +1444,43 @@ pub fn render_right_panels(
                     {
                         if let Some(msg) = panel_state.pause_run(controller, status, pulses_cfg) {
                             *status_message = msg;
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Row 2: (Dry-Cut, Continue)
+                ui.horizontal(|ui| {
+                    let is_dry = panel_state.run_mode == RunMode::DryCut && !panel_state.is_paused;
+                    let dry_fill = if is_dry {
+                        Color32::from_rgb(20, 130, 165)
+                    } else {
+                        Color32::from_rgb(24, 72, 95)
+                    };
+                    let dry_btn = Button::new(
+                        RichText::new("🧭 Dry-Cut")
+                            .size(13.0)
+                            .color(Color32::from_rgb(130, 240, 255))
+                            .strong(),
+                    )
+                    .fill(dry_fill);
+                    if ui
+                        .add_sized([run_btn_w, 30.0], dry_btn)
+                        .on_hover_text(if is_connected {
+                            "Move physical cutting head along toolpaths without firing the laser"
+                        } else {
+                            "Simulate pointer movement along toolpaths offline (with fast-forward)"
+                        })
+                        .clicked()
+                    {
+                        match check_cut_area_bounds(doc, pulses_cfg) {
+                            Ok(()) => {
+                                *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
+                            }
+                            Err(msg) => {
+                                *status_message = msg;
+                            }
                         }
                     }
 
@@ -1408,9 +1505,170 @@ pub fn render_right_panels(
 
                 ui.add_space(4.0);
 
-                // Row 3: ⏮ Backward  |  ⏭ Forward (active only while paused)
+                // Row 3: (Frame, Follower)
                 ui.horizontal(|ui| {
-                    let can_step = panel_state.is_paused && has_pause;
+                    let frame_btn = Button::new(
+                        RichText::new("🔲 Frame")
+                            .size(12.5)
+                            .color(Color32::from_rgb(255, 200, 50))
+                            .strong(),
+                    )
+                    .fill(Color32::from_rgb(48, 42, 22));
+                    if ui
+                        .add_sized([run_btn_w, 28.0], frame_btn)
+                        .on_hover_text("Trace the active job bounding box with the red guide pointer (laser off)")
+                        .clicked()
+                    {
+                        let mut bbox: Option<kurbo::Rect> = None;
+                        for layer in &doc.layers {
+                            if !layer.visible || layer.is_obstacle {
+                                continue;
+                            }
+                            for ent in &layer.entities {
+                                let b = ent.bounding_box();
+                                bbox = Some(match bbox {
+                                    Some(acc) => acc.union(b),
+                                    None => b,
+                                });
+                            }
+                        }
+                        if let Some(b) = bbox {
+                            if let Some(ref c) = controller {
+                                if c.is_connected() {
+                                    c.set_red_pointer(true);
+                                    let corners = [
+                                        kurbo::Point::new(b.x0, b.y0),
+                                        kurbo::Point::new(b.x1, b.y0),
+                                        kurbo::Point::new(b.x1, b.y1),
+                                        kurbo::Point::new(b.x0, b.y1),
+                                        kurbo::Point::new(b.x0, b.y0),
+                                    ];
+                                    let mut prev = current_head;
+                                    for pt in corners {
+                                        let dx = pulses_cfg.mm_to_pulses_x(pt.x - prev.x);
+                                        let dy = pulses_cfg.mm_to_pulses_y(pt.y - prev.y);
+                                        if dx != 0 {
+                                            c.jog(Axis::X, dx);
+                                        }
+                                        if dy != 0 {
+                                            c.jog(Axis::Y, dy);
+                                        }
+                                        prev = pt;
+                                    }
+                                }
+                            }
+                            *status_message = format!(
+                                "Framing job bounds [{:.1}..{:.1}, {:.1}..{:.1}] mm with red guide pointer.",
+                                b.x0, b.x1, b.y0, b.y1
+                            );
+                        } else {
+                            *status_message = "No active cuttable geometry to frame.".to_string();
+                        }
+                    }
+
+                    let fol_bg = if status.follower_active {
+                        Color32::from_rgb(20, 75, 42)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let fol_fg = if status.follower_active {
+                        Color32::from_rgb(0, 255, 130)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [run_btn_w, 28.0],
+                            Button::new(RichText::new("🛡 Follower").size(12.5).color(fol_fg).strong())
+                                .fill(fol_bg),
+                        )
+                        .on_hover_text("Toggle capacitive height tracking follower servo")
+                        .clicked()
+                    {
+                        status.follower_active = !status.follower_active;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_follower_servo(status.follower_active);
+                            }
+                        }
+                        *status_message = format!(
+                            "Height follower servo: {}",
+                            if status.follower_active { "ON" } else { "OFF" }
+                        );
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Row 4: (Red Dot, Gas)
+                ui.horizontal(|ui| {
+                    let red_bg = if status.red_pointer_on {
+                        Color32::from_rgb(85, 28, 28)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let red_fg = if status.red_pointer_on {
+                        Color32::from_rgb(255, 115, 115)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [run_btn_w, 28.0],
+                            Button::new(RichText::new("🔴 Red Dot").size(12.5).color(red_fg).strong())
+                                .fill(red_bg),
+                        )
+                        .on_hover_text("Toggle 650nm visible red laser guide pointer")
+                        .clicked()
+                    {
+                        status.red_pointer_on = !status.red_pointer_on;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_red_pointer(status.red_pointer_on);
+                            }
+                        }
+                        *status_message = format!(
+                            "Red Dot guide: {}",
+                            if status.red_pointer_on { "ON" } else { "OFF" }
+                        );
+                    }
+
+                    let gas_bg = if status.gas_valve_open {
+                        Color32::from_rgb(24, 68, 92)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let gas_fg = if status.gas_valve_open {
+                        Color32::from_rgb(90, 225, 255)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [run_btn_w, 28.0],
+                            Button::new(RichText::new("💨 Gas").size(12.5).color(gas_fg).strong())
+                                .fill(gas_bg),
+                        )
+                        .on_hover_text("Toggle assist gas valve")
+                        .clicked()
+                    {
+                        status.gas_valve_open = !status.gas_valve_open;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_gas(3, status.gas_valve_open);
+                            }
+                        }
+                        *status_message = format!(
+                            "Assist gas valve: {}",
+                            if status.gas_valve_open { "OPEN" } else { "CLOSED" }
+                        );
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Row 5: (Backward, Forward)
+                ui.horizontal(|ui| {
                     let step_fill = if can_step {
                         Color32::from_rgb(65, 95, 155)
                     } else {
@@ -1420,7 +1678,7 @@ pub fn render_right_panels(
                     let back_btn = Button::new(RichText::new("⏮ Backward").size(12.5).color(Color32::WHITE).strong())
                         .fill(step_fill);
                     if ui
-                        .add_enabled_ui(can_step, |ui| ui.add_sized([run_btn_w, 30.0], back_btn))
+                        .add_enabled_ui(can_step, |ui| ui.add_sized([run_btn_w, 28.0], back_btn))
                         .inner
                         .on_hover_text(format!(
                             "Step backward {:.2} mm along active profile (or jump to previous profile endpoint)",
@@ -1439,7 +1697,7 @@ pub fn render_right_panels(
                     let fwd_btn = Button::new(RichText::new("⏭ Forward").size(12.5).color(Color32::WHITE).strong())
                         .fill(step_fill);
                     if ui
-                        .add_enabled_ui(can_step, |ui| ui.add_sized([run_btn_w, 30.0], fwd_btn))
+                        .add_enabled_ui(can_step, |ui| ui.add_sized([run_btn_w, 28.0], fwd_btn))
                         .inner
                         .on_hover_text(format!(
                             "Step forward {:.2} mm along active profile (or jump to next profile start)",
@@ -1458,7 +1716,7 @@ pub fn render_right_panels(
 
                 ui.add_space(4.0);
 
-                // Row 4: 🏠 Home (All 3 axes toward selected origin)  |  ⬆ Z-Home (Z-up only)
+                // Row 6: (Home, Z-Home)
                 ui.horizontal(|ui| {
                     let home_fill = if is_connected {
                         if status.is_homing_xy || status.is_homing_z {
@@ -1516,168 +1774,6 @@ pub fn render_right_panels(
                             c.home_z();
                             *status_message = "Homing Z-axis (moving Z-up to sensor)...".to_string();
                         }
-                    }
-                });
-
-                ui.add_space(4.0);
-
-                // Row 5: 🔲 Frame Job (trace job bounding box with red guide pointer)
-                let frame_btn = Button::new(
-                    RichText::new("🔲 Frame Job")
-                        .size(12.5)
-                        .color(Color32::from_rgb(255, 200, 50))
-                        .strong(),
-                )
-                .fill(Color32::from_rgb(48, 42, 22));
-                if ui
-                    .add_sized([full_row_w, 28.0], frame_btn)
-                    .on_hover_text("Trace the active job bounding box with the red guide pointer (laser off)")
-                    .clicked()
-                {
-                    let mut bbox: Option<kurbo::Rect> = None;
-                    for layer in &doc.layers {
-                        if !layer.visible || layer.is_obstacle {
-                            continue;
-                        }
-                        for ent in &layer.entities {
-                            let b = ent.bounding_box();
-                            bbox = Some(match bbox {
-                                Some(acc) => acc.union(b),
-                                None => b,
-                            });
-                        }
-                    }
-                    if let Some(b) = bbox {
-                        if let Some(ref c) = controller {
-                            if c.is_connected() {
-                                c.set_red_pointer(true);
-                                let corners = [
-                                    kurbo::Point::new(b.x0, b.y0),
-                                    kurbo::Point::new(b.x1, b.y0),
-                                    kurbo::Point::new(b.x1, b.y1),
-                                    kurbo::Point::new(b.x0, b.y1),
-                                    kurbo::Point::new(b.x0, b.y0),
-                                ];
-                                let mut prev = current_head;
-                                for pt in corners {
-                                    let dx = pulses_cfg.mm_to_pulses_x(pt.x - prev.x);
-                                    let dy = pulses_cfg.mm_to_pulses_y(pt.y - prev.y);
-                                    if dx != 0 {
-                                        c.jog(Axis::X, dx);
-                                    }
-                                    if dy != 0 {
-                                        c.jog(Axis::Y, dy);
-                                    }
-                                    prev = pt;
-                                }
-                            }
-                        }
-                        *status_message = format!(
-                            "Framing job bounds [{:.1}..{:.1}, {:.1}..{:.1}] mm with red guide pointer.",
-                            b.x0, b.x1, b.y0, b.y1
-                        );
-                    } else {
-                        *status_message = "No active cuttable geometry to frame.".to_string();
-                    }
-                }
-
-                ui.add_space(4.0);
-
-                // Row 6: Follower  |  Red Dot  |  Gas
-                ui.horizontal(|ui| {
-                    let aux_w = ((full_row_w - 2.0 * spacing_x) / 3.0).floor().max(58.0);
-
-                    let fol_bg = if status.follower_active {
-                        Color32::from_rgb(20, 75, 42)
-                    } else {
-                        Color32::from_rgb(38, 42, 50)
-                    };
-                    let fol_fg = if status.follower_active {
-                        Color32::from_rgb(0, 255, 130)
-                    } else {
-                        Color32::WHITE
-                    };
-                    if ui
-                        .add_sized(
-                            [aux_w, 26.0],
-                            Button::new(RichText::new("🛡 Follower").size(11.5).color(fol_fg).strong())
-                                .fill(fol_bg),
-                        )
-                        .on_hover_text("Toggle capacitive height tracking follower servo")
-                        .clicked()
-                    {
-                        status.follower_active = !status.follower_active;
-                        if let Some(ref c) = controller {
-                            if c.is_connected() {
-                                c.set_follower_servo(status.follower_active);
-                            }
-                        }
-                        *status_message = format!(
-                            "Height follower servo: {}",
-                            if status.follower_active { "ON" } else { "OFF" }
-                        );
-                    }
-
-                    let red_bg = if status.red_pointer_on {
-                        Color32::from_rgb(85, 28, 28)
-                    } else {
-                        Color32::from_rgb(38, 42, 50)
-                    };
-                    let red_fg = if status.red_pointer_on {
-                        Color32::from_rgb(255, 115, 115)
-                    } else {
-                        Color32::WHITE
-                    };
-                    if ui
-                        .add_sized(
-                            [aux_w, 26.0],
-                            Button::new(RichText::new("🔴 Red Dot").size(11.5).color(red_fg).strong())
-                                .fill(red_bg),
-                        )
-                        .on_hover_text("Toggle 650nm visible red laser guide pointer")
-                        .clicked()
-                    {
-                        status.red_pointer_on = !status.red_pointer_on;
-                        if let Some(ref c) = controller {
-                            if c.is_connected() {
-                                c.set_red_pointer(status.red_pointer_on);
-                            }
-                        }
-                        *status_message = format!(
-                            "Red Dot guide: {}",
-                            if status.red_pointer_on { "ON" } else { "OFF" }
-                        );
-                    }
-
-                    let gas_bg = if status.gas_valve_open {
-                        Color32::from_rgb(24, 68, 92)
-                    } else {
-                        Color32::from_rgb(38, 42, 50)
-                    };
-                    let gas_fg = if status.gas_valve_open {
-                        Color32::from_rgb(90, 225, 255)
-                    } else {
-                        Color32::WHITE
-                    };
-                    if ui
-                        .add_sized(
-                            [aux_w, 26.0],
-                            Button::new(RichText::new("💨 Gas").size(11.5).color(gas_fg).strong())
-                                .fill(gas_bg),
-                        )
-                        .on_hover_text("Toggle assist gas valve")
-                        .clicked()
-                    {
-                        status.gas_valve_open = !status.gas_valve_open;
-                        if let Some(ref c) = controller {
-                            if c.is_connected() {
-                                c.set_gas(3, status.gas_valve_open);
-                            }
-                        }
-                        *status_message = format!(
-                            "Assist gas valve: {}",
-                            if status.gas_valve_open { "OPEN" } else { "CLOSED" }
-                        );
                     }
                 });
 

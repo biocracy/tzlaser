@@ -287,6 +287,30 @@ impl MachineStatus {
         }
     }
 
+    pub fn x_pos_limit(&self) -> bool {
+        (self.limit_sensor_mask & 0x01) != 0
+    }
+
+    pub fn x_neg_limit(&self) -> bool {
+        (self.limit_sensor_mask & 0x02) != 0
+    }
+
+    pub fn y_pos_limit(&self) -> bool {
+        (self.limit_sensor_mask & 0x6C) != 0
+    }
+
+    pub fn y_neg_limit(&self) -> bool {
+        (self.limit_sensor_mask & 0x90) != 0
+    }
+
+    pub fn z_pos_limit(&self) -> bool {
+        self.is_connected && self.z_homed && self.pos_z.abs() <= 50
+    }
+
+    pub fn z_neg_cap_limit(&self) -> bool {
+        self.is_connected && (self.capacitive_height_mm <= 0.5 || self.capacitance_pf >= 25.0)
+    }
+
     /// Merge status decoded from the Port 999 Z-axis / capacitive follower poll response.
     pub fn apply_z_status(&mut self, pos_z: i32, raw_cap: u32, follower_state: u32) {
         self.pos_z = pos_z;
