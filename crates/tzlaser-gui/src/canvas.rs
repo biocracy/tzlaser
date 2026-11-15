@@ -1538,16 +1538,37 @@ pub fn render_canvas(
 
             for order_idx in 1..cut_sequence.len() {
                 if let Some(waypoints) = state.cached_rapid_routes.1.get(order_idx - 1) {
-                    let rapid_color = if waypoints.len() > 2 {
-                        Color32::from_rgba_unmultiplied(255, 165, 70, 140)
+                    let is_traveled_done =
+                        completed_before_path_1based.is_some_and(|cutoff| order_idx < cutoff);
+                    let base_rapid = if waypoints.len() > 2 {
+                        Color32::from_rgba_unmultiplied(255, 175, 65, 185)
                     } else {
-                        Color32::from_rgba_unmultiplied(0, 200, 255, 45)
+                        Color32::from_rgba_unmultiplied(80, 215, 255, 115)
+                    };
+                    let (rapid_color, width) = if is_traveled_done {
+                        (desaturate_and_alpha(base_rapid, 0.20, 28), 1.0_f32)
+                    } else {
+                        (base_rapid, 1.4_f32)
                     };
                     for pair in waypoints.windows(2) {
                         let p1 = state.world_to_screen(pair[0], origin_screen);
                         let p2 = state.world_to_screen(pair[1], origin_screen);
                         if p1.distance(p2) > 2.0 {
-                            painter.line_segment([p1, p2], Stroke::new(1.2_f32, rapid_color));
+                            if is_traveled_done {
+                                painter.add(egui::Shape::dashed_line(
+                                    &[p1, p2],
+                                    Stroke::new(width, rapid_color),
+                                    4.0,
+                                    5.0,
+                                ));
+                            } else {
+                                painter.add(egui::Shape::dashed_line(
+                                    &[p1, p2],
+                                    Stroke::new(width, rapid_color),
+                                    8.0,
+                                    4.0,
+                                ));
+                            }
                         }
                     }
                 }

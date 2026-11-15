@@ -2322,18 +2322,32 @@ pub fn render_right_panels(
                     ui.add(ProgressBar::new(progress).text(bar_text));
                 }
 
-                // Fast-forward speed multiplier strictly for offline Dry-Cut simulation
+                // Simulation speed multiplier strictly for offline Dry-Cut simulation
                 if !is_connected && panel_state.run_mode != RunMode::Cutting {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Fast-Forward:").size(11.5).color(Color32::from_rgb(170, 200, 220)).strong());
-                        for &mult in &[1.0, 2.0, 4.0, 8.0, 16.0] {
-                            let selected = (panel_state.sim_speed_multiplier - mult).abs() < 1e-6;
-                            let label = format!("{}x", mult as u32);
-                            if ui.selectable_label(selected, RichText::new(label).size(11.5).strong()).clicked() {
-                                panel_state.sim_speed_multiplier = mult;
-                            }
-                        }
+                        ui.label(
+                            RichText::new("Sim Speed:")
+                                .size(11.5)
+                                .color(Color32::from_rgb(170, 200, 220))
+                                .strong(),
+                        );
+                        let fmt_speed = |m: f64| -> String {
+                            let s = format!("{:.3}", m);
+                            let s = s.trim_end_matches('0').trim_end_matches('.');
+                            format!("{}x", s)
+                        };
+                        egui::ComboBox::from_id_salt("sim_speed_combo")
+                            .selected_text(fmt_speed(panel_state.sim_speed_multiplier))
+                            .width(72.0)
+                            .show_ui(ui, |ui| {
+                                for &mult in &[0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0] {
+                                    let selected = (panel_state.sim_speed_multiplier - mult).abs() < 1e-6;
+                                    if ui.selectable_label(selected, fmt_speed(mult)).clicked() {
+                                        panel_state.sim_speed_multiplier = mult;
+                                    }
+                                }
+                            });
                     });
                 }
 
