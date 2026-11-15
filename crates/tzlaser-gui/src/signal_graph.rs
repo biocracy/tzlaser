@@ -11,8 +11,13 @@ pub struct SignalGraphState {
     pub show_y: bool,
     pub show_z: bool,
     pub show_w: bool,
+    pub show_ax: bool,
+    pub show_ay: bool,
+    pub show_az: bool,
+    pub show_aw: bool,
     pub offline_telemetry: SignalTelemetry,
     pub frozen_snapshot: Option<(f64, Vec<AxisSignalSample>)>,
+    pub last_active_snapshot: Option<(f64, Vec<AxisSignalSample>)>,
 }
 
 impl Default for SignalGraphState {
@@ -25,8 +30,13 @@ impl Default for SignalGraphState {
             show_y: true,
             show_z: true,
             show_w: true,
+            show_ax: true,
+            show_ay: true,
+            show_az: false,
+            show_aw: false,
             offline_telemetry: SignalTelemetry::new(),
             frozen_snapshot: None,
+            last_active_snapshot: None,
         }
     }
 }
@@ -123,6 +133,13 @@ pub fn render_signal_graph(
         toggle_pill(ui, "W", &mut state.show_w, Color32::from_rgb(255, 200, 80));
 
         ui.separator();
+        ui.label(RichText::new("Acc:").size(10.0).weak());
+        toggle_pill(ui, "aX", &mut state.show_ax, Color32::from_rgb(255, 145, 70));
+        toggle_pill(ui, "aY", &mut state.show_ay, Color32::from_rgb(100, 235, 210));
+        toggle_pill(ui, "aZ", &mut state.show_az, Color32::from_rgb(165, 145, 255));
+        toggle_pill(ui, "aW", &mut state.show_aw, Color32::from_rgb(245, 225, 130));
+
+        ui.separator();
         for w in [5.0_f64, 15.0, 30.0, 60.0] {
             let sel = (state.window_secs - w).abs() < 0.1;
             if ui
@@ -161,6 +178,7 @@ pub fn render_signal_graph(
             }
             state.offline_telemetry.clear();
             state.frozen_snapshot = None;
+            state.last_active_snapshot = None;
         }
 
         ui.separator();
@@ -208,8 +226,9 @@ pub fn render_signal_graph(
         egui::StrokeKind::Inside,
     );
 
+    let any_acc = state.show_ax || state.show_ay || state.show_az || state.show_aw;
     let pad_left = 48.0;
-    let pad_right = 8.0;
+    let pad_right = if any_acc { 54.0 } else { 8.0 };
     let pad_top = 12.0;
     let pad_bottom = 16.0;
     let inner = Rect::from_min_max(
@@ -262,9 +281,49 @@ pub fn render_signal_graph(
     }
     let y_max = (peak * 1.15).max(500.0);
 
+    // Compute per-sample acceleration (pls/s^2) aligned with `visible`
+    let mut acc_samples: Vec<[f32; 4]> = Vec::with_capacity(visible.len());
+    for i in 0..visible.len() {
+        if i == 0 {
+            acc_samples.push([0.0; 4]);
+        } else {
+            let dt = (visible[i].timestamp_secs - visible[i - 1].timestamp_secs).max(0.01) as f32;
+            acc_samples.push([
+                (visible[i].x_rate - visible[i - 1].x_rate) / dt,
+                (visible[i].y_rate - visible[i - 1].y_rate) / dt,
+                (visible[i].z_rate - visible[i - 1].z_rate) / dt,
+                (visible[i].w_rate - visible[i - 1].w_rate) / dt,
+            ]);
+        }
+    }
+
+    let mut acc_peak = 1000.0_f32;
+    for a in &acc_samples {
+        if state.show_ax {
+            acc_peak = acc_peak.max(a[0].abs());
+        }
+        if state.show_ay {
+            acc_peak = acc_peak.max(a[1].abs());
+        }
+        if state.show_az {
+            acc_peak = acc_peak.max(a[2].abs());
+        }
+        if state.show_aw {
+            acc_peak = acc_peak.max(a[3].abs());
+        }
+    }
+    let a_max = (acc_peak * 1.15).max(1000.0);
+
     let to_screen = |t: f64, val: f32| -> Pos2 {
         let u = ((t - t_min) / state.window_secs).clamp(0.0, 1.0) as f32;
         let v = (val / y_max).clamp(-1.0, 1.0);
+        let x = inner.left() + u * inner.width();
+        let y = inner.center().y - v * (inner.height() * 0.5);
+        pos2(x, y)
+    };
+    let to_screen_acc = |t: f64, val: f32| -> Pos2 {
+        let u = ((t - t_min) / state.window_secs).clamp(0.0, 1.0) as f32;
+        let v = (val / a_max).clamp(-1.0, 1.0);
         let x = inner.left() + u * inner.width();
         let y = inner.center().y - v * (inner.height() * 0.5);
         pos2(x, y)
@@ -304,6 +363,32 @@ pub fn render_signal_graph(
         FontId::monospace(9.5),
         Color32::from_rgb(130, 138, 152),
     );
+
+    // Secondary Y-axis labels on the right for Acceleration (pls/s^2)
+    if any_acc {
+        let acc_lbl_col = Color32::from_rgb(175, 165, 210);
+        painter.text(
+            pos2(inner.right() + 4.0, inner.top()),
+            Align2::LEFT_TOP,
+            format!("+{}", format_rate(a_max).trim_start_matches('+')),
+            FontId::monospace(9.5),
+            acc_lbl_col,
+        );
+        painter.text(
+            pos2(inner.right() + 4.0, zero_y),
+            Align2::LEFT_CENTER,
+            "pls/s²",
+            FontId::monospace(8.5),
+            acc_lbl_col,
+        );
+        painter.text(
+            pos2(inner.right() + 4.0, inner.bottom()),
+            Align2::LEFT_BOTTOM,
+            format!("-{}", format_rate(a_max).trim_start_matches('+')),
+            FontId::monospace(9.5),
+            acc_lbl_col,
+        );
+    }
 
     // Time grid ticks
     let num_ticks = 5usize;
@@ -413,6 +498,26 @@ pub fn render_signal_graph(
     draw_channel(state.show_z, Color32::from_rgb(95, 175, 255), |s| s.z_rate);
     draw_channel(state.show_y, Color32::from_rgb(80, 230, 125), |s| s.y_rate);
     draw_channel(state.show_x, Color32::from_rgb(255, 95, 95), |s| s.x_rate);
+
+    // Draw acceleration curves on the secondary Y-axis
+    let draw_acc_channel = |enabled: bool, color: Color32, axis_idx: usize| {
+        if !enabled || visible.len() < 2 {
+            return;
+        }
+        let mut pts: Vec<Pos2> = Vec::with_capacity(visible.len());
+        for (i, s) in visible.iter().enumerate() {
+            let t_clamped = s.timestamp_secs.max(t_min);
+            pts.push(to_screen_acc(t_clamped, acc_samples[i][axis_idx]));
+        }
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, Stroke::new(1.2, color)));
+        }
+    };
+
+    draw_acc_channel(state.show_aw, Color32::from_rgba_unmultiplied(245, 225, 130, 200), 3);
+    draw_acc_channel(state.show_az, Color32::from_rgba_unmultiplied(165, 145, 255, 200), 2);
+    draw_acc_channel(state.show_ay, Color32::from_rgba_unmultiplied(100, 235, 210, 210), 1);
+    draw_acc_channel(state.show_ax, Color32::from_rgba_unmultiplied(255, 145, 70, 210), 0);
 }
 
 fn fetch_snapshot(
@@ -420,18 +525,44 @@ fn fetch_snapshot(
     controller: &Option<LaserController>,
     is_active_motion: bool,
 ) -> (f64, Vec<AxisSignalSample>) {
-    if let Some(ref c) = controller {
+    let raw = if let Some(ref c) = controller {
         if c.is_connected() {
             let tel_arc = c.telemetry();
             let mut tel = tel_arc.lock().unwrap();
             if is_active_motion {
                 tel.tick_sample(50);
             }
-            return tel.snapshot();
+            tel.snapshot()
+        } else {
+            if is_active_motion {
+                state.tick_offline();
+            }
+            state.offline_telemetry.snapshot()
         }
-    }
+    } else {
+        if is_active_motion {
+            state.tick_offline();
+        }
+        state.offline_telemetry.snapshot()
+    };
+
     if is_active_motion {
-        state.tick_offline();
+        state.last_active_snapshot = Some(raw.clone());
+        return raw;
     }
-    state.offline_telemetry.snapshot()
+
+    // Machine is paused or idle: freeze the graph unless a new discrete command (e.g. step jog) arrived
+    let new_last_ts = raw.1.last().map(|s| s.timestamp_secs).unwrap_or(0.0);
+    let prev_last_ts = state
+        .last_active_snapshot
+        .as_ref()
+        .and_then(|(_, v)| v.last().map(|s| s.timestamp_secs))
+        .unwrap_or(-1.0);
+    if state.last_active_snapshot.is_none() || (new_last_ts - prev_last_ts).abs() > 1e-6 {
+        let frozen_snap = (new_last_ts.max(0.001), raw.1);
+        state.last_active_snapshot = Some(frozen_snap.clone());
+        return frozen_snap;
+    }
+
+    state.last_active_snapshot.clone().unwrap_or(raw)
 }
