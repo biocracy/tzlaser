@@ -549,7 +549,13 @@ impl LaserController {
                             active_z_step_watch = None;
                             active_remote_jog = None;
                             pending_xy_home_after_z = None;
-                            active_fifo = None;
+                            if active_fifo.take().is_some() {
+                                for fpkt in build_fifo_finish_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                                }
+                            }
                             let (p1, _p2) = build_stop_packets(|| {
                                 seq_clone.fetch_add(1, Ordering::Relaxed)
                             });
@@ -573,6 +579,13 @@ impl LaserController {
                             active_step_watch = None;
                             active_z_step_watch = None;
                             active_remote_jog = None;
+                            if active_fifo.take().is_some() {
+                                for fpkt in build_fifo_finish_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                                }
+                            }
 
                             // 1. Home Z up first so the nozzle clears the sheet before XY moves.
                             //    XY homing will be triggered once Z homing completes (matching SC2000).
@@ -596,23 +609,17 @@ impl LaserController {
                                     Instant::now() + Duration::from_secs(15),
                                 ));
                             } else {
-                                if pending_stop_p2_at.take().is_some() {
-                                    let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                    let p2 = Packet::write_request(
-                                        s_rst,
-                                        registers::REG_COMMAND,
-                                        vec![2],
-                                    );
-                                    let _ = send_and_wait_ack(&socket, &p2, &mut buf);
-                                    thread::sleep(Duration::from_millis(25));
+                                pending_stop_p2_at = None;
+                                for (addr, vals) in [
+                                    (registers::REG_COMMAND, vec![2]),
+                                    (1344, vec![0]),
+                                    (registers::REG_ENABLE_FLAG, vec![1]),
+                                    (registers::REG_COMMAND, vec![3]),
+                                ] {
+                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let p = Packet::write_request(s, addr, vals);
+                                    let _ = send_and_wait_ack(&socket, &p, &mut buf);
                                 }
-                                let s_en = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                let en = Packet::write_request(
-                                    s_en,
-                                    registers::REG_ENABLE_FLAG,
-                                    vec![1],
-                                );
-                                let _ = send_and_wait_ack(&socket, &en, &mut buf);
                                 last_r1004 = 0;
                                 for hpkt in build_xy_home_packets(
                                     || seq_clone.fetch_add(1, Ordering::Relaxed),
@@ -1036,23 +1043,17 @@ impl LaserController {
                     };
                     if z_done || Instant::now() >= deadline {
                         pending_xy_home_after_z = None;
-                        if pending_stop_p2_at.take().is_some() {
-                            let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
-                            let p2 = Packet::write_request(
-                                s_rst,
-                                registers::REG_COMMAND,
-                                vec![2],
-                            );
-                            let _ = send_and_wait_ack(&socket, &p2, &mut buf);
-                            thread::sleep(Duration::from_millis(25));
+                        pending_stop_p2_at = None;
+                        for (addr, vals) in [
+                            (registers::REG_COMMAND, vec![2]),
+                            (1344, vec![0]),
+                            (registers::REG_ENABLE_FLAG, vec![1]),
+                            (registers::REG_COMMAND, vec![3]),
+                        ] {
+                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let p = Packet::write_request(s, addr, vals);
+                            let _ = send_and_wait_ack(&socket, &p, &mut buf);
                         }
-                        let s_en = seq_clone.fetch_add(1, Ordering::Relaxed);
-                        let en = Packet::write_request(
-                            s_en,
-                            registers::REG_ENABLE_FLAG,
-                            vec![1],
-                        );
-                        let _ = send_and_wait_ack(&socket, &en, &mut buf);
                         last_r1004 = 0;
                         for hpkt in build_xy_home_packets(
                             || seq_clone.fetch_add(1, Ordering::Relaxed),
