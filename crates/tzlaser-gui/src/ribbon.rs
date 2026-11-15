@@ -5,8 +5,8 @@ use eframe::egui::{
 use kurbo::Point;
 use std::net::SocketAddr;
 use tzlaser_core::{
-    apply_lead_lines, Color, Document, DxfImporter, Entity, HistoryManager, Layer, LeadConfig,
-    LeadType, PostJobAction, PulseConfig, SortMode,
+    apply_lead_lines, Color, CoolHeuristicSolver, Document, DxfImporter, Entity, HistoryManager,
+    Layer, LeadConfig, LeadType, PostJobAction, PulseConfig, SortMode,
 };
 use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 
@@ -35,6 +35,7 @@ pub struct RibbonState {
     pub pulse_duration_ms: u32,
     pub pulse_power_pct: f32,
     pub pending_sort_action: Option<PendingSortAction>,
+    pub cool_solver: Option<CoolHeuristicSolver>,
     // Dimensioned shape placement fields for the Draw tab
     pub draw_place_x: f64,
     pub draw_place_y: f64,
@@ -55,6 +56,7 @@ impl Default for RibbonState {
             pulse_duration_ms: 50,
             pulse_power_pct: 20.0,
             pending_sort_action: None,
+            cool_solver: None,
             draw_place_x: 150.0,
             draw_place_y: 150.0,
             draw_rect_w: 100.0,
@@ -984,7 +986,68 @@ fn render_profiles_tab(
                                 }
                             }
                         }
+                    } else if doc.sort_mode == SortMode::MaxDistanceInterior {
+                        let mut finish_clicked = false;
+                        if let Some(ref mut solver) = state.cool_solver {
+                            solver.step(200);
+                            ui.ctx().request_repaint();
+
+                            let finish_btn = Button::new(
+                                RichText::new("✓ Finish").size(11.0).color(Color32::WHITE).strong(),
+                            )
+                            .fill(Color32::from_rgb(28, 135, 78))
+                            .min_size(Vec2::new(66.0, 19.0));
+                            if ui
+                                .add(finish_btn)
+                                .on_hover_text("Apply the best Max-Min Cooling cut order found so far")
+                                .clicked()
+                            {
+                                finish_clicked = true;
+                            }
+                            ui.label(
+                                RichText::new(format!("Min Dist: {:.1} mm", solver.best_min_dist_mm))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(120, 235, 255))
+                                    .strong(),
+                            );
+                        } else {
+                            let sort_btn = Button::new(
+                                RichText::new("⚡ Sort")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(255, 215, 0))
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(45, 40, 22))
+                            .min_size(Vec2::new(60.0, 19.0));
+                            if ui
+                                .add(sort_btn)
+                                .on_hover_text(
+                                    "Start Max-Min Cooling heuristic (click Finish to apply new order)",
+                                )
+                                .clicked()
+                            {
+                                state.cool_solver = Some(CoolHeuristicSolver::new(doc));
+                                *status_message =
+                                    "Running Max Dist Interior (Cool) heuristic — click Finish to apply."
+                                        .to_string();
+                            }
+                        }
+                        if finish_clicked {
+                            if let Some(solver) = state.cool_solver.take() {
+                                history.record(
+                                    doc,
+                                    selection,
+                                    "Sort (Max Dist Interior Cool)",
+                                );
+                                doc.apply_cut_sequence(&solver.full_sequence());
+                                *status_message = format!(
+                                    "Applied Max Dist Interior (Cool) order: min distance = {:.2} mm ({} iters).",
+                                    solver.best_min_dist_mm, solver.iterations
+                                );
+                            }
+                        }
                     } else {
+                        state.cool_solver = None;
                         let sort_btn = Button::new(RichText::new("⚡ Sort").size(11.0).color(Color32::from_rgb(255, 215, 0)).strong())
                             .fill(Color32::from_rgb(45, 40, 22))
                             .min_size(Vec2::new(60.0, 19.0));

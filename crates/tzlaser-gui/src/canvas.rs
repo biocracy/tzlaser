@@ -514,6 +514,17 @@ fn draw_dashed_closed_poly(painter: &egui::Painter, pts: &[Pos2], stroke: Stroke
     }
 }
 
+fn desaturate_and_alpha(c: Color32, sat_factor: f32, alpha: u8) -> Color32 {
+    let r = c.r() as f32;
+    let g = c.g() as f32;
+    let b = c.b() as f32;
+    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    let nr = (lum + (r - lum) * sat_factor).round().clamp(0.0, 255.0) as u8;
+    let ng = (lum + (g - lum) * sat_factor).round().clamp(0.0, 255.0) as u8;
+    let nb = (lum + (b - lum) * sat_factor).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(nr, ng, nb, alpha)
+}
+
 fn render_entity(
     painter: &egui::Painter,
     entity: &Entity,
@@ -1327,16 +1338,25 @@ pub fn render_canvas(
                         let is_completed = completed_before_path_1based.is_some_and(|cutoff| {
                             path_order_map.get(&key).is_some_and(|&idx1| idx1 < cutoff)
                         });
-                        let alpha = if is_completed { completed_alpha } else { unsel_alpha };
+                        let draw_color = if is_completed {
+                            desaturate_and_alpha(ent_color, 0.20, completed_alpha)
+                        } else {
+                            Color32::from_rgba_unmultiplied(
+                                ent_color.r(),
+                                ent_color.g(),
+                                ent_color.b(),
+                                unsel_alpha,
+                            )
+                        };
                         let base_stroke = Stroke::new(
                             if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
-                            Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), alpha),
+                            draw_color,
                         );
                         render_entity(
                             &painter,
                             child,
                             is_selected,
-                            ent_color,
+                            draw_color,
                             base_stroke,
                             sel_glow_stroke,
                             sel_core_stroke,
@@ -1354,16 +1374,25 @@ pub fn render_canvas(
                     let is_completed = completed_before_path_1based.is_some_and(|cutoff| {
                         path_order_map.get(&key).is_some_and(|&idx1| idx1 < cutoff)
                     });
-                    let alpha = if is_completed { completed_alpha } else { unsel_alpha };
+                    let draw_color = if is_completed {
+                        desaturate_and_alpha(ent_color, 0.20, completed_alpha)
+                    } else {
+                        Color32::from_rgba_unmultiplied(
+                            ent_color.r(),
+                            ent_color.g(),
+                            ent_color.b(),
+                            unsel_alpha,
+                        )
+                    };
                     let base_stroke = Stroke::new(
                         if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
-                        Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), alpha),
+                        draw_color,
                     );
                     render_entity(
                         &painter,
                         entity,
                         is_selected,
-                        ent_color,
+                        draw_color,
                         base_stroke,
                         sel_glow_stroke,
                         sel_core_stroke,

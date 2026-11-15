@@ -1859,7 +1859,12 @@ impl Document {
     /// Computes the toolpath cutting sequence using the active saved order (if enabled)
     /// or the document's currently selected SortMode.
     pub fn compute_cut_sequence(&self) -> Vec<CutPathInfo> {
-        let mut paths = self.compute_cut_sequence_with_mode(self.sort_mode);
+        let effective_mode = if self.sort_mode == SortMode::MaxDistanceInterior {
+            SortMode::Manual
+        } else {
+            self.sort_mode
+        };
+        let mut paths = self.compute_cut_sequence_with_mode(effective_mode);
         if self.use_saved_cut_order && !self.saved_cut_order.is_empty() {
             let mut pos_by_key: HashMap<(usize, usize, Option<usize>), usize> =
                 HashMap::with_capacity(paths.len());
@@ -2218,6 +2223,13 @@ impl Document {
         self.use_saved_cut_order = false;
         let seq = self.compute_cut_sequence_with_mode(mode);
         self.manual_sequence.clear();
+        self.apply_cut_sequence(&seq);
+    }
+
+    /// Reorders the entities within layers to permanently match an explicit `CutPathInfo` sequence.
+    pub fn apply_cut_sequence(&mut self, seq: &[CutPathInfo]) {
+        self.use_saved_cut_order = false;
+        self.manual_sequence.clear();
 
         let mut old_to_new: HashMap<(usize, usize), usize> = HashMap::new();
         let mut old_child_to_new: HashMap<(usize, usize, usize), usize> = HashMap::new();
@@ -2226,14 +2238,14 @@ impl Document {
             let mut ordered_entities = Vec::with_capacity(layer.entities.len());
             let mut used = vec![false; layer.entities.len()];
 
-            for info in &seq {
+            for info in seq {
                 if info.layer_idx == l_idx && info.entity_idx < layer.entities.len() && !used[info.entity_idx] {
                     let new_idx = ordered_entities.len();
                     let ent = match &layer.entities[info.entity_idx] {
                         Entity::Group { children } => {
                             let mut reordered = Vec::with_capacity(children.len());
                             let mut c_used = vec![false; children.len()];
-                            for s in &seq {
+                            for s in seq {
                                 if s.layer_idx == l_idx && s.entity_idx == info.entity_idx {
                                     if let Some(old_c) = s.child_idx {
                                         if old_c < children.len() && !c_used[old_c] {
@@ -2763,6 +2775,236 @@ pub fn chain_connected_entities(entities: Vec<Entity>, tolerance_mm: f64) -> Vec
     }
 
     closed_result
+}
+
+/// Anytime bottleneck-maximization heuristic for `SortMode::MaxDistanceInterior` ("Cool" mode).
+/// Maximizes the minimal distance between any two consecutive cuts while keeping bend/open paths
+/// first and outer contours last (or optimizing all paths when fewer than 2 interior paths exist).
+#[derive(Debug, Clone)]
+pub struct CoolHeuristicSolver {
+    prefix: Vec<CutPathInfo>,
+    suffix: Vec<CutPathInfo>,
+    current: Vec<CutPathInfo>,
+    best: Vec<CutPathInfo>,
+    best_score: (f64, f64, f64),
+    pub best_min_dist_mm: f64,
+    pub iterations: usize,
+    stagnant_iters: usize,
+    rng_state: u64,
+}
+
+impl CoolHeuristicSolver {
+    fn pair_dist(a: &CutPathInfo, b: &CutPathInfo) -> f64 {
+        let dx = b.start_point.x - a.end_point.x;
+        let dy = b.start_point.y - a.end_point.y;
+        dx.hypot(dy)
+    }
+
+    /// Score tuple `(min_dist, second_min_dist, sum_dist)` — larger is better.
+    fn eval_score(paths: &[CutPathInfo]) -> (f64, f64, f64) {
+        if paths.len() < 2 {
+            return (0.0, 0.0, 0.0);
+        }
+        let mut min1 = f64::INFINITY;
+        let mut min2 = f64::INFINITY;
+        let mut sum = 0.0;
+        for w in paths.windows(2) {
+            let d = Self::pair_dist(&w[0], &w[1]);
+            sum += d;
+            if d < min1 {
+                min2 = min1;
+                min1 = d;
+            } else if d < min2 {
+                min2 = d;
+            }
+        }
+        if !min2.is_finite() {
+            min2 = min1;
+        }
+        (min1, min2, sum)
+    }
+
+    fn better_score(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+        if (a.0 - b.0).abs() > 1e-6 {
+            a.0 > b.0
+        } else if (a.1 - b.1).abs() > 1e-6 {
+            a.1 > b.1
+        } else {
+            a.2 > b.2 + 1e-6
+        }
+    }
+
+    fn next_rand(&mut self) -> usize {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.rng_state >> 32) as usize
+    }
+
+    pub fn new(doc: &Document) -> Self {
+        let current_seq = doc.compute_cut_sequence();
+        let mut bend = Vec::new();
+        let mut interior = Vec::new();
+        let mut outer = Vec::new();
+        for p in &current_seq {
+            if p.is_open {
+                bend.push(*p);
+            } else if p.is_interior {
+                interior.push(*p);
+            } else {
+                outer.push(*p);
+            }
+        }
+
+        let (prefix, mut active, suffix) = if interior.len() >= 2 {
+            (bend, interior, outer)
+        } else {
+            (Vec::new(), current_seq, Vec::new())
+        };
+
+        let mut best = active.clone();
+        let mut best_score = Self::eval_score(&best);
+
+        if active.len() >= 2 {
+            // Seed 1: farthest-neighbor order
+            let mut fn_pool = active.clone();
+            let mut fn_pos = prefix.last().map_or(Point::ORIGIN, |p| p.end_point);
+            let mut fn_order = Vec::with_capacity(active.len());
+            Document::sequence_group_farthest_neighbor(&mut fn_pool, &mut fn_pos, &mut fn_order);
+            let fn_score = Self::eval_score(&fn_order);
+            if Self::better_score(fn_score, best_score) {
+                best = fn_order;
+                best_score = fn_score;
+            }
+
+            // Seed 2: 1D-projected interleaving (0, n/2, 1, n/2+1, ...)
+            active.sort_by(|a, b| {
+                let pa = a.start_point.x + a.start_point.y;
+                let pb = b.start_point.x + b.start_point.y;
+                pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let half = (active.len() + 1) / 2;
+            let mut interleaved = Vec::with_capacity(active.len());
+            for i in 0..half {
+                interleaved.push(active[i]);
+                if i + half < active.len() {
+                    interleaved.push(active[i + half]);
+                }
+            }
+            let il_score = Self::eval_score(&interleaved);
+            if Self::better_score(il_score, best_score) {
+                best = interleaved;
+                best_score = il_score;
+            }
+        }
+
+        Self {
+            prefix,
+            suffix,
+            current: best.clone(),
+            best,
+            best_score,
+            best_min_dist_mm: best_score.0,
+            iterations: 0,
+            stagnant_iters: 0,
+            rng_state: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    pub fn step(&mut self, max_iters: usize) {
+        let n = self.current.len();
+        if n < 3 {
+            self.iterations += 1;
+            return;
+        }
+
+        for _ in 0..max_iters {
+            self.iterations += 1;
+
+            // Find the current bottleneck edge (minimum consecutive distance)
+            let mut bottleneck_i = 0usize;
+            let mut min_d = f64::INFINITY;
+            for i in 0..(n - 1) {
+                let d = Self::pair_dist(&self.current[i], &self.current[i + 1]);
+                if d < min_d {
+                    min_d = d;
+                    bottleneck_i = i;
+                }
+            }
+
+            let mut cur_score = Self::eval_score(&self.current);
+            let mut improved = false;
+
+            // Target bottleneck endpoints (bottleneck_i or bottleneck_i + 1)
+            let pivot = if (self.next_rand() & 1) == 0 {
+                bottleneck_i
+            } else {
+                bottleneck_i + 1
+            };
+
+            let sample_count = n.min(24);
+            for s in 0..sample_count {
+                let j = if n <= 24 { s } else { self.next_rand() % n };
+                if j == pivot {
+                    continue;
+                }
+                self.current.swap(pivot, j);
+                let cand = Self::eval_score(&self.current);
+                if Self::better_score(cand, cur_score) {
+                    cur_score = cand;
+                    improved = true;
+                    break;
+                }
+                self.current.swap(pivot, j);
+            }
+
+            // Also try random relocate / swap to escape bottleneck ties
+            if !improved {
+                let a = self.next_rand() % n;
+                let b = self.next_rand() % n;
+                if a != b {
+                    self.current.swap(a, b);
+                    let cand = Self::eval_score(&self.current);
+                    if Self::better_score(cand, cur_score) {
+                        cur_score = cand;
+                        improved = true;
+                    } else {
+                        self.current.swap(a, b);
+                    }
+                }
+            }
+
+            if Self::better_score(cur_score, self.best_score) {
+                self.best_score = cur_score;
+                self.best = self.current.clone();
+                self.best_min_dist_mm = cur_score.0;
+                self.stagnant_iters = 0;
+            } else if improved {
+                self.stagnant_iters = 0;
+            } else {
+                self.stagnant_iters += 1;
+                if self.stagnant_iters > 40 {
+                    // Perturb from best to explore a fresh basin
+                    self.current = self.best.clone();
+                    let a = self.next_rand() % n;
+                    let b = self.next_rand() % n;
+                    let c = self.next_rand() % n;
+                    self.current.swap(a, b);
+                    self.current.swap(b, c);
+                    self.stagnant_iters = 0;
+                }
+            }
+        }
+    }
+
+    pub fn full_sequence(&self) -> Vec<CutPathInfo> {
+        let mut out = Vec::with_capacity(self.prefix.len() + self.best.len() + self.suffix.len());
+        out.extend_from_slice(&self.prefix);
+        out.extend_from_slice(&self.best);
+        out.extend_from_slice(&self.suffix);
+        out
+    }
 }
 
 #[cfg(test)]
