@@ -497,6 +497,7 @@ pub fn build_fifo_finish_packets(mut seq_gen: impl FnMut() -> u16) -> Vec<Packet
         Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![4]),
         Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![2]),
         Packet::write_request(seq_gen(), 1344, vec![0]),
+        Packet::write_request(seq_gen(), 1244, vec![24823]),
         Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![1]),
     ]
 }

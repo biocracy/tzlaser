@@ -136,11 +136,19 @@ pub fn build_trajectory_fifo_ticks(
     let mut ticks = Vec::new();
     let mut cur_px = start_px;
     let mut cur_py = start_py;
-    let accel = pulses_cfg.jog_accel_mm_s2.clamp(10.0, 150.0);
+    // Development safety: cap Dry-Cut to 5 mm/s and gentle 25 mm/s^2 acceleration
+    let dev_speed_mm_s = 5.0_f64;
+    let accel = pulses_cfg.jog_accel_mm_s2.clamp(10.0, 25.0);
 
     let segs: Vec<&MotionSegment> = traj.iter().filter(|s| s.length_mm > 1e-6).collect();
     if segs.is_empty() {
         return ticks;
+    }
+
+    // SC2000 Motion FIFO stream preamble: tick 0 = 0x30, followed by 58 zero-motion 0x02 warmup ticks
+    ticks.push((0, 0, 0x30));
+    for _ in 0..58 {
+        ticks.push((0, 0, 0x02));
     }
 
     let seg_dir = |s: &MotionSegment| -> (f64, f64) {
@@ -172,20 +180,11 @@ pub fn build_trajectory_fifo_ticks(
         let mut cum_len = Vec::with_capacity(chain.len() + 1);
         cum_len.push(0.0_f64);
         let mut total_len = 0.0_f64;
-        let mut min_speed = f64::INFINITY;
         for s in chain {
             total_len += s.length_mm;
             cum_len.push(total_len);
-            let spd = if s.is_rapid {
-                s.speed_mm_s.clamp(1.0, 20.0)
-            } else {
-                s.speed_mm_s.clamp(0.5, 20.0)
-            };
-            if spd < min_speed {
-                min_speed = spd;
-            }
         }
-        let v_target = min_speed.max(0.5);
+        let v_target = dev_speed_mm_s;
         let d_ramp_full = (v_target * v_target) / (2.0 * accel);
         let (v_peak, t_accel, d_accel, t_cruise, total_t) = if 2.0 * d_ramp_full >= total_len {
             let vp = (total_len * accel).sqrt().max(0.5);
@@ -243,13 +242,7 @@ pub fn build_trajectory_fifo_ticks(
             let tick_dy = (cur_py - next_py).clamp(-127, 127) as i8;
             cur_px -= tick_dx as i32;
             cur_py -= tick_dy as i32;
-            let flags = if ticks.is_empty() {
-                0x30
-            } else if is_rapid {
-                0x03
-            } else {
-                0x01
-            };
+            let flags = if is_rapid { 0x03 } else { 0x01 };
             ticks.push((tick_dx, tick_dy, flags));
         }
 
@@ -259,18 +252,15 @@ pub fn build_trajectory_fifo_ticks(
             let tick_dy = (cur_py - end_py).clamp(-127, 127) as i8;
             cur_px -= tick_dx as i32;
             cur_py -= tick_dy as i32;
-            let flags = if ticks.is_empty() {
-                0x30
-            } else if is_rapid {
-                0x03
-            } else {
-                0x01
-            };
+            let flags = if is_rapid { 0x03 } else { 0x01 };
             ticks.push((tick_dx, tick_dy, flags));
         }
 
         idx = chain_end;
     }
+
+    // SC2000 Motion FIFO stream end-of-stream marker
+    ticks.push((0, 0, 0xF0));
     ticks
 }
 
@@ -2636,12 +2626,14 @@ mod tests {
             path_index_1based: 1,
         }];
         let ticks = build_trajectory_fifo_ticks(&traj, origin, &cfg, 0, 0);
-        assert!(!ticks.is_empty());
-        assert_eq!(ticks[0].2, 0x30);
+        assert!(ticks.len() > 60);
+        assert_eq!(ticks[0], (0, 0, 0x30));
+        assert!(ticks[1..59].iter().all(|&t| t == (0, 0, 0x02)));
+        assert_eq!(ticks.last(), Some(&(0, 0, 0xF0)));
         // Total FIFO pulses are negated relative to R1008 target position
         let sum_x: i32 = ticks.iter().map(|t| t.0 as i32).sum();
         assert_eq!(sum_x, -cfg.mm_to_pulses_x(20.0));
-        // First tick velocity should be small (accelerating from rest, not jumping straight to cruise)
-        assert!(ticks[0].0.abs() <= 2);
+        // First motion tick velocity should be small (accelerating gently from rest at 5 mm/s)
+        assert!(ticks[59].0.abs() <= 1);
     }
 }
