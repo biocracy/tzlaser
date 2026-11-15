@@ -65,7 +65,7 @@ impl MaterialLibrary {
                     material: "Mild Steel".to_string(),
                     thickness_mm: 1.0,
                     params: CuttingParams {
-                        speed_mm_s: 120.0,
+                        speed_mm_s: 20.0,
                         power_percent: 85.0,
                         pierce_time_ms: 150,
                         gas_type: "Air".to_string(),
@@ -80,7 +80,7 @@ impl MaterialLibrary {
                     material: "Mild Steel".to_string(),
                     thickness_mm: 2.0,
                     params: CuttingParams {
-                        speed_mm_s: 65.0,
+                        speed_mm_s: 16.0,
                         power_percent: 95.0,
                         pierce_time_ms: 250,
                         gas_type: "O2".to_string(),
@@ -95,7 +95,7 @@ impl MaterialLibrary {
                     material: "Mild Steel".to_string(),
                     thickness_mm: 3.0,
                     params: CuttingParams {
-                        speed_mm_s: 40.0,
+                        speed_mm_s: 12.0,
                         power_percent: 100.0,
                         pierce_time_ms: 350,
                         gas_type: "O2".to_string(),
@@ -110,7 +110,7 @@ impl MaterialLibrary {
                     material: "Mild Steel".to_string(),
                     thickness_mm: 5.0,
                     params: CuttingParams {
-                        speed_mm_s: 22.0,
+                        speed_mm_s: 8.0,
                         power_percent: 100.0,
                         pierce_time_ms: 500,
                         gas_type: "O2".to_string(),
@@ -125,7 +125,7 @@ impl MaterialLibrary {
                     material: "Stainless Steel".to_string(),
                     thickness_mm: 1.0,
                     params: CuttingParams {
-                        speed_mm_s: 110.0,
+                        speed_mm_s: 18.0,
                         power_percent: 90.0,
                         pierce_time_ms: 150,
                         gas_type: "N2".to_string(),
@@ -140,7 +140,7 @@ impl MaterialLibrary {
                     material: "Stainless Steel".to_string(),
                     thickness_mm: 2.0,
                     params: CuttingParams {
-                        speed_mm_s: 55.0,
+                        speed_mm_s: 14.0,
                         power_percent: 100.0,
                         pierce_time_ms: 250,
                         gas_type: "N2".to_string(),
@@ -155,7 +155,7 @@ impl MaterialLibrary {
                     material: "Aluminum".to_string(),
                     thickness_mm: 1.5,
                     params: CuttingParams {
-                        speed_mm_s: 85.0,
+                        speed_mm_s: 16.0,
                         power_percent: 95.0,
                         pierce_time_ms: 200,
                         gas_type: "N2".to_string(),
@@ -170,7 +170,7 @@ impl MaterialLibrary {
                     material: "Aluminum".to_string(),
                     thickness_mm: 3.0,
                     params: CuttingParams {
-                        speed_mm_s: 35.0,
+                        speed_mm_s: 10.0,
                         power_percent: 100.0,
                         pierce_time_ms: 350,
                         gas_type: "N2".to_string(),
@@ -185,7 +185,7 @@ impl MaterialLibrary {
                     material: "General".to_string(),
                     thickness_mm: 0.0,
                     params: CuttingParams {
-                        speed_mm_s: 300.0,
+                        speed_mm_s: 20.0,
                         power_percent: 25.0,
                         pierce_time_ms: 0,
                         gas_type: "Air".to_string(),

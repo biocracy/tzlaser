@@ -42,7 +42,7 @@ pub struct CuttingParams {
 impl Default for CuttingParams {
     fn default() -> Self {
         Self {
-            speed_mm_s: 100.0,
+            speed_mm_s: 15.0,
             power_percent: 80.0,
             pierce_time_ms: 200,
             gas_type: "Air".to_string(),
@@ -580,7 +580,7 @@ impl Layer {
             color: Color { r: 130, g: 165, b: 205 },
             visible: true,
             params: CuttingParams {
-                speed_mm_s: 200.0,
+                speed_mm_s: 20.0,
                 power_percent: 0.0,
                 pierce_time_ms: 0,
                 gas_type: "None".to_string(),

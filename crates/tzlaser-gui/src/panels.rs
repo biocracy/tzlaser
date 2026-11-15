@@ -123,8 +123,9 @@ pub fn head_world_mm(status: &MachineStatus, pulse_config: &PulseConfig) -> kurb
 }
 
 /// Convert a `MotionSegment` trajectory into a continuous 1-ms Motion FIFO tick stream `(dx, dy, flags)`.
-/// Uses exact integer accumulator rounding so consecutive curve chords flow seamlessly without stopping
-/// or accumulating quantization drift.
+/// Groups smooth consecutive segments (e.g. circle/arc chords) into continuous chains with
+/// trapezoidal acceleration/deceleration ramps so curves flow without stopping and corners/starts
+/// accelerate smoothly without shocking the machine.
 pub fn build_trajectory_fifo_ticks(
     traj: &[MotionSegment],
     origin_world: kurbo::Point,
@@ -135,46 +136,138 @@ pub fn build_trajectory_fifo_ticks(
     let mut ticks = Vec::new();
     let mut cur_px = start_px;
     let mut cur_py = start_py;
+    let accel = pulses_cfg.jog_accel_mm_s2.clamp(10.0, 150.0);
 
-    for seg in traj {
-        let target_px = pulses_cfg.mm_to_pulses_x(seg.end.x - origin_world.x);
-        let target_py = pulses_cfg.mm_to_pulses_y(seg.end.y - origin_world.y);
-        let dx_total = target_px - cur_px;
-        let dy_total = target_py - cur_py;
-        if dx_total == 0 && dy_total == 0 {
-            continue;
+    let segs: Vec<&MotionSegment> = traj.iter().filter(|s| s.length_mm > 1e-6).collect();
+    if segs.is_empty() {
+        return ticks;
+    }
+
+    let seg_dir = |s: &MotionSegment| -> (f64, f64) {
+        let dx = s.end.x - s.start.x;
+        let dy = s.end.y - s.start.y;
+        let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+        (dx / len, dy / len)
+    };
+
+    // Group into continuous chains (break on rapid transitions or sharp corners > ~30 deg)
+    let mut idx = 0;
+    while idx < segs.len() {
+        let chain_start = idx;
+        let is_rapid = segs[idx].is_rapid;
+        let mut chain_end = idx + 1;
+        while chain_end < segs.len() {
+            if segs[chain_end].is_rapid != is_rapid {
+                break;
+            }
+            let (ux, uy) = seg_dir(segs[chain_end - 1]);
+            let (vx, vy) = seg_dir(segs[chain_end]);
+            if ux * vx + uy * vy < 0.866 {
+                break;
+            }
+            chain_end += 1;
         }
-        let speed = if seg.is_rapid {
-            seg.speed_mm_s.clamp(1.0, 120.0)
+
+        let chain = &segs[chain_start..chain_end];
+        let mut cum_len = Vec::with_capacity(chain.len() + 1);
+        cum_len.push(0.0_f64);
+        let mut total_len = 0.0_f64;
+        let mut min_speed = f64::INFINITY;
+        for s in chain {
+            total_len += s.length_mm;
+            cum_len.push(total_len);
+            let spd = if s.is_rapid {
+                s.speed_mm_s.clamp(1.0, 20.0)
+            } else {
+                s.speed_mm_s.clamp(0.5, 20.0)
+            };
+            if spd < min_speed {
+                min_speed = spd;
+            }
+        }
+        let v_target = min_speed.max(0.5);
+        let d_ramp_full = (v_target * v_target) / (2.0 * accel);
+        let (v_peak, t_accel, d_accel, t_cruise, total_t) = if 2.0 * d_ramp_full >= total_len {
+            let vp = (total_len * accel).sqrt().max(0.5);
+            let ta = vp / accel;
+            (vp, ta, 0.5 * total_len, 0.0, 2.0 * ta)
         } else {
-            seg.speed_mm_s.max(0.5)
+            let ta = v_target / accel;
+            let dc = total_len - 2.0 * d_ramp_full;
+            let tc = dc / v_target;
+            (v_target, ta, d_ramp_full, tc, 2.0 * ta + tc)
         };
-        let secs = (seg.length_mm / speed).max(0.001);
+
+        let end_px = pulses_cfg.mm_to_pulses_x(chain.last().unwrap().end.x - origin_world.x);
+        let end_py = pulses_cfg.mm_to_pulses_y(chain.last().unwrap().end.y - origin_world.y);
         let min_ticks_for_step =
-            ((dx_total.abs().max(dy_total.abs()) as usize) + 126) / 127;
-        let n_ticks = ((secs * 1000.0).ceil() as usize)
+            (((end_px - cur_px).abs().max((end_py - cur_py).abs()) as usize) + 126) / 127;
+        let n_ticks = ((total_t * 1000.0).ceil() as usize)
             .max(min_ticks_for_step)
             .max(1);
 
-        let seg_start_px = cur_px;
-        let seg_start_py = cur_py;
-        for i in 1..=n_ticks {
-            let t = i as f64 / n_ticks as f64;
-            let next_px = seg_start_px + ((dx_total as f64) * t).round() as i32;
-            let next_py = seg_start_py + ((dy_total as f64) * t).round() as i32;
+        let mut seg_cursor = 0usize;
+        for k in 1..=n_ticks {
+            let s_dist = if k == n_ticks {
+                total_len
+            } else {
+                let t = (k as f64 / n_ticks as f64) * total_t;
+                if t < t_accel {
+                    0.5 * accel * t * t
+                } else if t < t_accel + t_cruise {
+                    d_accel + v_peak * (t - t_accel)
+                } else {
+                    let rem = (total_t - t).max(0.0);
+                    (total_len - 0.5 * accel * rem * rem).min(total_len)
+                }
+            };
+
+            while seg_cursor + 1 < chain.len() && s_dist > cum_len[seg_cursor + 1] {
+                seg_cursor += 1;
+            }
+            let s0 = cum_len[seg_cursor];
+            let s1 = cum_len[seg_cursor + 1];
+            let frac = if s1 > s0 + 1e-9 {
+                ((s_dist - s0) / (s1 - s0)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let seg = chain[seg_cursor];
+            let wx = seg.start.x + (seg.end.x - seg.start.x) * frac;
+            let wy = seg.start.y + (seg.end.y - seg.start.y) * frac;
+            let next_px = pulses_cfg.mm_to_pulses_x(wx - origin_world.x);
+            let next_py = pulses_cfg.mm_to_pulses_y(wy - origin_world.y);
             let tick_dx = (next_px - cur_px).clamp(-127, 127) as i8;
             let tick_dy = (next_py - cur_py).clamp(-127, 127) as i8;
             cur_px += tick_dx as i32;
             cur_py += tick_dy as i32;
             let flags = if ticks.is_empty() {
                 0x30
-            } else if seg.is_rapid {
+            } else if is_rapid {
                 0x03
             } else {
                 0x01
             };
             ticks.push((tick_dx, tick_dy, flags));
         }
+
+        // Flush any remaining quantized pulse difference at the chain end
+        while cur_px != end_px || cur_py != end_py {
+            let tick_dx = (end_px - cur_px).clamp(-127, 127) as i8;
+            let tick_dy = (end_py - cur_py).clamp(-127, 127) as i8;
+            cur_px += tick_dx as i32;
+            cur_py += tick_dy as i32;
+            let flags = if ticks.is_empty() {
+                0x30
+            } else if is_rapid {
+                0x03
+            } else {
+                0x01
+            };
+            ticks.push((tick_dx, tick_dy, flags));
+        }
+
+        idx = chain_end;
     }
     ticks
 }
@@ -202,7 +295,7 @@ pub fn home_config_from_pulse(pulse_config: &PulseConfig) -> tzlaser_protocol::H
     tzlaser_protocol::HomeConfig {
         x_dir,
         y_dir,
-        fast_speed_pls_s: ((40.0 * ppm).round() as u32).max(1_000),
+        fast_speed_pls_s: ((20.0 * ppm).round() as u32).max(1_000),
         slow_speed_pls_s: ((2.0 * ppm).round() as u32).max(100),
         max_search_pulses: ((max_dim * 1.2 * ppm).round() as u32).max(50_000),
     }
@@ -260,7 +353,7 @@ impl PanelState {
         current_head: kurbo::Point,
         controller: &Option<LaserController>,
     ) -> String {
-        let traj = doc.build_motion_trajectory(current_head, 200.0);
+        let traj = doc.build_motion_trajectory(current_head, 20.0);
         if traj.is_empty() {
             return "No active toolpaths to run on visible layers.".to_string();
         }
@@ -649,7 +742,7 @@ impl PanelState {
     ) -> Option<String> {
         let cp = self.paused_checkpoint.take()?;
         let exclusion_polys = doc.all_obstacle_exclusion_polygons();
-        let rapid_speed = doc.travel_speed_mm_s(200.0);
+        let rapid_speed = doc.travel_speed_mm_s(20.0);
 
         let mut new_traj: Vec<MotionSegment> = Vec::new();
         let return_dist = current_head.distance(cp.point_mm);
@@ -914,7 +1007,7 @@ impl PanelState {
     /// so speed edits in Cutting Layers take effect immediately (even while running or paused).
     pub fn sync_layer_speeds(&mut self, doc: &Document) {
         let seq = doc.compute_cut_sequence();
-        let travel_speed = doc.travel_speed_mm_s(200.0);
+        let travel_speed = doc.travel_speed_mm_s(20.0);
         for traj in [&mut self.trajectory, &mut self.full_trajectory] {
             for seg in traj.iter_mut() {
                 if seg.is_rapid {
@@ -2513,7 +2606,7 @@ mod tests {
         });
 
         state.start_run(RunMode::DryCut, &doc, kurbo::Point::new(0.0, 0.0), &None);
-        // Seg 0 is rapid (200 mm/s), Seg 1 is cut (80 mm/s)
+        // Seg 0 is rapid (20 mm/s), Seg 1 is cut (80 mm/s)
         assert!(state.trajectory[0].is_rapid);
         assert!(!state.trajectory[1].is_rapid);
         assert!((state.trajectory[1].speed_mm_s - 80.0).abs() < 1e-6);
@@ -2521,10 +2614,32 @@ mod tests {
         // User edits layer speed in Cutting Layers while paused or running -> sync updates trajectory
         doc.layers[0].params.speed_mm_s = 12.5;
         state.sync_layer_speeds(&doc);
-        assert!((state.trajectory[0].speed_mm_s - 200.0).abs() < 1e-6);
+        assert!((state.trajectory[0].speed_mm_s - 20.0).abs() < 1e-6);
         assert!((state.trajectory[1].speed_mm_s - 12.5).abs() < 1e-6);
         assert!((state.full_trajectory[1].speed_mm_s - 12.5).abs() < 1e-6);
 
         state.stop_run(&None, &mut status);
+    }
+
+    #[test]
+    fn test_build_trajectory_fifo_ticks_ramps_and_reaches_target() {
+        let cfg = PulseConfig::default();
+        let origin = origin_world_mm(&cfg);
+        let traj = vec![MotionSegment {
+            start: origin,
+            end: kurbo::Point::new(origin.x + 20.0, origin.y),
+            is_rapid: false,
+            speed_mm_s: 15.0,
+            length_mm: 20.0,
+            path_index_1based: 1,
+        }];
+        let ticks = build_trajectory_fifo_ticks(&traj, origin, &cfg, 0, 0);
+        assert!(!ticks.is_empty());
+        assert_eq!(ticks[0].2, 0x30);
+        // Total pulses should match 20.0 mm * pulses_per_mm_x
+        let sum_x: i32 = ticks.iter().map(|t| t.0 as i32).sum();
+        assert_eq!(sum_x, cfg.mm_to_pulses_x(20.0));
+        // First tick velocity should be small (accelerating from rest, not jumping straight to cruise)
+        assert!(ticks[0].0.abs() <= 2);
     }
 }
