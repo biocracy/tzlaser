@@ -348,6 +348,24 @@ pub fn format_duration_secs(secs: f64) -> String {
 }
 
 impl PanelState {
+    /// Return the 1-based cutting index of the active/paused path while a job is active or paused,
+    /// so all paths with a smaller cutting index can be rendered at 30% alpha until Stop or completion.
+    pub fn completed_before_path_1based(&self) -> Option<usize> {
+        if self.run_mode == RunMode::Idle {
+            return None;
+        }
+        let seg = self.trajectory.get(self.current_seg_idx)?;
+        if self.current_seg_idx > 0
+            && self.trajectory[self.current_seg_idx..]
+                .iter()
+                .all(|s| s.is_rapid)
+        {
+            Some(seg.path_index_1based + 1)
+        } else {
+            Some(seg.path_index_1based)
+        }
+    }
+
     /// Stop any active motion, reset head position to origin (0, 0), show an alert message,
     /// and prompt for re-homing if connected to physical hardware (offline requires no re-homing).
     pub fn trigger_out_of_bounds_recovery(

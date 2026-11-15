@@ -265,6 +265,89 @@ impl Entity {
         }
     }
 
+    /// Re-anchor a closed path's starting vertex to the point on its contour closest to `target_pt`,
+    /// or reverse an open path if `target_pt` is closer to its end than its start.
+    pub fn set_start_point_near(&mut self, target_pt: Point) -> bool {
+        match self {
+            Entity::Polyline { points, closed } => {
+                if points.len() < 2 {
+                    return false;
+                }
+                if *closed {
+                    let n = points.len();
+                    let mut best: Option<(usize, Point, f64)> = None;
+                    for i in 0..n {
+                        let a = points[i];
+                        let b = points[(i + 1) % n];
+                        let dx = b.x - a.x;
+                        let dy = b.y - a.y;
+                        let len2 = dx * dx + dy * dy;
+                        let t = if len2 > 1e-12 {
+                            (((target_pt.x - a.x) * dx + (target_pt.y - a.y) * dy) / len2)
+                                .clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let proj = Point::new(a.x + dx * t, a.y + dy * t);
+                        let dist = proj.distance(target_pt);
+                        if best.map_or(true, |(_, _, bd)| dist < bd) {
+                            best = Some((i, proj, dist));
+                        }
+                    }
+                    let Some((seg_i, proj, _)) = best else {
+                        return false;
+                    };
+                    let next_i = (seg_i + 1) % n;
+                    if proj.distance(points[seg_i]) < 1e-4 {
+                        points.rotate_left(seg_i);
+                    } else if proj.distance(points[next_i]) < 1e-4 {
+                        points.rotate_left(next_i);
+                    } else {
+                        let mut rotated = Vec::with_capacity(n + 1);
+                        rotated.push(proj);
+                        rotated.extend_from_slice(&points[seg_i + 1..]);
+                        rotated.extend_from_slice(&points[..=seg_i]);
+                        *points = rotated;
+                    }
+                    true
+                } else {
+                    if target_pt.distance(*points.last().unwrap()) < target_pt.distance(points[0]) {
+                        points.reverse();
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+            Entity::Circle { center, radius } => {
+                let start_ang = (target_pt.y - center.y).atan2(target_pt.x - center.x);
+                let segments = adaptive_arc_segments(*radius, std::f64::consts::TAU, 180);
+                let mut points = Vec::with_capacity(segments);
+                for i in 0..segments {
+                    let ang = start_ang + std::f64::consts::TAU * (i as f64) / (segments as f64);
+                    points.push(Point::new(
+                        center.x + *radius * ang.cos(),
+                        center.y + *radius * ang.sin(),
+                    ));
+                }
+                *self = Entity::Polyline {
+                    points,
+                    closed: true,
+                };
+                true
+            }
+            Entity::Line { start, end } => {
+                if target_pt.distance(*end) < target_pt.distance(*start) {
+                    std::mem::swap(start, end);
+                    true
+                } else {
+                    false
+                }
+            }
+            Entity::Arc { .. } | Entity::Group { .. } => false,
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         match self {
             Entity::Line { .. } => false,
@@ -2350,6 +2433,29 @@ impl Document {
     /// Build ordered rapid and cutting motion segments across the document's active cut sequence,
     /// starting from `start_origin` and returning to `start_origin` at the end.
     /// Rapid travel moves automatically route around any `Obstacle` layer exclusion zones.
+    /// Re-anchor the starting point of the 1-based cut-sequence path at `target_pt`.
+    pub fn set_path_start_point(&mut self, path_index_1based: usize, target_pt: Point) -> bool {
+        let seq = self.compute_cut_sequence();
+        let Some(info) = path_index_1based.checked_sub(1).and_then(|i| seq.get(i)) else {
+            return false;
+        };
+        let Some(layer) = self.layers.get_mut(info.layer_idx) else {
+            return false;
+        };
+        let Some(entity) = layer.entities.get_mut(info.entity_idx) else {
+            return false;
+        };
+        let target = match (entity, info.child_idx) {
+            (Entity::Group { children }, Some(c_idx)) => match children.get_mut(c_idx) {
+                Some(c) => c,
+                None => return false,
+            },
+            (ent, None) => ent,
+            _ => return false,
+        };
+        target.set_start_point_near(target_pt)
+    }
+
     pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
         let seq = self.compute_cut_sequence();
         let rapid_speed = self.travel_speed_mm_s(rapid_speed_mm_s);

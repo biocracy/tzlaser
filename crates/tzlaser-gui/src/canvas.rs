@@ -180,6 +180,7 @@ pub struct CanvasState {
     pub last_viewport_size: Vec2,
     pub context_menu: Option<PathContextMenu>,
     pub pending_continue_from_point: Option<Point>,
+    pub pending_set_start_point: Option<(usize, Point)>,
     pub draw_tool: DrawTool,
     pub draw_anchor: Option<Point>,
     pub draw_spline_pts: Vec<Point>,
@@ -215,6 +216,7 @@ impl Default for CanvasState {
             last_viewport_size: Vec2::new(800.0, 600.0),
             context_menu: None,
             pending_continue_from_point: None,
+            pending_set_start_point: None,
             draw_tool: DrawTool::None,
             draw_anchor: None,
             draw_spline_pts: Vec::new(),
@@ -695,6 +697,7 @@ pub fn render_canvas(
     paused_points_mm: &[Point],
     active_pause_mm: Option<Point>,
     can_context_menu: bool,
+    completed_before_path_1based: Option<usize>,
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
     state.last_viewport_size = response.rect.size();
@@ -1276,18 +1279,27 @@ pub fn render_canvas(
 
     // 6. Render Document Layers & Entities with High-Visibility Glow
     let has_selection = !selection.is_empty();
-    let index_color_map: HashMap<(usize, usize, Option<usize>), Color32> = if state.color_by_cut_index {
+    let (index_color_map, path_order_map): (
+        HashMap<(usize, usize, Option<usize>), Color32>,
+        HashMap<(usize, usize, Option<usize>), usize>,
+    ) = if state.color_by_cut_index || completed_before_path_1based.is_some() {
         let seq = doc.compute_cut_sequence();
         let total = seq.len();
-        let mut map = HashMap::new();
+        let mut cmap = HashMap::new();
+        let mut omap = HashMap::new();
         for (order_idx, info) in seq.iter().enumerate() {
-            map.entry((info.layer_idx, info.entity_idx, info.child_idx))
-                .or_insert_with(|| state.color_palette.color_for_index(order_idx, total));
+            let key = (info.layer_idx, info.entity_idx, info.child_idx);
+            if state.color_by_cut_index {
+                cmap.entry(key)
+                    .or_insert_with(|| state.color_palette.color_for_index(order_idx, total));
+            }
+            omap.entry(key).or_insert(order_idx + 1);
         }
-        map
+        (cmap, omap)
     } else {
-        HashMap::new()
+        (HashMap::new(), HashMap::new())
     };
+    let completed_alpha: u8 = (255.0_f32 * 0.30).round() as u8;
 
     for (l_idx, layer) in doc.layers.iter().enumerate() {
         if !layer.visible {
@@ -1307,13 +1319,18 @@ pub fn render_canvas(
             match entity {
                 Entity::Group { children } => {
                     for (c_idx, child) in children.iter().enumerate() {
+                        let key = (l_idx, e_idx, Some(c_idx));
                         let ent_color = index_color_map
-                            .get(&(l_idx, e_idx, Some(c_idx)))
+                            .get(&key)
                             .copied()
                             .unwrap_or(layer_color);
+                        let is_completed = completed_before_path_1based.is_some_and(|cutoff| {
+                            path_order_map.get(&key).is_some_and(|&idx1| idx1 < cutoff)
+                        });
+                        let alpha = if is_completed { completed_alpha } else { unsel_alpha };
                         let base_stroke = Stroke::new(
                             if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
-                            Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
+                            Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), alpha),
                         );
                         render_entity(
                             &painter,
@@ -1329,13 +1346,18 @@ pub fn render_canvas(
                     }
                 }
                 _ => {
+                    let key = (l_idx, e_idx, None);
                     let ent_color = index_color_map
-                        .get(&(l_idx, e_idx, None))
+                        .get(&key)
                         .copied()
                         .unwrap_or(layer_color);
+                    let is_completed = completed_before_path_1based.is_some_and(|cutoff| {
+                        path_order_map.get(&key).is_some_and(|&idx1| idx1 < cutoff)
+                    });
+                    let alpha = if is_completed { completed_alpha } else { unsel_alpha };
                     let base_stroke = Stroke::new(
                         if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
-                        Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), unsel_alpha),
+                        Color32::from_rgba_unmultiplied(ent_color.r(), ent_color.g(), ent_color.b(), alpha),
                     );
                     render_entity(
                         &painter,
@@ -1908,6 +1930,18 @@ pub fn render_canvas(
                         .fill(Color32::from_rgb(30, 120, 98));
                         if ui.add(btn).clicked() {
                             state.pending_continue_from_point = Some(menu.point_mm);
+                            close_menu = true;
+                        }
+                        ui.add_space(2.0);
+                        let start_btn = egui::Button::new(
+                            egui::RichText::new("Set starting point here")
+                                .size(12.5)
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(45, 92, 145));
+                        if ui.add(start_btn).clicked() {
+                            state.pending_set_start_point = Some((menu.path_index_1based, menu.point_mm));
                             close_menu = true;
                         }
                     });

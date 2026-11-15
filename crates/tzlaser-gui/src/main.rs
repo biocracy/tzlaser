@@ -502,6 +502,7 @@ impl eframe::App for TzlaserApp {
             let active_pause_mm = self.panel_state.paused_checkpoint.map(|c| c.point_mm);
             let can_context_menu =
                 self.panel_state.run_mode == panels::RunMode::Idle || self.panel_state.is_paused;
+            let completed_before = self.panel_state.completed_before_path_1based();
             render_canvas(
                 ui,
                 &mut self.canvas_state,
@@ -514,6 +515,7 @@ impl eframe::App for TzlaserApp {
                 &paused_points_mm,
                 active_pause_mm,
                 can_context_menu,
+                completed_before,
             );
             if let Some(target_pt) = self.canvas_state.pending_continue_from_point.take() {
                 if let Some(msg) = self.panel_state.set_pause_at_path_point(
@@ -524,6 +526,20 @@ impl eframe::App for TzlaserApp {
                     &self.pulse_config,
                 ) {
                     self.status_message = msg;
+                }
+            }
+            if let Some((path_idx_1based, target_pt)) = self.canvas_state.pending_set_start_point.take() {
+                if self.document.set_path_start_point(path_idx_1based, target_pt) {
+                    self.history.record(&self.document, &self.selection, "Set Path Start Point");
+                    self.status_message = format!(
+                        "Starting point of Path #{} set to X: {:.2}, Y: {:.2} mm.",
+                        path_idx_1based, target_pt.x, target_pt.y
+                    );
+                } else {
+                    self.status_message = format!(
+                        "Path #{} does not support re-anchoring its starting point.",
+                        path_idx_1based
+                    );
                 }
             }
         });
