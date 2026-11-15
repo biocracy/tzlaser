@@ -172,6 +172,8 @@ pub struct MachineStatus {
     pub is_homing_xy: bool,
     pub is_homing_z: bool,
     pub is_moving: bool,
+    pub z_pos_sensor: bool,
+    pub z_neg_sensor: bool,
     /// Upper byte of `R1002` (`(regs[2] >> 16) & 0xFF`): hardware limit sensor bitmask
     /// (observed: `0x01` = X+, `0x02` = X-, `0x90` = Y1-/Y2- dual-drive).
     pub limit_sensor_mask: u32,
@@ -202,6 +204,8 @@ impl Default for MachineStatus {
             is_homing_xy: false,
             is_homing_z: false,
             is_moving: false,
+            z_pos_sensor: false,
+            z_neg_sensor: false,
             limit_sensor_mask: 0,
             raw_registers: Vec::new(),
         }
@@ -273,6 +277,8 @@ impl MachineStatus {
             is_homing_xy,
             is_homing_z: false,
             is_moving,
+            z_pos_sensor: false,
+            z_neg_sensor: false,
             limit_sensor_mask,
             raw_registers: regs.to_vec(),
         }
@@ -304,11 +310,11 @@ impl MachineStatus {
     }
 
     pub fn z_pos_limit(&self) -> bool {
-        self.is_connected && self.z_homed && self.pos_z.abs() <= 50
+        self.is_connected && self.z_pos_sensor
     }
 
     pub fn z_neg_cap_limit(&self) -> bool {
-        self.is_connected && (self.capacitive_height_mm <= 0.5 || self.capacitance_pf >= 25.0)
+        self.is_connected && self.z_neg_sensor
     }
 
     /// Merge status decoded from the Port 999 Z-axis / capacitive follower poll response.
@@ -606,6 +612,33 @@ pub fn decode_z_homed_from_poll(bytes: &[u8]) -> Option<bool> {
     let w1 = u16::from_be_bytes([bytes[base + 2], bytes[base + 3]]) as u32;
     let d5 = (w1 << 16) | w0;
     Some(d5 == 0x8000_0001)
+}
+
+/// Decode `(z_pos_upper_limit_sensor, z_neg_collision_sensor)` from Port 999 64-word status response.
+/// - `D5` bit 0 (`(d5 & 1) != 0`) is set when the Z+ upper limit sensor is triggered.
+/// - `D2` / `D3` / `D4` non-zero (or capacitive spike `D7 > 650_000`) indicates a Z- / touch-off alarm.
+pub fn decode_z_sensors_from_poll(bytes: &[u8]) -> Option<(bool, bool)> {
+    if bytes.len() < 133 || bytes[0] != 0x01 || bytes[1] != 0x03 || bytes[2] != 0x80 {
+        return None;
+    }
+    let received_crc = u16::from_le_bytes([bytes[131], bytes[132]]);
+    if received_crc != modbus_crc16(&bytes[..131]) {
+        return None;
+    }
+    let read_dword_ws = |dword_idx: usize| -> u32 {
+        let base = 3 + dword_idx * 4;
+        let w0 = u16::from_be_bytes([bytes[base], bytes[base + 1]]) as u32;
+        let w1 = u16::from_be_bytes([bytes[base + 2], bytes[base + 3]]) as u32;
+        (w1 << 16) | w0
+    };
+    let d2 = read_dword_ws(2);
+    let d3 = read_dword_ws(3);
+    let d4 = read_dword_ws(4);
+    let d5 = read_dword_ws(5);
+    let d7 = read_dword_ws(7);
+    let z_pos = (d5 & 0x0000_0001) != 0;
+    let z_neg = (d2 | d3 | d4) != 0 || d7 > 650_000;
+    Some((z_pos, z_neg))
 }
 
 /// Decode a Port 999 64-word status polling response (`01 03 80 <128 bytes> <crc16_le>`).
