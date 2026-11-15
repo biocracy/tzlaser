@@ -44,6 +44,7 @@ pub struct PanelState {
     pub last_tick: Option<std::time::Instant>,
     pub last_hw_dispatched_seg: Option<usize>,
     pub hw_seg_dispatched_at: Option<std::time::Instant>,
+    pub hw_seg_seen_moving: bool,
     pub paused_checkpoint: Option<PauseCheckpoint>,
     pub pause_buffer: Vec<PauseCheckpoint>,
     pub material_db: MaterialLibrary,
@@ -75,6 +76,7 @@ impl Default for PanelState {
             last_tick: None,
             last_hw_dispatched_seg: None,
             hw_seg_dispatched_at: None,
+            hw_seg_seen_moving: false,
             paused_checkpoint: None,
             pause_buffer: Vec::new(),
             material_db: MaterialLibrary::with_default_presets(),
@@ -89,10 +91,11 @@ impl Default for PanelState {
     }
 }
 
-/// Return the selected bed origin corner in canvas world coordinates (mm).
+/// Return the selected bed origin corner in canvas world coordinates (mm),
+/// matching `CanvasState::bed_width_mm` (`cut_width_mm`) and `bed_height_mm` (`cut_height_mm`).
 pub fn origin_world_mm(pulse_config: &PulseConfig) -> kurbo::Point {
-    let w = pulse_config.table_width_mm;
-    let h = pulse_config.table_height_mm;
+    let w = pulse_config.cut_width_mm();
+    let h = pulse_config.cut_height_mm();
     if pulse_config.origin_corner.contains("Top-Left") {
         kurbo::Point::new(0.0, h)
     } else if pulse_config.origin_corner.contains("Bottom-Right") {
@@ -211,6 +214,8 @@ impl PanelState {
         self.run_mode = mode;
         self.last_tick = Some(std::time::Instant::now());
         self.last_hw_dispatched_seg = None;
+        self.hw_seg_dispatched_at = None;
+        self.hw_seg_seen_moving = false;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
 
@@ -872,27 +877,40 @@ impl PanelState {
                 let head_world = head_world_mm(status, pulses_cfg);
 
                 if self.last_hw_dispatched_seg != Some(self.current_seg_idx) {
+                    let dx_p = pulses_cfg.mm_to_pulses_x(seg.end.x - head_world.x);
+                    let dy_p = pulses_cfg.mm_to_pulses_y(seg.end.y - head_world.y);
+                    if dx_p == 0 && dy_p == 0 {
+                        self.traveled_length_mm += seg.length_mm;
+                        self.seg_progress_mm = 0.0;
+                        self.current_seg_idx += 1;
+                        self.hw_seg_dispatched_at = None;
+                        self.hw_seg_seen_moving = false;
+                        continue;
+                    }
                     if let Some(ref c) = controller {
-                        let dx_p = pulses_cfg.mm_to_pulses_x(seg.end.x - head_world.x);
-                        let dy_p = pulses_cfg.mm_to_pulses_y(seg.end.y - head_world.y);
-                        if dx_p != 0 || dy_p != 0 {
-                            let ppm = pulses_cfg
-                                .pulses_per_mm_x
-                                .max(pulses_cfg.pulses_per_mm_y)
-                                .max(10.0);
-                            let speed_pls = (seg.speed_mm_s.max(0.5) * ppm)
-                                .round()
-                                .clamp(200.0, 200_000.0) as u32;
-                            let move_cfg = tzlaser_protocol::JogConfig {
-                                min_speed: (speed_pls / 10).max(100),
-                                jog_speed: speed_pls,
-                                accel: (speed_pls * 10).max(2_000),
-                            };
-                            c.move_xy(dx_p, dy_p, move_cfg);
-                        }
+                        let ppm = pulses_cfg
+                            .pulses_per_mm_x
+                            .max(pulses_cfg.pulses_per_mm_y)
+                            .max(10.0);
+                        let speed_pls = (seg.speed_mm_s.max(0.5) * ppm)
+                            .round()
+                            .clamp(200.0, 120_000.0) as u32;
+                        let move_cfg = tzlaser_protocol::JogConfig {
+                            min_speed: (speed_pls / 10).max(100),
+                            jog_speed: speed_pls,
+                            accel: (speed_pls * 4).clamp(2_000, 100_000),
+                        };
+                        c.move_xy(dx_p, dy_p, move_cfg);
                     }
                     self.last_hw_dispatched_seg = Some(self.current_seg_idx);
                     self.hw_seg_dispatched_at = Some(now);
+                    self.hw_seg_seen_moving = false;
+                    self.seg_progress_mm = 0.0;
+                    break;
+                }
+
+                if status.is_moving {
+                    self.hw_seg_seen_moving = true;
                 }
 
                 let elapsed = self
@@ -901,16 +919,15 @@ impl PanelState {
                     .unwrap_or(0.0);
                 let dist_to_end = head_world.distance(seg.end);
                 let expected_secs = seg.length_mm / seg.speed_mm_s.max(0.5);
-                let arrived = dist_to_end <= 0.35
-                    || (!status.is_moving
-                        && elapsed >= 0.08
-                        && (dist_to_end <= 1.5 || elapsed >= expected_secs + 0.35));
+                let finished = (self.hw_seg_seen_moving && !status.is_moving)
+                    || (!status.is_moving && elapsed >= (expected_secs + 0.15).max(0.18));
 
-                if arrived {
+                if finished {
                     self.traveled_length_mm += seg.length_mm;
                     self.seg_progress_mm = 0.0;
                     self.current_seg_idx += 1;
                     self.hw_seg_dispatched_at = None;
+                    self.hw_seg_seen_moving = false;
                 } else {
                     self.seg_progress_mm = (seg.length_mm - dist_to_end).clamp(0.0, seg.length_mm);
                     break;
