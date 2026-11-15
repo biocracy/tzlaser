@@ -441,6 +441,20 @@ pub fn build_jog_packet(seq: u16, axis: Axis, pulses: i32, config: &JogConfig) -
     Packet::write_request(seq, registers::REG_JOG_MOTION, payload)
 }
 
+/// Build a coordinated 2-axis XY move packet on Port 502 (`REG_JOG_MOTION`).
+pub fn build_xy_move_packet(seq: u16, dx: i32, dy: i32, config: &JogConfig) -> Packet {
+    let payload = vec![
+        config.min_speed,
+        config.jog_speed,
+        config.accel,
+        dx as u32,
+        dy as u32,
+        0,
+        0,
+    ];
+    Packet::write_request(seq, registers::REG_JOG_MOTION, payload)
+}
+
 /// Build packets to stop motion on Port 502 (`p1` = deceleration ramp, `p2` = stop command 2).
 /// Note: SC2000 sends `p1` first, then sends `p2` ~140ms later.
 pub fn build_stop_packets(mut seq_gen: impl FnMut() -> u16) -> (Packet, Packet) {

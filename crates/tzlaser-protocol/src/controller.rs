@@ -6,17 +6,18 @@ use std::time::{Duration, Instant};
 
 use crate::motion::{
     build_init_packets, build_initial_enable_packets, build_jog_packet, build_stop_packets,
-    build_xy_home_packets, build_z_handshake_packets, build_z_home_packet, build_z_jog_packet,
-    build_z_poll_packet, build_z_stop_packet, decode_remote_jog, decode_z_homed_from_poll,
-    decode_z_poll_response, decode_z_sensors_from_poll, registers, remote_buttons, Axis,
-    HomeConfig, JogConfig, MachineStatus, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z,
-    DEFAULT_Z_JOG_SPEED,
+    build_xy_home_packets, build_xy_move_packet, build_z_handshake_packets, build_z_home_packet,
+    build_z_jog_packet, build_z_poll_packet, build_z_stop_packet, decode_remote_jog,
+    decode_z_homed_from_poll, decode_z_poll_response, decode_z_sensors_from_poll, registers,
+    remote_buttons, Axis, HomeConfig, JogConfig, MachineStatus, CONTINUOUS_JOG_PULSES_XY,
+    CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
 
 pub enum Command {
     Jog { axis: Axis, pulses: i32 },
     JogWithConfig { axis: Axis, pulses: i32, config: JogConfig, auto_stop: bool },
+    MoveXY { dx: i32, dy: i32, config: JogConfig },
     StartContinuousJog { axis: Axis, direction: i32 },
     Stop,
     HomeAll(HomeConfig),
@@ -407,6 +408,37 @@ impl LaserController {
                             } else {
                                 auto_stop_at = None;
                             }
+                        }
+                        Command::MoveXY { dx, dy, config } => {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            pending_xy_home_after_z = None;
+                            auto_stop_at = None;
+                            active_step_watch = None;
+                            if pending_stop_p2_at.take().is_some() {
+                                let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let p2 = Packet::write_request(
+                                    s_rst,
+                                    registers::REG_COMMAND,
+                                    vec![2],
+                                );
+                                let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                thread::sleep(Duration::from_millis(25));
+                            }
+                            if last_r1004 != 0 {
+                                let s_en = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let en = Packet::write_request(
+                                    s_en,
+                                    registers::REG_ENABLE_FLAG,
+                                    vec![1],
+                                );
+                                let _ = send_and_wait_ack(&socket, &en, &mut buf);
+                                last_r1004 = 0;
+                            }
+                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let pkt = build_xy_move_packet(s, dx, dy, &config);
+                            let _ = socket.send_to(&pkt.encode(), target_addr);
                         }
                         Command::StartContinuousJog { axis, direction } => {
                             let sign = if direction >= 0 { 1 } else { -1 };
@@ -993,6 +1025,10 @@ impl LaserController {
             config,
             auto_stop,
         });
+    }
+
+    pub fn move_xy(&self, dx: i32, dy: i32, config: JogConfig) {
+        let _ = self.command_tx.send(Command::MoveXY { dx, dy, config });
     }
 
     pub fn start_continuous_jog(&self, axis: Axis, direction: i32) {

@@ -43,6 +43,7 @@ pub struct PanelState {
     pub estimated_job_secs: f64,
     pub last_tick: Option<std::time::Instant>,
     pub last_hw_dispatched_seg: Option<usize>,
+    pub hw_seg_dispatched_at: Option<std::time::Instant>,
     pub paused_checkpoint: Option<PauseCheckpoint>,
     pub pause_buffer: Vec<PauseCheckpoint>,
     pub material_db: MaterialLibrary,
@@ -73,6 +74,7 @@ impl Default for PanelState {
             estimated_job_secs: 0.0,
             last_tick: None,
             last_hw_dispatched_seg: None,
+            hw_seg_dispatched_at: None,
             paused_checkpoint: None,
             pause_buffer: Vec::new(),
             material_db: MaterialLibrary::with_default_presets(),
@@ -85,6 +87,30 @@ impl Default for PanelState {
             job_start_pos: kurbo::Point::ZERO,
         }
     }
+}
+
+/// Return the selected bed origin corner in canvas world coordinates (mm).
+pub fn origin_world_mm(pulse_config: &PulseConfig) -> kurbo::Point {
+    let w = pulse_config.table_width_mm;
+    let h = pulse_config.table_height_mm;
+    if pulse_config.origin_corner.contains("Top-Left") {
+        kurbo::Point::new(0.0, h)
+    } else if pulse_config.origin_corner.contains("Bottom-Right") {
+        kurbo::Point::new(w, 0.0)
+    } else if pulse_config.origin_corner.contains("Top-Right") {
+        kurbo::Point::new(w, h)
+    } else {
+        kurbo::Point::ZERO
+    }
+}
+
+/// Return the current cutting head position in canvas world coordinates (mm).
+pub fn head_world_mm(status: &MachineStatus, pulse_config: &PulseConfig) -> kurbo::Point {
+    let origin = origin_world_mm(pulse_config);
+    kurbo::Point::new(
+        origin.x + pulse_config.pulses_to_mm_x(status.pos_x),
+        origin.y + pulse_config.pulses_to_mm_y(status.pos_y),
+    )
 }
 
 /// Build `HomeConfig` matching the selected `origin_corner` and pulse scaling in `PulseConfig`.
@@ -840,43 +866,80 @@ impl PanelState {
         self.last_tick = Some(now);
 
         let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
-        let speed_mult = if hw_connected || self.run_mode != RunMode::DryCut {
-            1.0
-        } else {
-            self.sim_speed_multiplier
-        };
+        if hw_connected {
+            while self.current_seg_idx < self.trajectory.len() {
+                let seg = self.trajectory[self.current_seg_idx];
+                let head_world = head_world_mm(status, pulses_cfg);
 
-        let mut remaining_dt = dt;
-        while remaining_dt > 1e-9 && self.current_seg_idx < self.trajectory.len() {
-            if hw_connected && self.last_hw_dispatched_seg != Some(self.current_seg_idx) {
-                if let Some(ref c) = controller {
-                    let seg = self.trajectory[self.current_seg_idx];
-                    let dx_p = pulses_cfg.mm_to_pulses_x(seg.end.x - seg.start.x);
-                    let dy_p = pulses_cfg.mm_to_pulses_y(seg.end.y - seg.start.y);
-                    if dx_p != 0 {
-                        c.jog(Axis::X, dx_p);
+                if self.last_hw_dispatched_seg != Some(self.current_seg_idx) {
+                    if let Some(ref c) = controller {
+                        let dx_p = pulses_cfg.mm_to_pulses_x(seg.end.x - head_world.x);
+                        let dy_p = pulses_cfg.mm_to_pulses_y(seg.end.y - head_world.y);
+                        if dx_p != 0 || dy_p != 0 {
+                            let ppm = pulses_cfg
+                                .pulses_per_mm_x
+                                .max(pulses_cfg.pulses_per_mm_y)
+                                .max(10.0);
+                            let speed_pls = (seg.speed_mm_s.max(0.5) * ppm)
+                                .round()
+                                .clamp(200.0, 200_000.0) as u32;
+                            let move_cfg = tzlaser_protocol::JogConfig {
+                                min_speed: (speed_pls / 10).max(100),
+                                jog_speed: speed_pls,
+                                accel: (speed_pls * 10).max(2_000),
+                            };
+                            c.move_xy(dx_p, dy_p, move_cfg);
+                        }
                     }
-                    if dy_p != 0 {
-                        c.jog(Axis::Y, dy_p);
-                    }
+                    self.last_hw_dispatched_seg = Some(self.current_seg_idx);
+                    self.hw_seg_dispatched_at = Some(now);
                 }
-                self.last_hw_dispatched_seg = Some(self.current_seg_idx);
+
+                let elapsed = self
+                    .hw_seg_dispatched_at
+                    .map(|t| (now - t).as_secs_f64())
+                    .unwrap_or(0.0);
+                let dist_to_end = head_world.distance(seg.end);
+                let expected_secs = seg.length_mm / seg.speed_mm_s.max(0.5);
+                let arrived = dist_to_end <= 0.35
+                    || (!status.is_moving
+                        && elapsed >= 0.08
+                        && (dist_to_end <= 1.5 || elapsed >= expected_secs + 0.35));
+
+                if arrived {
+                    self.traveled_length_mm += seg.length_mm;
+                    self.seg_progress_mm = 0.0;
+                    self.current_seg_idx += 1;
+                    self.hw_seg_dispatched_at = None;
+                } else {
+                    self.seg_progress_mm = (seg.length_mm - dist_to_end).clamp(0.0, seg.length_mm);
+                    break;
+                }
             }
-
-            let seg = self.trajectory[self.current_seg_idx];
-            let eff_speed = (seg.speed_mm_s * speed_mult).max(0.5);
-            let seg_remaining = (seg.length_mm - self.seg_progress_mm).max(0.0);
-            let step_mm = eff_speed * remaining_dt;
-
-            if step_mm < seg_remaining {
-                self.seg_progress_mm += step_mm;
-                self.traveled_length_mm += step_mm;
-                remaining_dt = 0.0;
+        } else {
+            let speed_mult = if self.run_mode != RunMode::DryCut {
+                1.0
             } else {
-                self.traveled_length_mm += seg_remaining;
-                remaining_dt -= seg_remaining / eff_speed;
-                self.seg_progress_mm = 0.0;
-                self.current_seg_idx += 1;
+                self.sim_speed_multiplier
+            };
+
+            let mut remaining_dt = dt;
+            while remaining_dt > 1e-9 && self.current_seg_idx < self.trajectory.len() {
+                let seg = self.trajectory[self.current_seg_idx];
+                let eff_speed = (seg.speed_mm_s * speed_mult).max(0.5);
+                let seg_remaining = (seg.length_mm - self.seg_progress_mm).max(0.0);
+                let step_mm = eff_speed * remaining_dt;
+
+                if step_mm < seg_remaining {
+                    self.seg_progress_mm += step_mm;
+                    self.traveled_length_mm += step_mm;
+                    remaining_dt = 0.0;
+                } else {
+                    self.traveled_length_mm += seg_remaining;
+                    remaining_dt -= seg_remaining / eff_speed;
+                    self.seg_progress_mm = 0.0;
+                    self.current_seg_idx += 1;
+                }
             }
         }
 
@@ -886,8 +949,11 @@ impl PanelState {
                 .last()
                 .map(|last| last.end)
                 .unwrap_or(self.job_start_pos);
-            status.pos_x = pulses_cfg.mm_to_pulses_x(end_pos.x);
-            status.pos_y = pulses_cfg.mm_to_pulses_y(end_pos.y);
+            let origin_world = origin_world_mm(pulses_cfg);
+            if !hw_connected {
+                status.pos_x = pulses_cfg.mm_to_pulses_x(end_pos.x - origin_world.x);
+                status.pos_y = pulses_cfg.mm_to_pulses_y(end_pos.y - origin_world.y);
+            }
 
             let finished_label = if self.run_mode == RunMode::DryCut {
                 "Dry-Cut simulation"
@@ -933,20 +999,35 @@ impl PanelState {
             };
 
             if let Some(tp) = target_pos {
-                let dx_p = pulses_cfg.mm_to_pulses_x(tp.x - end_pos.x);
-                let dy_p = pulses_cfg.mm_to_pulses_y(tp.y - end_pos.y);
+                let head_now = if hw_connected {
+                    head_world_mm(status, pulses_cfg)
+                } else {
+                    end_pos
+                };
+                let dx_p = pulses_cfg.mm_to_pulses_x(tp.x - head_now.x);
+                let dy_p = pulses_cfg.mm_to_pulses_y(tp.y - head_now.y);
                 if let Some(ref c) = controller {
-                    if c.is_connected() {
-                        if dx_p != 0 {
-                            c.jog(Axis::X, dx_p);
-                        }
-                        if dy_p != 0 {
-                            c.jog(Axis::Y, dy_p);
-                        }
+                    if c.is_connected() && (dx_p != 0 || dy_p != 0) {
+                        let ppm = pulses_cfg
+                            .pulses_per_mm_x
+                            .max(pulses_cfg.pulses_per_mm_y)
+                            .max(10.0);
+                        let rapid_pls = (100.0 * ppm).round().clamp(500.0, 200_000.0) as u32;
+                        c.move_xy(
+                            dx_p,
+                            dy_p,
+                            tzlaser_protocol::JogConfig {
+                                min_speed: (rapid_pls / 10).max(100),
+                                jog_speed: rapid_pls,
+                                accel: (rapid_pls * 10).max(2_000),
+                            },
+                        );
                     }
                 }
-                status.pos_x = pulses_cfg.mm_to_pulses_x(tp.x);
-                status.pos_y = pulses_cfg.mm_to_pulses_y(tp.y);
+                if !hw_connected {
+                    status.pos_x = pulses_cfg.mm_to_pulses_x(tp.x - origin_world.x);
+                    status.pos_y = pulses_cfg.mm_to_pulses_y(tp.y - origin_world.y);
+                }
             }
 
             let z_note = if pulses_cfg.post_job_z_home {
@@ -967,8 +1048,11 @@ impl PanelState {
         let frac = (self.seg_progress_mm / seg.length_mm.max(1e-9)).clamp(0.0, 1.0);
         let cur_x = seg.start.x + (seg.end.x - seg.start.x) * frac;
         let cur_y = seg.start.y + (seg.end.y - seg.start.y) * frac;
-        status.pos_x = pulses_cfg.mm_to_pulses_x(cur_x);
-        status.pos_y = pulses_cfg.mm_to_pulses_y(cur_y);
+        if !hw_connected {
+            let origin_world = origin_world_mm(pulses_cfg);
+            status.pos_x = pulses_cfg.mm_to_pulses_x(cur_x - origin_world.x);
+            status.pos_y = pulses_cfg.mm_to_pulses_y(cur_y - origin_world.y);
+        }
         status.laser_on = (self.run_mode == RunMode::Cutting) && !seg.is_rapid;
         status.red_pointer_on = (self.run_mode == RunMode::DryCut) || status.red_pointer_on;
 
@@ -1384,10 +1468,7 @@ pub fn render_right_panels(
                 ui.label(RichText::new("Job Execution:").strong().size(12.0));
                 ui.add_space(3.0);
 
-                let current_head = kurbo::Point::new(
-                    pulses_cfg.pulses_to_mm_x(status.pos_x),
-                    pulses_cfg.pulses_to_mm_y(status.pos_y),
-                );
+                let current_head = head_world_mm(status, pulses_cfg);
                 let spacing_x = ui.spacing().item_spacing.x;
                 let run_btn_w = ((ui.available_width() - spacing_x) / 2.0).floor().max(95.0);
                 let has_pause = panel_state.paused_checkpoint.is_some();
