@@ -101,7 +101,8 @@ fn interpolate_bulge(p1: Point, p2: Point, bulge: f64) -> Vec<Point> {
     let radius = ((p1.x - center_x).powi(2) + (p1.y - center_y).powi(2)).sqrt();
     let start_angle = (p1.y - center_y).atan2(p1.x - center_x);
 
-    let steps = (theta.abs() / (PI / 16.0)).ceil().clamp(4.0, 32.0) as usize;
+    let min_segs = (theta.abs() / (PI / 36.0)).ceil().max(16.0) as usize;
+    let steps = crate::document::adaptive_arc_segments(radius, theta.abs(), min_segs);
     let mut arc_pts = Vec::with_capacity(steps + 1);
     arc_pts.push(p1);
 
@@ -355,7 +356,9 @@ impl DxfImporter {
 
                     if v1.bulge.abs() > 1e-5 {
                         let arc = interpolate_bulge(p1, p2, v1.bulge);
-                        for pt in arc.into_iter().take(if next_idx == 0 { usize::MAX } else { 16 }) {
+                        let is_final_open = next_idx != 0 && i + 1 == vertices.len() - 1;
+                        let count = if is_final_open { arc.len() } else { arc.len().saturating_sub(1) };
+                        for pt in arc.into_iter().take(count) {
                             path_points.push(*transform * pt);
                         }
                     } else {
@@ -408,7 +411,9 @@ impl DxfImporter {
 
                     if v1.bulge.abs() > 1e-5 {
                         let arc = interpolate_bulge(p1, p2, v1.bulge);
-                        for pt in arc.into_iter().take(if next_idx == 0 { usize::MAX } else { 16 }) {
+                        let is_final_open = next_idx != 0 && i + 1 == vertices.len() - 1;
+                        let count = if is_final_open { arc.len() } else { arc.len().saturating_sub(1) };
+                        for pt in arc.into_iter().take(count) {
                             path_points.push(*transform * pt);
                         }
                     } else {
@@ -478,7 +483,7 @@ impl DxfImporter {
 
             EntityType::Spline(spline) => {
                 let degree = spline.degree_of_curve.max(1) as usize;
-                let num_samples = (spline.control_points.len() * 8).clamp(32, 256);
+                let num_samples = (spline.control_points.len() * 24).clamp(128, 1024);
                 let evaluated = evaluate_bspline(
                     degree,
                     &spline.knot_values,
@@ -505,7 +510,7 @@ impl DxfImporter {
                     ellipse.minor_axis_ratio,
                     ellipse.start_parameter,
                     ellipse.end_parameter,
-                    48,
+                    180,
                 );
                 if pts_raw.len() >= 2 {
                     let pts: Vec<Point> = pts_raw.into_iter().map(|p| *transform * p).collect();

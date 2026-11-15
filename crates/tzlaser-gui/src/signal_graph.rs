@@ -63,18 +63,19 @@ pub fn render_signal_graph(
     ui: &mut Ui,
     state: &mut SignalGraphState,
     controller: &Option<LaserController>,
+    is_active_motion: bool,
 ) {
     let (now_secs, samples) = if state.frozen {
         if let Some(ref snap) = state.frozen_snapshot {
             snap.clone()
         } else {
-            let snap = fetch_snapshot(state, controller);
+            let snap = fetch_snapshot(state, controller, is_active_motion);
             state.frozen_snapshot = Some(snap.clone());
             snap
         }
     } else {
         state.frozen_snapshot = None;
-        fetch_snapshot(state, controller)
+        fetch_snapshot(state, controller, is_active_motion)
     };
 
     let latest = samples.last().cloned().unwrap_or(AxisSignalSample {
@@ -417,15 +418,20 @@ pub fn render_signal_graph(
 fn fetch_snapshot(
     state: &mut SignalGraphState,
     controller: &Option<LaserController>,
+    is_active_motion: bool,
 ) -> (f64, Vec<AxisSignalSample>) {
     if let Some(ref c) = controller {
         if c.is_connected() {
             let tel_arc = c.telemetry();
             let mut tel = tel_arc.lock().unwrap();
-            tel.tick_sample(50);
+            if is_active_motion {
+                tel.tick_sample(50);
+            }
             return tel.snapshot();
         }
     }
-    state.tick_offline();
+    if is_active_motion {
+        state.tick_offline();
+    }
     state.offline_telemetry.snapshot()
 }

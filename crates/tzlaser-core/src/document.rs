@@ -63,7 +63,7 @@ pub enum Entity {
 
 /// Compute smooth adaptive segment count for a circular arc of `radius` (mm) and `sweep_rad` (rad),
 /// keeping chord sagitta error <= 0.002 mm and arc step <= 0.20 mm so motion commands glide smoothly.
-fn adaptive_arc_segments(radius: f64, sweep_rad: f64, min_segs: usize) -> usize {
+pub(crate) fn adaptive_arc_segments(radius: f64, sweep_rad: f64, min_segs: usize) -> usize {
     let r = radius.abs().max(0.1);
     let sweep = sweep_rad.abs().max(1e-6);
     let max_sagitta = 0.002_f64;

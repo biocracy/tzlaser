@@ -1172,7 +1172,7 @@ impl LaserController {
                     } else {
                         active_fifo = Some(fifo);
                     }
-                } else {
+                } else if status_clone.lock().unwrap().is_moving || auto_stop_at.is_some() {
                     telemetry_clone.lock().unwrap().tick_sample(50);
                 }
             }

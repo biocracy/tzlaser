@@ -301,8 +301,6 @@ impl eframe::App for TzlaserApp {
                 }
             }
             ctx.request_repaint();
-        } else if !hw_connected {
-            self.signal_graph.tick_offline();
         }
 
         // Enforce cutting-area bounds on the head position every frame
@@ -482,7 +480,10 @@ impl eframe::App for TzlaserApp {
                 .max_height(420.0)
                 .frame(Frame::new().fill(graph_fill).inner_margin(Margin::symmetric(8, 6)))
                 .show(ctx, |ui| {
-                    render_signal_graph(ui, &mut self.signal_graph, &self.controller);
+                    let is_active_motion = (self.panel_state.run_mode != panels::RunMode::Idle
+                        && !self.panel_state.is_paused)
+                        || self.status.is_moving;
+                    render_signal_graph(ui, &mut self.signal_graph, &self.controller, is_active_motion);
                 });
         }
 
