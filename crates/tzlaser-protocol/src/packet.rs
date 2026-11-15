@@ -118,8 +118,10 @@ impl Packet {
         }
 
         // Verify CRC over bytes[4..end]
+        // Note: PC -> Board requests encode CRC in Big-Endian, while Board -> PC responses
+        // encode the same Modbus CRC-16 in Little-Endian (byte-swapped).
         let computed_crc = modbus_crc16(&bytes[4..]);
-        if received_crc != computed_crc {
+        if received_crc != computed_crc && received_crc != computed_crc.swap_bytes() {
             return Err(PacketError::CrcMismatch {
                 received: received_crc,
                 computed: computed_crc,
@@ -172,6 +174,18 @@ mod tests {
         // Re-encoding must produce the exact identical bytes on the wire
         let re_encoded = pkt.encode();
         assert_eq!(raw, re_encoded);
+    }
+
+    #[test]
+    fn test_decode_board_response_with_little_endian_crc() {
+        // Live board response to ReadRegisters(1000, 2) with Little-Endian CRC (0x21CF on wire for 0xCF21)
+        let raw = hex::decode("000121cf00100030e803000002003523e5ac1bdb0000").unwrap();
+        let pkt = Packet::decode(&raw).expect("Failed to decode board response");
+        assert_eq!(pkt.seq, 1);
+        assert_eq!(pkt.opcode, Opcode::ReadRegisters);
+        assert_eq!(pkt.addr, 1000);
+        assert_eq!(pkt.count, 2);
+        assert_eq!(pkt.data.len(), 2);
     }
 }
 
