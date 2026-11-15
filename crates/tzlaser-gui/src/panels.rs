@@ -59,6 +59,10 @@ pub struct PanelState {
     pub prompted_home_this_connection: bool,
     pub oob_alert: Option<(String, bool)>,
     pub job_start_pos: kurbo::Point,
+    pub sim_vx_pls: f32,
+    pub sim_vy_pls: f32,
+    pub sim_ax_pls: f32,
+    pub sim_ay_pls: f32,
 }
 
 impl Default for PanelState {
@@ -95,6 +99,10 @@ impl Default for PanelState {
             prompted_home_this_connection: false,
             oob_alert: None,
             job_start_pos: kurbo::Point::ZERO,
+            sim_vx_pls: 0.0,
+            sim_vy_pls: 0.0,
+            sim_ax_pls: 0.0,
+            sim_ay_pls: 0.0,
         }
     }
 }
@@ -187,13 +195,16 @@ pub fn build_trajectory_fifo_ticks(
             cum_len.push(total_len);
         }
         let v_target = dev_speed_mm_s;
-        let d_ramp_full = (v_target * v_target) / (2.0 * accel);
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        // Raised-cosine S-curve ramp: s(T_a) = 0.5 * v_peak * T_a, peak_accel = (PI/2) * v_peak / T_a
+        // Setting T_a = (PI/2) * v_peak / accel ensures peak acceleration <= accel and jerk is C1-smooth.
+        let d_ramp_full = half_pi * (v_target * v_target) / (2.0 * accel);
         let (v_peak, t_accel, d_accel, t_cruise, total_t) = if 2.0 * d_ramp_full >= total_len {
-            let vp = (total_len * accel).sqrt().max(0.5);
-            let ta = vp / accel;
+            let vp = ((total_len * accel) / half_pi).sqrt().max(0.5);
+            let ta = half_pi * vp / accel;
             (vp, ta, 0.5 * total_len, 0.0, 2.0 * ta)
         } else {
-            let ta = v_target / accel;
+            let ta = half_pi * v_target / accel;
             let dc = total_len - 2.0 * d_ramp_full;
             let tc = dc / v_target;
             (v_target, ta, d_ramp_full, tc, 2.0 * ta + tc)
@@ -214,12 +225,13 @@ pub fn build_trajectory_fifo_ticks(
             } else {
                 let t = (k as f64 / n_ticks as f64) * total_t;
                 if t < t_accel {
-                    0.5 * accel * t * t
+                    0.5 * v_peak * (t - (t_accel / std::f64::consts::PI) * (std::f64::consts::PI * t / t_accel).sin())
                 } else if t < t_accel + t_cruise {
                     d_accel + v_peak * (t - t_accel)
                 } else {
                     let rem = (total_t - t).max(0.0);
-                    (total_len - 0.5 * accel * rem * rem).min(total_len)
+                    let s_rem = 0.5 * v_peak * (rem - (t_accel / std::f64::consts::PI) * (std::f64::consts::PI * rem / t_accel).sin());
+                    (total_len - s_rem).min(total_len)
                 }
             };
 
@@ -427,6 +439,37 @@ impl PanelState {
         Ok(())
     }
 
+    /// Apply an acceleration-filtered (jerk-smoothed & magnitude-clamped) motion filter
+    /// so commanded velocity transitions smoothly without abrupt acceleration spikes.
+    pub fn step_filtered_velocity(
+        &mut self,
+        target_vx: f32,
+        target_vy: f32,
+        max_accel_pls_s2: f32,
+        dt_s: f32,
+    ) -> (f32, f32) {
+        let dt = dt_s.clamp(0.005, 0.08);
+        let a_limit = max_accel_pls_s2.max(1_000.0);
+        // Desired acceleration proportional to velocity error, clamped to ±a_limit
+        let tau_v = 0.08_f32;
+        let raw_ax = ((target_vx - self.sim_vx_pls) / tau_v).clamp(-a_limit, a_limit);
+        let raw_ay = ((target_vy - self.sim_vy_pls) / tau_v).clamp(-a_limit, a_limit);
+        // Low-pass filter on acceleration itself (tau_a = 45 ms) to eliminate jerk spikes
+        let alpha = (dt / (0.045 + dt)).clamp(0.05, 0.75);
+        self.sim_ax_pls += alpha * (raw_ax - self.sim_ax_pls);
+        self.sim_ay_pls += alpha * (raw_ay - self.sim_ay_pls);
+        self.sim_vx_pls += self.sim_ax_pls * dt;
+        self.sim_vy_pls += self.sim_ay_pls * dt;
+        (self.sim_vx_pls, self.sim_vy_pls)
+    }
+
+    pub fn reset_filtered_velocity(&mut self) {
+        self.sim_vx_pls = 0.0;
+        self.sim_vy_pls = 0.0;
+        self.sim_ax_pls = 0.0;
+        self.sim_ay_pls = 0.0;
+    }
+
     pub fn start_run(
         &mut self,
         mode: RunMode,
@@ -458,6 +501,7 @@ impl PanelState {
         self.hw_fifo_total_secs = 0.0;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
+        self.reset_filtered_velocity();
 
         let est_str = format_duration_secs(self.estimated_job_secs);
         if mode == RunMode::DryCut {
@@ -526,6 +570,7 @@ impl PanelState {
         self.estimated_job_secs = 0.0;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
+        self.reset_filtered_velocity();
         status.laser_on = false;
         if was_dry {
             status.red_pointer_on = false;

@@ -273,7 +273,7 @@ impl eframe::App for TzlaserApp {
                     self.signal_graph.record_offline(0.0, 0.0, 0.0, 0.0, false, Some("Done"));
                 }
             } else if !hw_connected {
-                if let Some(seg) = self.panel_state.trajectory.get(self.panel_state.current_seg_idx) {
+                if let Some(seg) = self.panel_state.trajectory.get(self.panel_state.current_seg_idx).copied() {
                     let speed_mult = if self.panel_state.run_mode != panels::RunMode::DryCut {
                         1.0
                     } else {
@@ -281,8 +281,17 @@ impl eframe::App for TzlaserApp {
                     };
                     let eff_speed = (seg.speed_mm_s * speed_mult).max(0.5);
                     let len = seg.length_mm.max(1e-9);
-                    let vx_pls = ((seg.end.x - seg.start.x) / len) * eff_speed * self.pulse_config.pulses_per_mm_x;
-                    let vy_pls = ((seg.end.y - seg.start.y) / len) * eff_speed * self.pulse_config.pulses_per_mm_y;
+                    let target_vx = ((seg.end.x - seg.start.x) / len) * eff_speed * self.pulse_config.pulses_per_mm_x;
+                    let target_vy = ((seg.end.y - seg.start.y) / len) * eff_speed * self.pulse_config.pulses_per_mm_y;
+                    let max_accel_pls = (self.pulse_config.jog_accel_mm_s2.max(20.0)
+                        * self.pulse_config.pulses_per_mm_x.max(self.pulse_config.pulses_per_mm_y)
+                        * speed_mult) as f32;
+                    let (vx_pls, vy_pls) = self.panel_state.step_filtered_velocity(
+                        target_vx as f32,
+                        target_vy as f32,
+                        max_accel_pls,
+                        0.016,
+                    );
                     let tag = if self.panel_state.run_mode == panels::RunMode::DryCut {
                         "Dry-Cut"
                     } else if seg.is_rapid {
@@ -291,8 +300,8 @@ impl eframe::App for TzlaserApp {
                         "Cut"
                     };
                     self.signal_graph.record_offline(
-                        vx_pls as f32,
-                        vy_pls as f32,
+                        vx_pls,
+                        vy_pls,
                         0.0,
                         0.0,
                         self.status.laser_on,
