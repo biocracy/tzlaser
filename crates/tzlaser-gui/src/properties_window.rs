@@ -125,12 +125,40 @@ impl MeasureAxisState {
     }
 }
 
+pub struct AxisPulseCalibState {
+    pub axis: Axis,
+    pub step_mm: f64,
+    pub commanded_pulses_total: i32,
+    pub commanded_signed_mm: f64,
+    pub micrometer_reading_mm: f64,
+}
+
+impl AxisPulseCalibState {
+    pub fn new(axis: Axis) -> Self {
+        Self {
+            axis,
+            step_mm: 1.0,
+            commanded_pulses_total: 0,
+            commanded_signed_mm: 0.0,
+            micrometer_reading_mm: 1.0,
+        }
+    }
+
+    pub fn computed_pulses_per_unit(&self) -> Option<f64> {
+        if self.commanded_pulses_total == 0 || self.micrometer_reading_mm.abs() <= 1e-4 {
+            return None;
+        }
+        Some((self.commanded_pulses_total.abs() as f64) / self.micrometer_reading_mm.abs())
+    }
+}
+
 pub struct PropertiesWindowState {
     pub open: bool,
     pub calib_target: CalibAxisTarget,
     pub calib_commanded_mm: f64,
     pub calib_measured_mm: f64,
     pub measure_axis: Option<MeasureAxisState>,
+    pub calib_dialog: Option<AxisPulseCalibState>,
 }
 
 impl Default for PropertiesWindowState {
@@ -141,6 +169,7 @@ impl Default for PropertiesWindowState {
             calib_commanded_mm: 10.0,
             calib_measured_mm: 10.0,
             measure_axis: None,
+            calib_dialog: None,
         }
     }
 }
@@ -216,7 +245,17 @@ pub fn render_properties_window(
             status_message,
         );
     }
-    if measure_applied {
+    let mut calib_applied = false;
+    if state.calib_dialog.is_some() {
+        calib_applied = render_axis_calib_dialog(
+            ctx,
+            state,
+            pulse_config,
+            controller,
+            status_message,
+        );
+    }
+    if measure_applied || calib_applied {
         sync_and_save_properties(
             pulse_config,
             canvas_state,
@@ -530,7 +569,7 @@ pub fn render_properties_window(
             ui.add_space(4.0);
 
             Grid::new("props_pulses_grid")
-                .num_columns(4)
+                .num_columns(5)
                 .spacing([14.0, 6.0])
                 .show(ui, |ui| {
                     ui.label(
@@ -564,6 +603,16 @@ pub fn render_properties_window(
                         .size(10.5)
                         .weak(),
                     );
+                    if ui
+                        .add(
+                            Button::new(RichText::new("🎯 Calibrate X").size(11.0).strong())
+                                .fill(Color32::from_rgb(42, 72, 108)),
+                        )
+                        .on_hover_text("Open X-axis micrometer pulse calibration dialog")
+                        .clicked()
+                    {
+                        state.calib_dialog = Some(AxisPulseCalibState::new(Axis::X));
+                    }
                     ui.end_row();
 
                     ui.label(
@@ -597,6 +646,16 @@ pub fn render_properties_window(
                         .size(10.5)
                         .weak(),
                     );
+                    if ui
+                        .add(
+                            Button::new(RichText::new("🎯 Calibrate Y").size(11.0).strong())
+                                .fill(Color32::from_rgb(42, 72, 108)),
+                        )
+                        .on_hover_text("Open Y-axis micrometer pulse calibration dialog")
+                        .clicked()
+                    {
+                        state.calib_dialog = Some(AxisPulseCalibState::new(Axis::Y));
+                    }
                     ui.end_row();
 
                     ui.label(
@@ -630,6 +689,16 @@ pub fn render_properties_window(
                         .size(10.5)
                         .weak(),
                     );
+                    if ui
+                        .add(
+                            Button::new(RichText::new("🎯 Calibrate Z").size(11.0).strong())
+                                .fill(Color32::from_rgb(42, 72, 108)),
+                        )
+                        .on_hover_text("Open Z-axis micrometer pulse calibration dialog")
+                        .clicked()
+                    {
+                        state.calib_dialog = Some(AxisPulseCalibState::new(Axis::Z));
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("W-Rotary:").strong());
@@ -647,6 +716,16 @@ pub fn render_properties_window(
                     }
                     ui.label("");
                     ui.label("");
+                    if ui
+                        .add(
+                            Button::new(RichText::new("🎯 Calibrate W").size(11.0).strong())
+                                .fill(Color32::from_rgb(42, 72, 108)),
+                        )
+                        .on_hover_text("Open W-rotary pulse calibration dialog")
+                        .clicked()
+                    {
+                        state.calib_dialog = Some(AxisPulseCalibState::new(Axis::W));
+                    }
                     ui.end_row();
                 });
 
@@ -1232,7 +1311,10 @@ fn render_measure_axis_dialog(
     let mut keep_open = true;
     let mut applied = false;
 
+    render_modal_backdrop(ctx, "measure_axis_modal_backdrop");
+
     Window::new(format!("📏 Measure Table {} Axis", axis_name))
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .default_width(430.0)
@@ -1508,6 +1590,272 @@ fn render_measure_axis_dialog(
 
     if keep_open {
         state.measure_axis = Some(m);
+    }
+    applied
+}
+
+fn render_modal_backdrop(ctx: &Context, id: &str) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen_rect.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen_rect.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(8, 10, 14, 155));
+        });
+}
+
+fn render_axis_calib_dialog(
+    ctx: &Context,
+    state: &mut PropertiesWindowState,
+    pulse_config: &mut PulseConfig,
+    controller: &Option<LaserController>,
+    status_message: &mut String,
+) -> bool {
+    let Some(mut d) = state.calib_dialog.take() else {
+        return false;
+    };
+
+    render_modal_backdrop(ctx, "axis_calib_modal_backdrop");
+
+    let is_connected = controller.as_ref().is_some_and(|c| c.is_connected());
+    let (axis_name, unit, cur_ppm) = match d.axis {
+        Axis::X => ("X", "mm", pulse_config.pulses_per_mm_x),
+        Axis::Y => ("Y", "mm", pulse_config.pulses_per_mm_y),
+        Axis::Z => ("Z", "mm", pulse_config.pulses_per_mm_z),
+        Axis::W => ("W", "deg", pulse_config.pulses_per_deg_w),
+    };
+    let (neg_arrow, pos_arrow) = match d.axis {
+        Axis::X => ("◀", "▶"),
+        Axis::Y | Axis::Z => ("▼", "▲"),
+        Axis::W => ("⟲", "⟳"),
+    };
+
+    let mut keep_open = true;
+    let mut applied = false;
+
+    Window::new(format!("🎯 Calibrate {}-Axis Pulses / {}", axis_name, unit))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(430.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_min_width(410.0);
+
+            ui.label(
+                RichText::new(format!(
+                    "Micrometer Calibration for {}-Axis (current: {:.3} pls/{})",
+                    axis_name, cur_ppm, unit
+                ))
+                .size(12.5)
+                .strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "1. Place a micrometer in line with the {}-axis touching the cutting head and zero it.\n\
+                     2. Use the arrow buttons below to displace the head (e.g. ±1.0 {}).\n\
+                     3. Enter the actual micrometer reading and click Apply Calibration.",
+                    axis_name, unit
+                ))
+                .size(11.0)
+                .weak(),
+            );
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Step Size:");
+                ui.add(
+                    DragValue::new(&mut d.step_mm)
+                        .range(0.05..=100.0)
+                        .speed(0.1)
+                        .max_decimals(2)
+                        .suffix(format!(" {}", unit)),
+                );
+                for preset in [0.5, 1.0, 5.0, 10.0] {
+                    if ui.small_button(format!("{:.1}", preset)).clicked() {
+                        d.step_mm = preset;
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let neg_lbl = format!("{} -{:.2} {}", neg_arrow, d.step_mm, unit);
+                let pos_lbl = format!("+{:.2} {} {}", d.step_mm, unit, pos_arrow);
+
+                if ui
+                    .add_enabled(
+                        is_connected,
+                        Button::new(RichText::new(neg_lbl).size(12.0).strong())
+                            .fill(Color32::from_rgb(44, 58, 78))
+                            .min_size(Vec2::new(128.0, 30.0)),
+                    )
+                    .on_disabled_hover_text("Connect to controller board first")
+                    .clicked()
+                {
+                    if let Some(ref c) = controller {
+                        let pulses = axis_mm_to_pulses(pulse_config, d.axis, -d.step_mm);
+                        c.jog(d.axis, pulses);
+                        d.commanded_pulses_total += pulses;
+                        d.commanded_signed_mm -= d.step_mm;
+                    }
+                }
+
+                if ui
+                    .add_enabled(
+                        is_connected,
+                        Button::new(RichText::new(pos_lbl).size(12.0).strong())
+                            .fill(Color32::from_rgb(44, 58, 78))
+                            .min_size(Vec2::new(128.0, 30.0)),
+                    )
+                    .on_disabled_hover_text("Connect to controller board first")
+                    .clicked()
+                {
+                    if let Some(ref c) = controller {
+                        let pulses = axis_mm_to_pulses(pulse_config, d.axis, d.step_mm);
+                        c.jog(d.axis, pulses);
+                        d.commanded_pulses_total += pulses;
+                        d.commanded_signed_mm += d.step_mm;
+                    }
+                }
+
+                if ui
+                    .add(
+                        Button::new(RichText::new("Zero / Reset").size(11.0))
+                            .min_size(Vec2::new(88.0, 30.0)),
+                    )
+                    .on_hover_text("Reset commanded displacement counter after re-zeroing the micrometer")
+                    .clicked()
+                {
+                    d.commanded_pulses_total = 0;
+                    d.commanded_signed_mm = 0.0;
+                }
+            });
+
+            ui.add_space(8.0);
+            Frame::group(ui.style()).show(ui, |ui| {
+                Grid::new("axis_calib_readout_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Commanded Net Displacement:");
+                        ui.label(
+                            RichText::new(format!(
+                                "{:+.3} {} ({} pulses)",
+                                d.commanded_signed_mm, unit, d.commanded_pulses_total
+                            ))
+                            .strong()
+                            .color(Color32::from_rgb(130, 215, 255)),
+                        );
+                        ui.end_row();
+
+                        ui.label(format!("Micrometer Reading ({}):", unit));
+                        ui.add(
+                            DragValue::new(&mut d.micrometer_reading_mm)
+                                .range(-1000.0..=1000.0)
+                                .speed(0.005)
+                                .max_decimals(4)
+                                .suffix(format!(" {}", unit)),
+                        );
+                        ui.end_row();
+
+                        ui.label("Calibrated Value:");
+                        match d.computed_pulses_per_unit() {
+                            Some(new_ppm) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.4} pls/{} (was {:.4})",
+                                        new_ppm, unit, cur_ppm
+                                    ))
+                                    .strong()
+                                    .color(Color32::from_rgb(120, 240, 175)),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("Move head with arrow buttons first")
+                                        .size(11.0)
+                                        .weak(),
+                                );
+                            }
+                        }
+                        ui.end_row();
+                    });
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                let can_apply = d.computed_pulses_per_unit().is_some();
+                if ui
+                    .add_enabled(
+                        can_apply,
+                        Button::new(
+                            RichText::new("✓ Apply Calibration")
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(28, 125, 78))
+                        .min_size(Vec2::new(140.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(new_ppm) = d.computed_pulses_per_unit() {
+                        let clamped = new_ppm.clamp(0.1, 100_000.0);
+                        match d.axis {
+                            Axis::X => pulse_config.pulses_per_mm_x = clamped,
+                            Axis::Y => pulse_config.pulses_per_mm_y = clamped,
+                            Axis::Z => pulse_config.pulses_per_mm_z = clamped,
+                            Axis::W => pulse_config.pulses_per_deg_w = clamped,
+                        }
+                        *status_message = format!(
+                            "Calibrated {}-axis to {:.4} pls/{} (micrometer: {:+.4} {} for {} pulses).",
+                            axis_name,
+                            clamped,
+                            unit,
+                            d.micrometer_reading_mm,
+                            unit,
+                            d.commanded_pulses_total
+                        );
+                        applied = true;
+                        keep_open = false;
+                    }
+                }
+
+                if ui
+                    .add_enabled(
+                        is_connected,
+                        Button::new(RichText::new("⏹ Stop").color(Color32::WHITE).strong())
+                            .fill(Color32::from_rgb(175, 42, 42))
+                            .min_size(Vec2::new(76.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(ref c) = controller {
+                        c.stop();
+                    }
+                }
+
+                if ui
+                    .add(
+                        Button::new(RichText::new("Cancel").size(12.0))
+                            .min_size(Vec2::new(76.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    keep_open = false;
+                }
+            });
+        });
+
+    if keep_open {
+        state.calib_dialog = Some(d);
     }
     applied
 }

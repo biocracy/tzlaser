@@ -208,6 +208,38 @@ fn configure_windows_theme_and_fonts(ctx: &egui::Context) {
     ctx.set_visuals(windows_dark_visuals());
 }
 
+#[cfg(not(target_os = "windows"))]
+fn configure_unix_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+
+    let mut fonts = egui::FontDefinitions::default();
+
+    let symbol_candidates: &[(&str, &str)] = &[
+        ("apple_symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
+        ("arial_unicode", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        ("noto_symbols", "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
+        ("noto_symbols2", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+        ("dejavu_sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ];
+
+    for (name, path) in symbol_candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                (*name).to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                vec.push((*name).to_owned());
+            }
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                vec.push((*name).to_owned());
+            }
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 impl eframe::App for TzlaserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "windows")]
@@ -522,7 +554,7 @@ fn main() -> eframe::Result<()> {
             #[cfg(target_os = "windows")]
             configure_windows_theme_and_fonts(&cc.egui_ctx);
             #[cfg(not(target_os = "windows"))]
-            let _ = cc;
+            configure_unix_fonts(&cc.egui_ctx);
             Ok(Box::new(TzlaserApp::default()))
         }),
     )
