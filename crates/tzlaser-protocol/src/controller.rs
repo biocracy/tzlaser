@@ -108,6 +108,9 @@ impl LaserController {
                 started_at: Instant,
                 sent_run_flag: bool,
                 seen_moving: bool,
+                telemetry_cursor: usize,
+                last_telemetry_at: Instant,
+                last_log_at: Instant,
             }
             let mut active_fifo: Option<FifoStreamState> = None;
 
@@ -505,21 +508,30 @@ impl LaserController {
                                 let st = status_clone.lock().unwrap();
                                 (st.pos_x, st.pos_y)
                             };
+                            let mut start_acks = Vec::new();
                             for spkt in build_fifo_start_packets(
                                 || seq_clone.fetch_add(1, Ordering::Relaxed),
                                 px,
                                 py,
                             ) {
-                                let _ = send_and_wait_ack(&socket, &spkt, &mut buf);
+                                start_acks.push(send_and_wait_ack(&socket, &spkt, &mut buf));
                             }
+                            eprintln!(
+                                "[FIFO START] px={} py={} r1022={} acks={:?}",
+                                px, py, last_r1022, start_acks
+                            );
+                            let now = Instant::now();
                             active_fifo = Some(FifoStreamState {
                                 ticks,
                                 cursor: 0,
                                 fifo_seq: last_r1022.wrapping_add(1),
                                 estimated_free: 8000,
-                                started_at: Instant::now(),
+                                started_at: now,
                                 sent_run_flag: false,
                                 seen_moving: false,
+                                telemetry_cursor: 0,
+                                last_telemetry_at: now,
+                                last_log_at: now,
                             });
                         }
                         Command::StartContinuousJog { axis, direction } => {
@@ -818,6 +830,19 @@ impl LaserController {
                                 if pkt.data.get(7).copied().unwrap_or(0) != 0 {
                                     fifo.seen_moving = true;
                                 }
+                                if fifo.last_log_at.elapsed() >= Duration::from_millis(250) {
+                                    fifo.last_log_at = Instant::now();
+                                    let r8 = pkt.data.get(8).copied().unwrap_or(0) as i32;
+                                    let r9 = pkt.data.get(9).copied().unwrap_or(0) as i32;
+                                    eprintln!(
+                                        "[FIFO 250ms] t={}ms cur={} free={} r1008={} r1009={}",
+                                        fifo.started_at.elapsed().as_millis(),
+                                        fifo.cursor,
+                                        last_r1006,
+                                        r8,
+                                        r9,
+                                    );
+                                }
                             }
                             // Ensure hardware soft limits R1063..R1070 (addr = 1252) remain unbounded
                             // ([0x7FFFFFFF, 0x80000000, ...]) so ±472,000 continuous & remote jogs are never blocked.
@@ -1083,6 +1108,20 @@ impl LaserController {
                             && (st.z_homed || latest_z.2 == 0)
                     };
                     if z_done || Instant::now() >= deadline {
+                        let (r2, r4) = {
+                            let st = status_clone.lock().unwrap();
+                            (st.limit_sensor_mask, last_r1004)
+                        };
+                        eprintln!(
+                            "[HOME] Z done (z_done={}, z_homed={}, z_state={}); limit_mask=0x{:02X} r1004=0x{:08X}; sending XY home (x_dir={}, y_dir={})",
+                            z_done,
+                            status_clone.lock().unwrap().z_homed,
+                            latest_z.2,
+                            r2,
+                            r4,
+                            home_cfg.x_dir,
+                            home_cfg.y_dir,
+                        );
                         pending_xy_home_after_z = None;
                         pending_stop_p2_at = None;
                         for (addr, vals) in [
@@ -1096,12 +1135,14 @@ impl LaserController {
                             let _ = send_and_wait_ack(&socket, &p, &mut buf);
                         }
                         last_r1004 = 0;
+                        let mut acks = Vec::new();
                         for hpkt in build_xy_home_packets(
                             || seq_clone.fetch_add(1, Ordering::Relaxed),
                             home_cfg,
                         ) {
-                            let _ = send_and_wait_ack(&socket, &hpkt, &mut buf);
+                            acks.push(send_and_wait_ack(&socket, &hpkt, &mut buf));
                         }
+                        eprintln!("[HOME] XY home acks: pkts={:?}", acks);
                     }
                 }
 
@@ -1125,22 +1166,40 @@ impl LaserController {
                             chunk,
                         );
                         let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
-                        let (sum_x, sum_y, any_laser) = chunk.iter().fold((0i32, 0i32, false), |acc, &(dx, dy, fl)| {
-                            (acc.0 + dx as i32, acc.1 + dy as i32, acc.2 || (fl != 0))
+                        fifo.cursor += take;
+                        fifo.fifo_seq = fifo.fifo_seq.wrapping_add(1);
+                        fifo.estimated_free = fifo.estimated_free.saturating_sub(take as u32);
+                        sent_this_iter += 1;
+                    }
+
+                    // Record real-time FIFO telemetry paced by actual elapsed time (~4 kHz SC2000 FIFO tick rate)
+                    let elapsed_ticks = (fifo.started_at.elapsed().as_secs_f64() * 4000.0) as usize;
+                    let target_tel_cursor = elapsed_ticks.min(fifo.ticks.len());
+                    if fifo.last_telemetry_at.elapsed() >= Duration::from_millis(25)
+                        && target_tel_cursor > fifo.telemetry_cursor
+                    {
+                        let slice = &fifo.ticks[fifo.telemetry_cursor..target_tel_cursor];
+                        let (sum_x, sum_y) = slice.iter().fold((0i32, 0i32), |acc, &(dx, dy, fl)| {
+                            if fl <= 0x03 {
+                                let sx = if (fl & 0x01) != 0 { -(dx as i32) } else { dx as i32 };
+                                let sy = if (fl & 0x02) != 0 { -(dy as i32) } else { dy as i32 };
+                                (acc.0 + sx, acc.1 + sy)
+                            } else {
+                                acc
+                            }
                         });
-                        let dt_s = (take as f32) * 0.001;
+                        let dt_s = (slice.len() as f32) * 0.00025;
+                        let tag = if fifo.telemetry_cursor == 0 { Some("FIFO") } else { None };
                         telemetry_clone.lock().unwrap().push_command(
                             (sum_x as f32) / dt_s,
                             (sum_y as f32) / dt_s,
                             0.0,
                             0.0,
-                            any_laser,
-                            if sent_this_iter == 0 { Some("FIFO") } else { None },
+                            false,
+                            tag,
                         );
-                        fifo.cursor += take;
-                        fifo.fifo_seq = fifo.fifo_seq.wrapping_add(1);
-                        fifo.estimated_free = fifo.estimated_free.saturating_sub(take as u32);
-                        sent_this_iter += 1;
+                        fifo.telemetry_cursor = target_tel_cursor;
+                        fifo.last_telemetry_at = Instant::now();
                     }
 
                     if !fifo.sent_run_flag
@@ -1156,7 +1215,7 @@ impl LaserController {
                     if is_moving_now {
                         fifo.seen_moving = true;
                     }
-                    let est_secs = (fifo.ticks.len() as f64 / 1000.0) + 0.5;
+                    let est_secs = (fifo.ticks.len() as f64 / 4000.0) + 0.5;
                     let fifo_done = fifo.cursor >= fifo.ticks.len()
                         && ((fifo.seen_moving && !is_moving_now)
                             || (!is_moving_now

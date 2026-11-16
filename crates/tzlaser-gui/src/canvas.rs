@@ -709,6 +709,7 @@ pub fn render_canvas(
     active_pause_mm: Option<Point>,
     can_context_menu: bool,
     completed_before_path_1based: Option<usize>,
+    initial_rapid_waypoints: &[Point],
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
     state.last_viewport_size = response.rect.size();
@@ -1254,7 +1255,7 @@ pub fn render_canvas(
     let x_end = origin_pt + x_screen_dir * axis_len;
     let y_end = origin_pt + y_screen_dir * axis_len;
 
-    painter.line_segment([origin_pt, x_end], Stroke::new(2.2, x_color));
+    painter.line_segment([origin_pt, x_end], Stroke::new(2.2_f32, x_color));
     draw_arrowhead(&painter, x_end, x_screen_dir.y.atan2(x_screen_dir.x), x_color, 8.5);
     let x_label_pos = x_end + x_screen_dir * 10.0 + Vec2::new(0.0, y_screen_dir.y * 8.0);
     painter.text(
@@ -1265,7 +1266,7 @@ pub fn render_canvas(
         x_color,
     );
 
-    painter.line_segment([origin_pt, y_end], Stroke::new(2.2, y_color));
+    painter.line_segment([origin_pt, y_end], Stroke::new(2.2_f32, y_color));
     draw_arrowhead(&painter, y_end, y_screen_dir.y.atan2(y_screen_dir.x), y_color, 8.5);
     let y_label_pos = y_end + y_screen_dir * 10.0 + Vec2::new(x_screen_dir.x * 10.0, 0.0);
     painter.text(
@@ -1277,7 +1278,7 @@ pub fn render_canvas(
     );
 
     // Origin target ring & center dot + "O" label
-    painter.circle_stroke(origin_pt, 6.5, Stroke::new(1.5, Color32::from_rgb(255, 215, 70)));
+    painter.circle_stroke(origin_pt, 6.5, Stroke::new(1.5_f32, Color32::from_rgb(255, 215, 70)));
     painter.circle_filled(origin_pt, 3.5, Color32::from_rgb(255, 80, 70));
     let origin_label_pos = origin_pt - x_screen_dir * 14.0 - y_screen_dir * 12.0;
     painter.text(
@@ -1534,6 +1535,33 @@ pub fn render_canvas(
                     routes.push(Document::route_rapid_between(from, to, &exclusion_polys));
                 }
                 state.cached_rapid_routes = (Some(scene_hash), routes);
+            }
+
+            if initial_rapid_waypoints.len() >= 2 {
+                let is_initial_done =
+                    completed_before_path_1based.is_some_and(|cutoff| cutoff > 1);
+                let base_rapid = if initial_rapid_waypoints.len() > 2 {
+                    Color32::from_rgba_unmultiplied(255, 175, 65, 200)
+                } else {
+                    Color32::from_rgba_unmultiplied(80, 215, 255, 165)
+                };
+                let (rapid_color, width) = if is_initial_done {
+                    (desaturate_and_alpha(base_rapid, 0.20, 28), 1.0_f32)
+                } else {
+                    (base_rapid, 1.6_f32)
+                };
+                for pair in initial_rapid_waypoints.windows(2) {
+                    let p1 = state.world_to_screen(pair[0], origin_screen);
+                    let p2 = state.world_to_screen(pair[1], origin_screen);
+                    if p1.distance(p2) > 2.0 {
+                        painter.add(egui::Shape::dashed_line(
+                            &[p1, p2],
+                            Stroke::new(width, rapid_color),
+                            if is_initial_done { 4.0 } else { 8.0 },
+                            if is_initial_done { 5.0 } else { 4.0 },
+                        ));
+                    }
+                }
             }
 
             for order_idx in 1..cut_sequence.len() {

@@ -222,7 +222,7 @@ pub fn render_signal_graph(
     painter.rect_stroke(
         rect,
         3.0,
-        Stroke::new(1.0, Color32::from_rgb(42, 48, 60)),
+        Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 60)),
         egui::StrokeKind::Inside,
     );
 
@@ -333,13 +333,13 @@ pub fn render_signal_graph(
     let zero_y = inner.center().y;
     painter.line_segment(
         [pos2(inner.left(), zero_y), pos2(inner.right(), zero_y)],
-        Stroke::new(1.0, Color32::from_rgb(55, 62, 75)),
+        Stroke::new(1.0_f32, Color32::from_rgb(55, 62, 75)),
     );
     for frac in [-1.0_f32, -0.5, 0.5, 1.0] {
         let y = zero_y - frac * (inner.height() * 0.5);
         painter.line_segment(
             [pos2(inner.left(), y), pos2(inner.right(), y)],
-            Stroke::new(0.6, Color32::from_rgb(28, 33, 42)),
+            Stroke::new(0.6_f32, Color32::from_rgb(28, 33, 42)),
         );
     }
     painter.text(
@@ -397,7 +397,7 @@ pub fn render_signal_graph(
         let x = inner.left() + u * inner.width();
         painter.line_segment(
             [pos2(x, inner.top()), pos2(x, inner.bottom())],
-            Stroke::new(0.6, Color32::from_rgb(28, 33, 42)),
+            Stroke::new(0.6_f32, Color32::from_rgb(28, 33, 42)),
         );
         let rel_t = -state.window_secs * (1.0 - u as f64);
         let lbl = if rel_t.abs() < 0.05 {
@@ -455,7 +455,7 @@ pub fn render_signal_graph(
                 if x - last_tag_x >= 44.0 {
                     painter.line_segment(
                         [pos2(x, inner.top()), pos2(x, inner.bottom())],
-                        Stroke::new(0.8, Color32::from_rgba_unmultiplied(150, 175, 220, 75)),
+                        Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(150, 175, 220, 75)),
                     );
                     painter.text(
                         pos2(x + 2.0, inner.top() + 1.0),
@@ -490,7 +490,7 @@ pub fn render_signal_graph(
             pts.push(to_screen(t_max, extract(last_s)));
         }
         if pts.len() >= 2 {
-            painter.add(egui::Shape::line(pts, Stroke::new(1.5, color)));
+            painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, color)));
         }
     };
 
@@ -510,7 +510,7 @@ pub fn render_signal_graph(
             pts.push(to_screen_acc(t_clamped, acc_samples[i][axis_idx]));
         }
         if pts.len() >= 2 {
-            painter.add(egui::Shape::line(pts, Stroke::new(1.2, color)));
+            painter.add(egui::Shape::line(pts, Stroke::new(1.2_f32, color)));
         }
     };
 

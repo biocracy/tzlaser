@@ -5,6 +5,7 @@ use tzlaser_core::{Document, Entity, HistoryManager, PulseConfig};
 use tzlaser_protocol::{LaserController, MachineStatus};
 
 mod canvas;
+mod console;
 mod layer_popup;
 mod panels;
 mod properties_window;
@@ -13,6 +14,7 @@ mod selection_hud;
 mod signal_graph;
 
 use canvas::{render_canvas, CanvasState};
+use console::{render_console, ConsoleLevel, ConsoleState};
 use panels::{render_right_panels, PanelState};
 use properties_window::PropertiesWindowState;
 use ribbon::{render_ribbon, RibbonState};
@@ -29,10 +31,13 @@ struct TzlaserApp {
     ribbon_state: RibbonState,
     props_window_state: PropertiesWindowState,
     signal_graph: SignalGraphState,
+    console: ConsoleState,
     pulse_config: PulseConfig,
     controller: Option<LaserController>,
     status: MachineStatus,
     status_message: String,
+    last_logged_status: String,
+    last_logged_connected: bool,
 }
 
 impl Default for TzlaserApp {
@@ -98,10 +103,13 @@ impl Default for TzlaserApp {
             ribbon_state: RibbonState::default(),
             props_window_state: PropertiesWindowState::default(),
             signal_graph: SignalGraphState::default(),
+            console: ConsoleState::default(),
             pulse_config,
             controller,
             status: MachineStatus::default(),
             status_message: "Ready. Auto-connecting to controller (10.1.1.168:502 & :999).".to_string(),
+            last_logged_status: String::new(),
+            last_logged_connected: false,
         }
     }
 }
@@ -312,10 +320,32 @@ impl eframe::App for TzlaserApp {
             ctx.request_repaint();
         }
 
-        // Enforce cutting-area bounds on the head position every frame
-        if self.status.pos_x != 0 || self.status.pos_y != 0 {
+        // Enforce cutting-area bounds on the head position every frame.
+        // Skip while hardware is unhomed (unreferenced coordinates) or actively homing.
+        let can_enforce_bounds = if hw_connected {
+            self.status.xy_homed && !self.status.is_homing_xy && !self.status.is_homing_z
+        } else {
+            true
+        };
+        if can_enforce_bounds && (self.status.pos_x != 0 || self.status.pos_y != 0) {
             let head_world = panels::head_world_mm(&self.status, &self.pulse_config);
-            if !panels::point_within_cut_area(head_world, &self.pulse_config) {
+            if panels::point_within_cut_area(head_world, &self.pulse_config) {
+                self.panel_state.oob_latched = false;
+            } else if !self.panel_state.oob_latched && self.panel_state.oob_alert.is_none() {
+                self.console.log(
+                    ConsoleLevel::Warn,
+                    format!(
+                        "[OOB] pos=({},{}) world=({:.2},{:.2}) cut=({:.1},{:.1}) xy_homed={} moving={}",
+                        self.status.pos_x,
+                        self.status.pos_y,
+                        head_world.x,
+                        head_world.y,
+                        self.pulse_config.cut_width_mm(),
+                        self.pulse_config.cut_height_mm(),
+                        self.status.xy_homed,
+                        self.status.is_moving,
+                    ),
+                );
                 let reason = format!(
                     "Head position jumped outside the effective cutting area ({:.1}, {:.1} mm vs {:.1} × {:.1} mm).",
                     head_world.x,
@@ -332,6 +362,8 @@ impl eframe::App for TzlaserApp {
                     self.signal_graph.record_offline(0.0, 0.0, 0.0, 0.0, false, Some("OOB Reset"));
                 }
             }
+        } else if self.status.pos_x == 0 && self.status.pos_y == 0 {
+            self.panel_state.oob_latched = false;
         }
 
         // Prompt to home machine on first connection to controller board
@@ -427,6 +459,28 @@ impl eframe::App for TzlaserApp {
                     {
                         self.signal_graph.expanded = !self.signal_graph.expanded;
                     }
+                    let console_arrow = if self.console.expanded { "▼" } else { "▲" };
+                    let console_btn = egui::Button::new(
+                        RichText::new(format!("{} Console", console_arrow))
+                            .size(11.0)
+                            .color(if self.console.expanded {
+                                Color32::from_rgb(0, 220, 255)
+                            } else {
+                                Color32::from_rgb(190, 200, 215)
+                            }),
+                    )
+                    .fill(if self.console.expanded {
+                        Color32::from_rgb(24, 52, 68)
+                    } else {
+                        Color32::from_rgb(42, 46, 56)
+                    });
+                    if ui
+                        .add(console_btn)
+                        .on_hover_text("Show/hide message console")
+                        .clicked()
+                    {
+                        self.console.expanded = !self.console.expanded;
+                    }
                     ui.separator();
                     ui.label(RichText::new(&self.status_message).size(12.0).color(status_text_color));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -479,7 +533,44 @@ impl eframe::App for TzlaserApp {
                 );
             });
 
-        // 3b. Collapsible & Resizable Real-Time Axis Signal Graph (spans width minus right panel)
+        // 3b. Collapsible & Resizable Lower Panels (Message Console + Signal Graph, stacked)
+        for msg in self.panel_state.pending_logs.drain(..) {
+            self.console.log(ConsoleLevel::Motion, msg);
+        }
+        if is_connected != self.last_logged_connected {
+            self.last_logged_connected = is_connected;
+            if is_connected {
+                self.console.log(
+                    ConsoleLevel::Info,
+                    format!("Controller connected at {}.", self.panel_state.target_ip),
+                );
+            } else {
+                self.console.log(ConsoleLevel::Warn, "Controller disconnected.");
+            }
+        }
+        if self.status_message != self.last_logged_status {
+            self.last_logged_status = self.status_message.clone();
+            let lvl = if self.status_message.contains("⚠️") {
+                ConsoleLevel::Warn
+            } else {
+                ConsoleLevel::Info
+            };
+            self.console.log(lvl, self.status_message.clone());
+        }
+
+        if self.console.expanded {
+            let console_fill = Color32::from_rgb(18, 21, 27);
+            egui::TopBottomPanel::bottom("message_console_panel")
+                .resizable(true)
+                .min_height(80.0)
+                .default_height(135.0)
+                .max_height(360.0)
+                .frame(Frame::new().fill(console_fill).inner_margin(Margin::symmetric(8, 6)))
+                .show(ctx, |ui| {
+                    render_console(ui, &mut self.console);
+                });
+        }
+
         if self.signal_graph.expanded {
             let graph_fill = Color32::from_rgb(20, 23, 29);
             egui::TopBottomPanel::bottom("motion_telemetry_panel")
@@ -513,6 +604,7 @@ impl eframe::App for TzlaserApp {
             let can_context_menu =
                 self.panel_state.run_mode == panels::RunMode::Idle || self.panel_state.is_paused;
             let completed_before = self.panel_state.completed_before_path_1based();
+            let initial_rapid = self.panel_state.initial_rapid_waypoints();
             render_canvas(
                 ui,
                 &mut self.canvas_state,
@@ -526,6 +618,7 @@ impl eframe::App for TzlaserApp {
                 active_pause_mm,
                 can_context_menu,
                 completed_before,
+                &initial_rapid,
             );
             if let Some(target_pt) = self.canvas_state.pending_continue_from_point.take() {
                 if let Some(msg) = self.panel_state.set_pause_at_path_point(

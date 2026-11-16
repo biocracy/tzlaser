@@ -58,6 +58,8 @@ pub struct PanelState {
     pub show_home_prompt: bool,
     pub prompted_home_this_connection: bool,
     pub oob_alert: Option<(String, bool)>,
+    pub oob_latched: bool,
+    pub pending_logs: Vec<String>,
     pub job_start_pos: kurbo::Point,
     pub sim_vx_pls: f32,
     pub sim_vy_pls: f32,
@@ -98,6 +100,8 @@ impl Default for PanelState {
             show_home_prompt: false,
             prompted_home_this_connection: false,
             oob_alert: None,
+            oob_latched: false,
+            pending_logs: Vec::new(),
             job_start_pos: kurbo::Point::ZERO,
             sim_vx_pls: 0.0,
             sim_vy_pls: 0.0,
@@ -136,6 +140,7 @@ pub fn head_world_mm(status: &MachineStatus, pulse_config: &PulseConfig) -> kurb
 /// Groups smooth consecutive segments (e.g. circle/arc chords) into continuous chains with
 /// trapezoidal acceleration/deceleration ramps so curves flow without stopping and corners/starts
 /// accelerate smoothly without shocking the machine.
+#[allow(dead_code)]
 pub fn build_trajectory_fifo_ticks(
     traj: &[MotionSegment],
     origin_world: kurbo::Point,
@@ -146,9 +151,15 @@ pub fn build_trajectory_fifo_ticks(
     let mut ticks = Vec::new();
     let mut cur_px = start_px;
     let mut cur_py = start_py;
-    // Development safety: cap Dry-Cut to 5 mm/s and gentle 25 mm/s^2 acceleration
-    let dev_speed_mm_s = 5.0_f64;
-    let accel = pulses_cfg.jog_accel_mm_s2.clamp(10.0, 25.0);
+    // Conservative safety limits for Dry-Cut: cap speed to 3.0 mm/s and accel to 12.0 mm/s^2
+    let dev_speed_mm_s = pulses_cfg.jog_speed_mm_s.clamp(1.0, 3.0);
+    let accel = pulses_cfg.jog_accel_mm_s2.clamp(5.0, 12.0);
+    let max_tick_x =
+        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_x.max(1.0) / 1000.0).ceil() as i32 + 1)
+            .clamp(1, 15);
+    let max_tick_y =
+        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_y.max(1.0) / 1000.0).ceil() as i32 + 1)
+            .clamp(1, 15);
 
     let segs: Vec<&MotionSegment> = traj.iter().filter(|s| s.length_mm > 1e-6).collect();
     if segs.is_empty() {
@@ -212,9 +223,10 @@ pub fn build_trajectory_fifo_ticks(
 
         let end_px = pulses_cfg.mm_to_pulses_x(chain.last().unwrap().end.x - origin_world.x);
         let end_py = pulses_cfg.mm_to_pulses_y(chain.last().unwrap().end.y - origin_world.y);
-        let min_ticks_for_step =
-            (((end_px - cur_px).abs().max((end_py - cur_py).abs()) as usize) + 126) / 127;
-        let n_ticks = ((total_t * 1000.0).ceil() as usize)
+        let min_ticks_x = (((end_px - cur_px).abs() as usize) + (max_tick_x as usize - 1)) / (max_tick_x as usize);
+        let min_ticks_y = (((end_py - cur_py).abs() as usize) + (max_tick_y as usize - 1)) / (max_tick_y as usize);
+        let min_ticks_for_step = min_ticks_x.max(min_ticks_y);
+        let n_ticks = ((total_t * 4000.0).ceil() as usize)
             .max(min_ticks_for_step)
             .max(1);
 
@@ -250,24 +262,44 @@ pub fn build_trajectory_fifo_ticks(
             let wy = seg.start.y + (seg.end.y - seg.start.y) * frac;
             let next_px = pulses_cfg.mm_to_pulses_x(wx - origin_world.x);
             let next_py = pulses_cfg.mm_to_pulses_y(wy - origin_world.y);
-            // SC2000 Motion FIFO ticks are subtracted from R1008/R1009 by the controller
-            // (positive FIFO dx/dy moves R1008/R1009 in the negative direction).
-            let tick_dx = (cur_px - next_px).clamp(-127, 127) as i8;
-            let tick_dy = (cur_py - next_py).clamp(-127, 127) as i8;
-            cur_px -= tick_dx as i32;
-            cur_py -= tick_dy as i32;
-            let flags = if is_rapid { 0x03 } else { 0x01 };
-            ticks.push((tick_dx, tick_dy, flags));
+            // SC2000 Motion FIFO ticks carry unsigned 7-bit pulse magnitudes (0..=127)
+            // with axis direction encoded in `flags`: bit 0 (0x01) = -X (R1008--), bit 1 (0x02) = -Y (R1009--).
+            let dx_req = next_px - cur_px;
+            let dy_req = next_py - cur_py;
+            let mag_x = dx_req.abs().min(max_tick_x) as u8;
+            let mag_y = dy_req.abs().min(max_tick_y) as u8;
+            let step_x = if dx_req < 0 { -(mag_x as i32) } else { mag_x as i32 };
+            let step_y = if dy_req < 0 { -(mag_y as i32) } else { mag_y as i32 };
+            cur_px += step_x;
+            cur_py += step_y;
+            let mut flags = 0u8;
+            if step_x < 0 {
+                flags |= 0x01;
+            }
+            if step_y < 0 {
+                flags |= 0x02;
+            }
+            ticks.push((mag_x as i8, mag_y as i8, flags));
         }
 
-        // Flush any remaining quantized pulse difference at the chain end
+        // Flush any remaining quantized pulse difference at the chain end without velocity spikes
         while cur_px != end_px || cur_py != end_py {
-            let tick_dx = (cur_px - end_px).clamp(-127, 127) as i8;
-            let tick_dy = (cur_py - end_py).clamp(-127, 127) as i8;
-            cur_px -= tick_dx as i32;
-            cur_py -= tick_dy as i32;
-            let flags = if is_rapid { 0x03 } else { 0x01 };
-            ticks.push((tick_dx, tick_dy, flags));
+            let dx_req = end_px - cur_px;
+            let dy_req = end_py - cur_py;
+            let mag_x = dx_req.abs().min(max_tick_x) as u8;
+            let mag_y = dy_req.abs().min(max_tick_y) as u8;
+            let step_x = if dx_req < 0 { -(mag_x as i32) } else { mag_x as i32 };
+            let step_y = if dy_req < 0 { -(mag_y as i32) } else { mag_y as i32 };
+            cur_px += step_x;
+            cur_py += step_y;
+            let mut flags = 0u8;
+            if step_x < 0 {
+                flags |= 0x01;
+            }
+            if step_y < 0 {
+                flags |= 0x02;
+            }
+            ticks.push((mag_x as i8, mag_y as i8, flags));
         }
 
         idx = chain_end;
@@ -301,8 +333,8 @@ pub fn home_config_from_pulse(pulse_config: &PulseConfig) -> tzlaser_protocol::H
     tzlaser_protocol::HomeConfig {
         x_dir,
         y_dir,
-        fast_speed_pls_s: ((20.0 * ppm).round() as u32).max(1_000),
-        slow_speed_pls_s: ((2.0 * ppm).round() as u32).max(100),
+        fast_speed_pls_s: ((3.0 * ppm).round() as u32).max(400),
+        slow_speed_pls_s: ((1.5 * ppm).round() as u32).max(200),
         max_search_pulses: ((max_dim * 1.2 * ppm).round() as u32).max(50_000),
     }
 }
@@ -378,6 +410,27 @@ impl PanelState {
         }
     }
 
+    /// Return the initial rapid travel waypoints from the head's starting position to the first
+    /// cuttable path's start point while a run/dry-cut is active or paused.
+    pub fn initial_rapid_waypoints(&self) -> Vec<kurbo::Point> {
+        if self.run_mode == RunMode::Idle {
+            return Vec::new();
+        }
+        let src = if !self.full_trajectory.is_empty() {
+            &self.full_trajectory
+        } else {
+            &self.trajectory
+        };
+        let mut pts = Vec::new();
+        for seg in src.iter().take_while(|s| s.is_rapid) {
+            if pts.is_empty() {
+                pts.push(seg.start);
+            }
+            pts.push(seg.end);
+        }
+        pts
+    }
+
     /// Stop any active motion, reset head position to origin (0, 0), show an alert message,
     /// and prompt for re-homing if connected to physical hardware (offline requires no re-homing).
     pub fn trigger_out_of_bounds_recovery(
@@ -389,6 +442,7 @@ impl PanelState {
         self.stop_run(controller, status);
         status.pos_x = 0;
         status.pos_y = 0;
+        self.oob_latched = true;
         let hw_connected = controller.as_ref().map_or(false, |c| c.is_connected());
         if hw_connected {
             status.xy_homed = false;
@@ -528,6 +582,7 @@ impl PanelState {
 
     /// Convert the active trajectory into a 1-ms Motion FIFO tick stream and dispatch it
     /// to the connected controller for continuous, stutter-free Dry-Cut curve tracing.
+    #[allow(dead_code)]
     pub fn start_hw_dry_cut_fifo(
         &mut self,
         controller: &Option<LaserController>,
@@ -540,9 +595,10 @@ impl PanelState {
         if !c.is_connected() || self.trajectory.is_empty() {
             return;
         }
+        let origin = origin_world_mm(pulses_cfg);
         let ticks = build_trajectory_fifo_ticks(
             &self.trajectory,
-            origin_world_mm(pulses_cfg),
+            origin,
             pulses_cfg,
             status.pos_x,
             status.pos_y,
@@ -550,7 +606,27 @@ impl PanelState {
         if ticks.is_empty() {
             return;
         }
-        self.hw_fifo_total_secs = ticks.len() as f64 / 1000.0;
+        let sum_dx: i32 = ticks.iter().map(|t| t.0 as i32).sum();
+        let sum_dy: i32 = ticks.iter().map(|t| t.1 as i32).sum();
+        let max_dx: i32 = ticks.iter().map(|t| (t.0 as i32).abs()).max().unwrap_or(0);
+        let max_dy: i32 = ticks.iter().map(|t| (t.1 as i32).abs()).max().unwrap_or(0);
+        self.pending_logs.push(format!(
+            "[DRY-CUT FIFO] origin=({:.1},{:.1}) start_pulses=({},{}) seg0=({:.1},{:.1})->({:.1},{:.1}) ticks={} sum_fifo=({},{}) max_tick=({},{})",
+            origin.x,
+            origin.y,
+            status.pos_x,
+            status.pos_y,
+            self.trajectory[0].start.x,
+            self.trajectory[0].start.y,
+            self.trajectory[0].end.x,
+            self.trajectory[0].end.y,
+            ticks.len(),
+            sum_dx,
+            sum_dy,
+            max_dx,
+            max_dy,
+        ));
+        self.hw_fifo_total_secs = ticks.len() as f64 / 4000.0;
         self.hw_fifo_started_at = Some(std::time::Instant::now());
         self.hw_fifo_active = true;
         self.hw_seg_seen_moving = false;
@@ -1225,14 +1301,41 @@ impl PanelState {
                             .pulses_per_mm_x
                             .max(pulses_cfg.pulses_per_mm_y)
                             .max(10.0);
-                        let speed_pls = (seg.speed_mm_s.max(0.5) * ppm)
+                        let eff_speed_mm_s = if self.run_mode == RunMode::DryCut {
+                            pulses_cfg.jog_speed_mm_s.clamp(3.0, 15.0)
+                        } else {
+                            seg.speed_mm_s.max(0.5)
+                        };
+                        let speed_pls = (eff_speed_mm_s * ppm)
                             .round()
                             .clamp(200.0, 120_000.0) as u32;
-                        let move_cfg = tzlaser_protocol::JogConfig {
-                            min_speed: (speed_pls / 10).max(100),
-                            jog_speed: speed_pls,
-                            accel: (speed_pls * 4).clamp(2_000, 100_000),
+                        let accel_pls = if self.run_mode == RunMode::DryCut {
+                            (pulses_cfg.jog_accel_mm_s2.clamp(15.0, 60.0) * ppm)
+                                .round()
+                                .clamp(1_500.0, 30_000.0) as u32
+                        } else {
+                            (speed_pls * 4).clamp(2_000, 100_000)
                         };
+                        let move_cfg = tzlaser_protocol::JogConfig {
+                            min_speed: if self.run_mode == RunMode::DryCut {
+                                (speed_pls / 3).max(300)
+                            } else {
+                                (speed_pls / 10).max(100)
+                            },
+                            jog_speed: speed_pls,
+                            accel: accel_pls,
+                        };
+                        self.pending_logs.push(format!(
+                            "[HW SEG {}] ({:.1},{:.1})->({:.1},{:.1}) pulses=({},{}) speed={} pls/s",
+                            self.current_seg_idx,
+                            head_world.x,
+                            head_world.y,
+                            seg.end.x,
+                            seg.end.y,
+                            dx_p,
+                            dy_p,
+                            speed_pls,
+                        ));
                         c.move_xy(dx_p, dy_p, move_cfg);
                     }
                     self.last_hw_dispatched_seg = Some(self.current_seg_idx);
@@ -1648,7 +1751,7 @@ pub fn render_right_panels(
                             dot_center,
                             2.8,
                             Color32::from_rgb(52, 58, 70),
-                            egui::Stroke::new(1.0, Color32::from_rgb(95, 102, 118)),
+                            egui::Stroke::new(1.0_f32, Color32::from_rgb(95, 102, 118)),
                         );
                     }
                     resp.clicked()
@@ -1664,7 +1767,7 @@ pub fn render_right_panels(
                             ui.allocate_exact_size(egui::vec2(btn_size[0], btn_size[1]), egui::Sense::hover());
                             if jog_dot_btn(
                                 ui,
-                                "Y+ ▲",
+                                "▲",
                                 None,
                                 None,
                                 status.y_pos_limit(),
@@ -1678,7 +1781,7 @@ pub fn render_right_panels(
                             }
                             if jog_dot_btn(
                                 ui,
-                                "Z+ ▲",
+                                "Z ▲",
                                 Some(Color32::from_rgb(130, 195, 255)),
                                 Some(Color32::from_rgb(28, 38, 56)),
                                 status.z_pos_limit(),
@@ -1695,7 +1798,7 @@ pub fn render_right_panels(
                             // Row 2: X- | STOP | X+ (middle between Z+ and Z-)
                             if jog_dot_btn(
                                 ui,
-                                "◄ X-",
+                                "◄",
                                 None,
                                 None,
                                 status.x_neg_limit(),
@@ -1714,7 +1817,7 @@ pub fn render_right_panels(
                             }
                             if jog_dot_btn(
                                 ui,
-                                "X+ ►",
+                                "►",
                                 None,
                                 None,
                                 status.x_pos_limit(),
@@ -1732,7 +1835,7 @@ pub fn render_right_panels(
                             ui.allocate_exact_size(egui::vec2(btn_size[0], btn_size[1]), egui::Sense::hover());
                             if jog_dot_btn(
                                 ui,
-                                "Y- ▼",
+                                "▼",
                                 None,
                                 None,
                                 status.y_neg_limit(),
@@ -1746,7 +1849,7 @@ pub fn render_right_panels(
                             }
                             if jog_dot_btn(
                                 ui,
-                                "Z- ▼",
+                                "Z ▼",
                                 Some(Color32::from_rgb(130, 195, 255)),
                                 Some(Color32::from_rgb(28, 38, 56)),
                                 status.z_neg_cap_limit(),
@@ -1769,21 +1872,24 @@ pub fn render_right_panels(
                     let mut clamped_pulses = pulses;
                     let mut limit_msg: Option<String> = None;
                     if pulses_cfg.soft_limits_enabled && (axis == Axis::X || axis == Axis::Y) {
+                        let head_world = head_world_mm(status, pulses_cfg);
                         let (cur_mm, delta_mm, max_mm) = match axis {
                             Axis::X => (
-                                pulses_cfg.pulses_to_mm_x(status.pos_x).abs(),
+                                head_world.x,
                                 pulses_cfg.pulses_to_mm_x(pulses),
                                 pulses_cfg.cut_width_mm(),
                             ),
                             Axis::Y => (
-                                pulses_cfg.pulses_to_mm_y(status.pos_y).abs(),
+                                head_world.y,
                                 pulses_cfg.pulses_to_mm_y(pulses),
                                 pulses_cfg.cut_height_mm(),
                             ),
                             _ => (0.0, 0.0, 0.0),
                         };
                         let next_mm = cur_mm + delta_mm;
-                        if next_mm < -0.01 || next_mm > max_mm + 0.01 {
+                        let moving_inward = (cur_mm < -0.01 && next_mm > cur_mm)
+                            || (cur_mm > max_mm + 0.01 && next_mm < cur_mm);
+                        if !moving_inward && (next_mm < -0.01 || next_mm > max_mm + 0.01) {
                             clamped_pulses = 0;
                             limit_msg = Some(format!(
                                 "Soft limit: {:?} target {:.1} mm outside effective cut area [0.0..{:.1} mm].",
@@ -1921,7 +2027,6 @@ pub fn render_right_panels(
                         match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
                             Ok(()) => {
                                 *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
-                                panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
                             }
                             Err(msg) => {
                                 *status_message = msg;
@@ -1946,9 +2051,6 @@ pub fn render_right_panels(
                             Ok(()) => {
                                 if let Some(msg) = panel_state.continue_run(doc, current_head, controller) {
                                     *status_message = msg;
-                                    if panel_state.run_mode == RunMode::DryCut {
-                                        panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
-                                    }
                                 }
                             }
                             Err(msg) => {
@@ -2241,7 +2343,7 @@ pub fn render_right_panels(
                     ui.add_space(4.0);
                     Frame::group(ui.style())
                         .fill(Color32::from_rgb(36, 30, 20))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(205, 145, 38)))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(205, 145, 38)))
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(format!(
@@ -2379,9 +2481,9 @@ pub fn render_right_panels(
                         Color32::from_rgb(28, 30, 36)
                     };
                     let row_stroke = if is_open {
-                        egui::Stroke::new(1.0, Color32::from_rgb(80, 175, 235))
+                        egui::Stroke::new(1.0_f32, Color32::from_rgb(80, 175, 235))
                     } else {
-                        egui::Stroke::new(1.0, Color32::from_rgb(44, 47, 56))
+                        egui::Stroke::new(1.0_f32, Color32::from_rgb(44, 47, 56))
                     };
 
                     Frame::group(ui.style())
@@ -2791,11 +2893,51 @@ mod tests {
         assert_eq!(ticks[0], (0, 0, 0x30));
         assert!(ticks[1..59].iter().all(|&t| t == (0, 0, 0x02)));
         assert_eq!(ticks.last(), Some(&(0, 0, 0xF0)));
-        // Total FIFO pulses are negated relative to R1008 target position
-        let sum_x: i32 = ticks.iter().map(|t| t.0 as i32).sum();
-        assert_eq!(sum_x, -cfg.mm_to_pulses_x(20.0));
-        // First motion tick velocity should be small (accelerating gently from rest at 5 mm/s)
+        // Motion ticks must use unsigned 7-bit magnitudes (0..=127) with direction in flags
+        assert!(ticks.iter().all(|&(dx, dy, _)| dx >= 0 && dy >= 0));
+        let sum_x: i32 = ticks
+            .iter()
+            .filter(|t| t.2 <= 0x03)
+            .map(|&(dx, _, fl)| if (fl & 0x01) != 0 { -(dx as i32) } else { dx as i32 })
+            .sum();
+        assert_eq!(sum_x, cfg.mm_to_pulses_x(20.0));
+        // First motion tick velocity should be small (accelerating gently from rest)
         assert!(ticks[59].0.abs() <= 1);
+    }
+
+    #[test]
+    fn test_fifo_seg0_bottom_right_sums() {
+        let mut cfg = PulseConfig::default();
+        cfg.table_width_mm = 1300.0;
+        cfg.table_height_mm = 900.0;
+        cfg.home_retract_x_mm = 10.0;
+        cfg.home_retract_y_mm = 10.0;
+        cfg.origin_corner = "Bottom-Right (Xmax, Y0)".to_string();
+        cfg.pulses_per_mm_x = 243.3264887063655;
+        cfg.pulses_per_mm_y = 237.60399334442596;
+        let origin = origin_world_mm(&cfg);
+        let traj = vec![MotionSegment {
+            start: kurbo::Point::new(1235.6, 54.1),
+            end: kurbo::Point::new(1181.7, 87.9),
+            is_rapid: true,
+            speed_mm_s: 20.0,
+            length_mm: kurbo::Point::new(1235.6, 54.1).distance(kurbo::Point::new(1181.7, 87.9)),
+            path_index_1based: 1,
+        }];
+        let ticks = build_trajectory_fifo_ticks(&traj, origin, &cfg, -13243, 12849);
+        let sx: i32 = ticks
+            .iter()
+            .filter(|t| t.2 <= 0x03)
+            .map(|&(dx, _, fl)| if (fl & 0x01) != 0 { -(dx as i32) } else { dx as i32 })
+            .sum();
+        let sy: i32 = ticks
+            .iter()
+            .filter(|t| t.2 <= 0x03)
+            .map(|&(_, dy, fl)| if (fl & 0x02) != 0 { -(dy as i32) } else { dy as i32 })
+            .sum();
+        println!("seg0 ticks={} sx={} sy={}", ticks.len(), sx, sy);
+        assert!((sx - (-13115)).abs() < 50, "sx={}", sx);
+        assert!((sy - 8031).abs() < 50, "sy={}", sy);
     }
 
     #[test]
