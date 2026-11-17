@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use crate::motion::{
     build_fifo_finish_packets, build_fifo_packet, build_fifo_start_packets, build_init_packets,
     build_initial_enable_packets, build_jog_packet, build_stop_packets, build_xy_home_packets,
-    build_xy_move_packet, build_z_handshake_packets, build_z_home_packet, build_z_jog_packet,
-    build_z_poll_packet, build_z_stop_packet, decode_remote_jog, decode_z_homed_from_poll,
-    decode_z_poll_response, decode_z_sensors_from_poll, fifo_flags, registers, remote_buttons,
-    Axis, HomeConfig, JogConfig, MachineStatus, SignalTelemetry, CONTINUOUS_JOG_PULSES_XY,
-    CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
+    build_xy_move_packet, build_z_calibrate_packet, build_z_handshake_packets,
+    build_z_home_packet, build_z_jog_packet, build_z_poll_packet, build_z_stop_packet,
+    decode_remote_jog, decode_z_poll_response, decode_z_poll_telemetry, fifo_flags, registers,
+    remote_buttons, Axis, CalibrationMonitor, HomeConfig, JogConfig, MachineStatus,
+    SignalTelemetry, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
 
@@ -27,6 +27,7 @@ pub enum Command {
     UpdateJogConfig { config: JogConfig, z_speed: u32 },
     WriteRegisters { addr: u32, values: Vec<u32> },
     CalibrateHeightSensor,
+    SetZMaterialConfig { material_thickness_mm: f64, pulses_per_mm_z: f64 },
     ProbeSurfaceZ,
     SetFollowerServo(bool),
     SetRedPointer(bool),
@@ -100,6 +101,10 @@ impl LaserController {
             let mut last_r1006: u32 = 8000;
             let mut last_r1022: u32 = 0;
             let mut pending_xy_home_after_z: Option<(HomeConfig, Instant, Instant)> = None;
+            let mut pending_z_home_after_cal_stop_at: Option<Instant> = None;
+            let mut cal_monitor: Option<CalibrationMonitor> = None;
+            let mut active_remote_z_fast: bool = false;
+            let mut ui_continuous_z_jog: bool = false;
             struct FifoStreamState {
                 ticks: Vec<(i8, i8, u8)>,
                 cursor: usize,
@@ -237,6 +242,26 @@ impl LaserController {
                     }
                 }
 
+                // Auto-retract Z to max height (Z-home) after stopping or aborting calibration
+                if let Some(t_zhome) = pending_z_home_after_cal_stop_at {
+                    if Instant::now() >= t_zhome {
+                        pending_z_home_after_cal_stop_at = None;
+                        if let Some(ref zs) = z_socket {
+                            let raw_home = build_z_home_packet();
+                            send_z_cmd_with_ack(
+                                zs,
+                                &raw_home,
+                                &mut z_buf,
+                                &mut z_status_seen,
+                                &mut latest_z,
+                            );
+                            status_clone.lock().unwrap().is_homing_z = true;
+                            last_z_poll = Instant::now() - Duration::from_secs(1);
+                            log::info!("[CAL] Auto-homing Z to max height after calibration stop/abort");
+                        }
+                    }
+                }
+
                 // Check scheduled delayed remote stop (ensures brief remote button taps move for at least 150ms)
                 if let Some(t_rem_stop) = pending_remote_stop_at {
                     if Instant::now() >= t_rem_stop {
@@ -288,7 +313,8 @@ impl LaserController {
                                 if let Some(ref zs) = z_socket {
                                     // For a finite Z step jog, `cmd = 9` on Port 999 takes the exact
                                     // relative pulse target (`hw_pulses = -pulses`) and moves to target.
-                                    let raw = build_z_jog_packet(pulses, z_jog_speed);
+                                    let eff_z_speed = z_jog_speed.max(120);
+                                    let raw = build_z_jog_packet(pulses, eff_z_speed);
                                     send_z_cmd_with_ack(
                                         zs,
                                         &raw,
@@ -351,10 +377,11 @@ impl LaserController {
                                     Some((axis, cur_pos, pulses.unsigned_abs() as i32));
                                 let move_secs = (pulses.unsigned_abs() as f64
                                     / jog_cfg.jog_speed.max(1) as f64)
-                                    + 0.10;
+                                    * 2.5
+                                    + 1.0;
                                 auto_stop_at = Some(
                                     Instant::now()
-                                        + Duration::from_secs_f64(move_secs.clamp(0.06, 15.0)),
+                                        + Duration::from_secs_f64(move_secs.clamp(0.15, 45.0)),
                                 );
                             }
                         }
@@ -442,10 +469,11 @@ impl LaserController {
                             if auto_stop {
                                 let move_secs = (pulses.unsigned_abs() as f64
                                     / config.jog_speed.max(1) as f64)
-                                    + 0.25;
+                                    * 2.5
+                                    + 1.5;
                                 auto_stop_at = Some(
                                     Instant::now()
-                                        + Duration::from_secs_f64(move_secs.max(0.08)),
+                                        + Duration::from_secs_f64(move_secs.max(0.20)),
                                 );
                             } else {
                                 auto_stop_at = None;
@@ -538,9 +566,11 @@ impl LaserController {
                             let sign = if direction >= 0 { 1 } else { -1 };
                             if axis == Axis::Z {
                                 if let Some(ref zs) = z_socket {
+                                    ui_continuous_z_jog = true;
+                                    let eff_z_speed = z_jog_speed.max(120);
                                     let raw = build_z_jog_packet(
                                         sign * CONTINUOUS_JOG_PULSES_Z,
-                                        z_jog_speed,
+                                        eff_z_speed,
                                     );
                                     send_z_cmd_with_ack(
                                         zs,
@@ -599,6 +629,8 @@ impl LaserController {
                             active_step_watch = None;
                             active_z_step_watch = None;
                             active_remote_jog = None;
+                            active_remote_z_fast = false;
+                            ui_continuous_z_jog = false;
                             pending_xy_home_after_z = None;
                             telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Stop"));
                             if active_fifo.take().is_some() {
@@ -615,6 +647,11 @@ impl LaserController {
                             pending_stop_p2_at = Some(Instant::now() + Duration::from_millis(140));
 
                             if let Some(ref zs) = z_socket {
+                                let was_calibrating = {
+                                    let st = status_clone.lock().unwrap();
+                                    st.is_calibrating_z || st.z_state_code == 7 || cal_monitor.is_some()
+                                };
+                                cal_monitor = None;
                                 let raw_stop = build_z_stop_packet();
                                 send_z_cmd_with_ack(
                                     zs,
@@ -623,6 +660,17 @@ impl LaserController {
                                     &mut z_status_seen,
                                     &mut latest_z,
                                 );
+                                let at_upper = {
+                                    let mut st = status_clone.lock().unwrap();
+                                    st.is_calibrating_z = false;
+                                    st.z_pos_sensor
+                                };
+                                if was_calibrating && !at_upper {
+                                    pending_z_home_after_cal_stop_at =
+                                        Some(Instant::now() + Duration::from_millis(80));
+                                } else {
+                                    pending_z_home_after_cal_stop_at = None;
+                                }
                                 last_z_poll = Instant::now() - Duration::from_secs(1);
                             }
                         }
@@ -706,10 +754,38 @@ impl LaserController {
                             let _ = socket.send_to(&pkt.encode(), target_addr);
                         }
                         Command::CalibrateHeightSensor => {
-                            log::info!("Initiating capacitive height sensor calibration routine");
-                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                            let pkt = Packet::write_request(s, 2100, vec![1]);
-                            let _ = socket.send_to(&pkt.encode(), target_addr);
+                            log::info!("Initiating capacitive height sensor calibration routine (Port 999 cmd=7)");
+                            pending_z_home_after_cal_stop_at = None;
+                            if let Some(ref zs) = z_socket {
+                                let raw_cal = build_z_calibrate_packet();
+                                send_z_cmd_with_ack(
+                                    zs,
+                                    &raw_cal,
+                                    &mut z_buf,
+                                    &mut z_status_seen,
+                                    &mut latest_z,
+                                );
+                                log::info!("[CAL] Port 999 cmd=7 sent");
+                                cal_monitor = Some(CalibrationMonitor::new(Instant::now()));
+                                {
+                                    let mut st = status_clone.lock().unwrap();
+                                    st.is_calibrating_z = true;
+                                    st.z_state_code = 7;
+                                    st.z_cal_error = None;
+                                    st.z_calibrated_thickness_mm = st.z_material_thickness_mm;
+                                }
+                                last_z_poll = Instant::now() - Duration::from_secs(1);
+                            } else {
+                                log::warn!("[CAL] Cannot calibrate height sensor: Port 999 Z socket is not bound");
+                            }
+                        }
+                        Command::SetZMaterialConfig {
+                            material_thickness_mm,
+                            pulses_per_mm_z,
+                        } => {
+                            let mut st = status_clone.lock().unwrap();
+                            st.z_material_thickness_mm = material_thickness_mm.max(0.0);
+                            st.z_pulses_per_mm = pulses_per_mm_z.max(1.0);
                         }
                         Command::ProbeSurfaceZ => {
                             log::info!("Probing sheet surface Z=0");
@@ -767,12 +843,23 @@ impl LaserController {
                     let _ = socket.send_to(&poll_pkt.encode(), target_addr);
                 }
 
-                // 4. Poll Port 999 Z-axis & height controller status (80ms during Z motion, 300ms idle)
-                let z_poll_interval = if active_z_step_watch.is_some()
+                // 4. Poll Port 999 Z-axis & height controller status (50ms during calibration, 80ms during Z motion, 120ms homing, 300ms idle)
+                let (cal_active, z_busy) = {
+                    let st = status_clone.lock().unwrap();
+                    (
+                        st.is_calibrating_z || cal_monitor.is_some(),
+                        st.is_homing_z || st.z_state_code != 0,
+                    )
+                };
+                let z_poll_interval = if cal_active {
+                    Duration::from_millis(50)
+                } else if active_z_step_watch.is_some()
                     || pending_xy_home_after_z.is_some()
                     || matches!(active_remote_jog, Some((Axis::Z, _)))
                 {
                     Duration::from_millis(80)
+                } else if z_busy {
+                    Duration::from_millis(120)
                 } else {
                     Duration::from_millis(300)
                 };
@@ -903,6 +990,11 @@ impl LaserController {
                                 pending_stop_p2_at =
                                     Some(Instant::now() + Duration::from_millis(140));
                                 if let Some(ref zs) = z_socket {
+                                    let was_calibrating = {
+                                        let st = status_clone.lock().unwrap();
+                                        st.is_calibrating_z || st.z_state_code == 7 || cal_monitor.is_some()
+                                    };
+                                    cal_monitor = None;
                                     let raw_stop = build_z_stop_packet();
                                     send_z_cmd_with_ack(
                                         zs,
@@ -911,6 +1003,17 @@ impl LaserController {
                                         &mut z_status_seen,
                                         &mut latest_z,
                                     );
+                                    let at_upper = {
+                                        let mut st = status_clone.lock().unwrap();
+                                        st.is_calibrating_z = false;
+                                        st.z_pos_sensor
+                                    };
+                                    if was_calibrating && !at_upper {
+                                        pending_z_home_after_cal_stop_at =
+                                            Some(Instant::now() + Duration::from_millis(80));
+                                    } else {
+                                        pending_z_home_after_cal_stop_at = None;
+                                    }
                                     last_z_poll = Instant::now() - Duration::from_secs(1);
                                     telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Stop Z"));
                                 }
@@ -928,20 +1031,28 @@ impl LaserController {
                             } else {
                                 decode_remote_jog(new_st.remote_button_mask)
                             };
-                            if remote_jog != active_remote_jog {
+                            let is_fast = (new_st.remote_button_mask
+                                & remote_buttons::FAST_FLAG)
+                                != 0;
+                            let z_fast_changed = matches!(remote_jog, Some((Axis::Z, _)))
+                                && is_fast != active_remote_z_fast;
+                            if remote_jog != active_remote_jog || z_fast_changed {
                                 // Stop previous remote jog if one was active
                                 if let Some((prev_axis, _)) = active_remote_jog.take() {
                                     if prev_axis == Axis::Z {
-                                        if let Some(ref zs) = z_socket {
-                                            let raw_stop = build_z_stop_packet();
-                                            send_z_cmd_with_ack(
-                                                zs,
-                                                &raw_stop,
-                                                &mut z_buf,
-                                                &mut z_status_seen,
-                                                &mut latest_z,
-                                            );
-                                            last_z_poll = Instant::now() - Duration::from_secs(1);
+                                        active_remote_z_fast = false;
+                                        if !z_fast_changed {
+                                            if let Some(ref zs) = z_socket {
+                                                let raw_stop = build_z_stop_packet();
+                                                send_z_cmd_with_ack(
+                                                    zs,
+                                                    &raw_stop,
+                                                    &mut z_buf,
+                                                    &mut z_status_seen,
+                                                    &mut latest_z,
+                                                );
+                                                last_z_poll = Instant::now() - Duration::from_secs(1);
+                                            }
                                         }
                                     } else {
                                         // If the user tapped a remote XY button very briefly (< 150ms) and released to Idle,
@@ -975,10 +1086,17 @@ impl LaserController {
                                     remote_jog_started_at = Some(Instant::now());
                                     pending_remote_stop_at = None;
                                     if axis == Axis::Z {
+                                        active_remote_z_fast = is_fast;
                                         if let Some(ref zs) = z_socket {
+                                            let normal_z = z_jog_speed.max(120);
+                                            let eff_z_speed = if is_fast {
+                                                normal_z.saturating_mul(3).clamp(280, 450)
+                                            } else {
+                                                normal_z
+                                            };
                                             let raw = build_z_jog_packet(
                                                 dir * CONTINUOUS_JOG_PULSES_Z,
-                                                z_jog_speed,
+                                                eff_z_speed,
                                             );
                                             send_z_cmd_with_ack(
                                                 zs,
@@ -1071,44 +1189,155 @@ impl LaserController {
                                 }
                             }
                             let mut st = status_clone.lock().unwrap();
+                            let prev_pos_z = st.pos_z;
+                            let prev_cap_height = st.capacitive_height_mm;
+                            let prev_cap_pf = st.capacitance_pf;
+                            let prev_raw_cap = st.raw_capacitance;
+                            let prev_z_state = st.z_state_code;
+                            let prev_z_vel = st.z_velocity;
+                            let prev_cal_z = st.is_calibrating_z;
+                            let prev_follower = st.follower_active;
                             let prev_z_homed = st.z_homed;
                             let prev_homing_z = st.is_homing_z;
                             let prev_z_pos_sensor = st.z_pos_sensor;
                             let prev_z_neg_sensor = st.z_neg_sensor;
+                            let prev_z_cal_error = st.z_cal_error.take();
+                            let prev_z_touchdown = st.z_touchdown_pos_z;
+                            let prev_z_cal_thick = st.z_calibrated_thickness_mm;
+                            let prev_z_mat_thick = st.z_material_thickness_mm;
+                            let prev_z_ppm = st.z_pulses_per_mm;
                             *st = new_st;
+                            st.pos_z = prev_pos_z;
+                            st.capacitive_height_mm = prev_cap_height;
+                            st.capacitance_pf = prev_cap_pf;
+                            st.raw_capacitance = prev_raw_cap;
+                            st.z_state_code = prev_z_state;
+                            st.z_velocity = prev_z_vel;
+                            st.is_calibrating_z = prev_cal_z;
+                            st.follower_active = prev_follower;
                             st.z_homed = prev_z_homed;
                             st.is_homing_z = prev_homing_z;
                             st.z_pos_sensor = prev_z_pos_sensor;
                             st.z_neg_sensor = prev_z_neg_sensor;
+                            st.z_cal_error = prev_z_cal_error;
+                            st.z_touchdown_pos_z = prev_z_touchdown;
+                            st.z_calibrated_thickness_mm = prev_z_cal_thick;
+                            st.z_material_thickness_mm = prev_z_mat_thick;
+                            st.z_pulses_per_mm = prev_z_ppm;
                         }
                     }
                 }
 
                 // 6. Receive incoming responses from Port 999 (Z-axis / Capacitive Follower)
                 if let Some(ref zs) = z_socket {
+                    let mut cal_failure: Option<String> = None;
+                    let mut mat_line_stop: Option<String> = None;
+                    let mut orphaned_z_jog = false;
                     while let Ok((n, src)) = zs.recv_from(&mut z_buf) {
                         if src == z_target_addr {
-                            if let Some((pos_z, raw_cap, state_code)) =
-                                decode_z_poll_response(&z_buf[..n])
-                            {
+                            if let Some(zt) = decode_z_poll_telemetry(&z_buf[..n]) {
                                 z_status_seen = true;
-                                latest_z = (pos_z, raw_cap, state_code);
-                                let mut st = status_clone.lock().unwrap();
-                                if board_initialized {
-                                    connected_clone.store(true, Ordering::Relaxed);
-                                    st.is_connected = true;
+                                latest_z = (zt.pos_z, zt.raw_cap, zt.state_code);
+                                let clearance_mm = {
+                                    let mut st = status_clone.lock().unwrap();
+                                    if board_initialized {
+                                        connected_clone.store(true, Ordering::Relaxed);
+                                        st.is_connected = true;
+                                    }
+                                    st.apply_z_telemetry(zt);
+                                    st.z_clearance_above_material_mm()
+                                };
+                                if zt.state_code == 9
+                                    && active_z_step_watch.is_none()
+                                    && !ui_continuous_z_jog
+                                    && !matches!(active_remote_jog, Some((Axis::Z, _)))
+                                {
+                                    orphaned_z_jog = true;
                                 }
-                                st.apply_z_status(pos_z, raw_cap, state_code);
-                                if let Some(zh) = decode_z_homed_from_poll(&z_buf[..n]) {
-                                    st.z_homed = zh;
+                                if let Some(ref mut mon) = cal_monitor {
+                                    if let Err(reason) = mon.check(&zt, Instant::now()) {
+                                        cal_failure = Some(reason);
+                                        break;
+                                    } else if zt.z_velocity > 0
+                                        && clearance_mm.map_or(false, |c| c < -0.35)
+                                    {
+                                        cal_failure = Some(format!(
+                                            "Head went below material line ({:.3} mm) during calibration — pushing against sheet",
+                                            clearance_mm.unwrap_or(0.0)
+                                        ));
+                                        break;
+                                    } else if mon.is_finished(&zt) {
+                                        if let Some(td_z) = mon.touchdown_pos_z() {
+                                            let mut st = status_clone.lock().unwrap();
+                                            st.z_touchdown_pos_z = Some(td_z);
+                                            log::info!(
+                                                "[CAL] Calibration complete: touchdown_pos_z={} pls ({:.3} mm from home, sheet_thickness={:.2} mm)",
+                                                td_z,
+                                                st.z_sheet_surface_mm_from_home().unwrap_or(0.0),
+                                                st.z_calibrated_thickness_mm
+                                            );
+                                        }
+                                        cal_monitor = None;
+                                    }
+                                } else if zt.z_velocity > 0
+                                    && zt.state_code != 7
+                                    && clearance_mm.map_or(false, |c| c < -0.10)
+                                {
+                                    mat_line_stop = Some(format!(
+                                        "Head went below material line ({:.3} mm) — stopped to prevent pushing against sheet",
+                                        clearance_mm.unwrap_or(0.0)
+                                    ));
+                                    break;
                                 }
-                                if let Some((zp, zn)) = decode_z_sensors_from_poll(&z_buf[..n]) {
-                                    st.z_pos_sensor = zp;
-                                    st.z_neg_sensor = zn;
-                                }
-                                st.is_homing_z = state_code == 2 && !st.z_homed;
                             }
                         }
+                    }
+                    if let Some(reason) = cal_failure {
+                        log::error!("[CAL] Calibration failure detected: {} -> stopping & homing Z", reason);
+                        cal_monitor = None;
+                        let raw_stop = build_z_stop_packet();
+                        send_z_cmd_with_ack(
+                            zs,
+                            &raw_stop,
+                            &mut z_buf,
+                            &mut z_status_seen,
+                            &mut latest_z,
+                        );
+                        {
+                            let mut st = status_clone.lock().unwrap();
+                            st.is_calibrating_z = false;
+                            st.z_cal_error = Some(reason);
+                            if !st.z_pos_sensor {
+                                pending_z_home_after_cal_stop_at =
+                                    Some(Instant::now() + Duration::from_millis(80));
+                            }
+                        }
+                        last_z_poll = Instant::now() - Duration::from_secs(1);
+                    } else if let Some(reason) = mat_line_stop {
+                        log::warn!("[Z-GUARD] {}", reason);
+                        active_z_step_watch = None;
+                        active_remote_jog = None;
+                        let raw_stop = build_z_stop_packet();
+                        send_z_cmd_with_ack(
+                            zs,
+                            &raw_stop,
+                            &mut z_buf,
+                            &mut z_status_seen,
+                            &mut latest_z,
+                        );
+                        status_clone.lock().unwrap().z_cal_error = Some(reason);
+                        last_z_poll = Instant::now() - Duration::from_secs(1);
+                    } else if orphaned_z_jog {
+                        log::warn!("[Z-WATCHDOG] Z-axis still jogging with no button held -> sending Stop Z");
+                        let raw_stop = build_z_stop_packet();
+                        send_z_cmd_with_ack(
+                            zs,
+                            &raw_stop,
+                            &mut z_buf,
+                            &mut z_status_seen,
+                            &mut latest_z,
+                        );
+                        last_z_poll = Instant::now() - Duration::from_secs(1);
                     }
                 }
 
@@ -1321,6 +1550,13 @@ impl LaserController {
 
     pub fn set_red_pointer(&self, enable: bool) {
         let _ = self.command_tx.send(Command::SetRedPointer(enable));
+    }
+
+    pub fn set_z_material_config(&self, material_thickness_mm: f64, pulses_per_mm_z: f64) {
+        let _ = self.command_tx.send(Command::SetZMaterialConfig {
+            material_thickness_mm,
+            pulses_per_mm_z,
+        });
     }
 
     pub fn laser_pulse(&self, duration_ms: u32, power_pct: f32) {

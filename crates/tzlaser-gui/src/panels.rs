@@ -1536,7 +1536,7 @@ pub fn render_right_panels(
                 // 1A. Head Position DRO (Moved here from Machine Controls)
                 let pos_x_mm = pulses_cfg.pulses_to_mm_x(status.pos_x);
                 let pos_y_mm = pulses_cfg.pulses_to_mm_y(status.pos_y);
-                let pos_z_mm = pulses_cfg.pulses_to_mm_x(status.pos_z);
+                let pos_z_mm = pulses_cfg.pulses_to_mm_z(status.pos_z);
 
                 Frame::group(ui.style()).fill(Color32::from_rgb(18, 20, 24)).show(ui, |ui| {
                     ui.label(RichText::new("Head Coordinates (WCS)").size(11.0).color(Color32::from_rgb(140, 150, 170)).strong());

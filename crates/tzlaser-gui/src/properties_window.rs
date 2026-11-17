@@ -132,6 +132,8 @@ pub struct AxisPulseCalibState {
     pub commanded_pulses_total: i32,
     pub commanded_signed_mm: f64,
     pub micrometer_reading_mm: f64,
+    pub start_pos_pulses: Option<i32>,
+    pub actual_pulses_delta: i32,
 }
 
 impl AxisPulseCalibState {
@@ -143,14 +145,21 @@ impl AxisPulseCalibState {
             commanded_pulses_total: 0,
             commanded_signed_mm: 0.0,
             micrometer_reading_mm: 1.0,
+            start_pos_pulses: None,
+            actual_pulses_delta: 0,
         }
     }
 
     pub fn computed_pulses_per_unit(&self) -> Option<f64> {
-        if self.commanded_pulses_total == 0 || self.micrometer_reading_mm.abs() <= 1e-4 {
+        let pulses = if self.actual_pulses_delta != 0 {
+            self.actual_pulses_delta
+        } else {
+            self.commanded_pulses_total
+        };
+        if pulses == 0 || self.micrometer_reading_mm.abs() <= 1e-4 {
             return None;
         }
-        Some((self.commanded_pulses_total.abs() as f64) / self.micrometer_reading_mm.abs())
+        Some((pulses.abs() as f64) / self.micrometer_reading_mm.abs())
     }
 }
 
@@ -254,6 +263,7 @@ pub fn render_properties_window(
             state,
             pulse_config,
             controller,
+            status,
             status_message,
         );
     }
@@ -1197,7 +1207,8 @@ fn tick_measure_axis(
         MeasurePhase::RetouchMax => {
             if sensor_triggered && traveled_mm > 0.5 {
                 m.max_pos_2 = cur_pos;
-                let fast_dist = (expected_table_mm - 100.0).max(0.0);
+                let measured_or_expected_mm = m.meas_origin_to_max_mm.unwrap_or(expected_table_mm);
+                let fast_dist = (measured_or_expected_mm - 100.0).max(0.0);
                 if fast_dist > 1.0 {
                     m.phase = MeasurePhase::ReturnFast;
                     m.phase_entered_at = Instant::now();
@@ -1398,18 +1409,26 @@ fn render_measure_axis_dialog(
                             .show(ui, |ui| {
                                 ui.label("1st Measurement (0 → MX):");
                                 ui.label(match m.meas_origin_to_max_mm {
-                                    Some(v) => RichText::new(format!("{:.2} mm", v))
-                                        .strong()
-                                        .color(Color32::from_rgb(120, 220, 255)),
+                                    Some(v) => RichText::new(format!(
+                                        "{:.2} mm  ({} pls)",
+                                        v,
+                                        (m.max_pos_1 - m.origin_pos_1).abs()
+                                    ))
+                                    .strong()
+                                    .color(Color32::from_rgb(120, 220, 255)),
                                     None => RichText::new("Pending...").weak(),
                                 });
                                 ui.end_row();
 
                                 ui.label("2nd Measurement (MX → 0):");
                                 ui.label(match m.meas_max_to_origin_mm {
-                                    Some(v) => RichText::new(format!("{:.2} mm", v))
-                                        .strong()
-                                        .color(Color32::from_rgb(120, 240, 180)),
+                                    Some(v) => RichText::new(format!(
+                                        "{:.2} mm  ({} pls)",
+                                        v,
+                                        (m.max_pos_2 - m.origin_pos_2).abs()
+                                    ))
+                                    .strong()
+                                    .color(Color32::from_rgb(120, 240, 180)),
                                     None => RichText::new("Pending...").weak(),
                                 });
                                 ui.end_row();
@@ -1626,11 +1645,16 @@ fn render_axis_calib_dialog(
     state: &mut PropertiesWindowState,
     pulse_config: &mut PulseConfig,
     controller: &Option<LaserController>,
+    status: &MachineStatus,
     status_message: &mut String,
 ) -> bool {
     let Some(mut d) = state.calib_dialog.take() else {
         return false;
     };
+
+    let cur_axis_pulses = axis_pos_pulses(status, d.axis);
+    let start_pulses = *d.start_pos_pulses.get_or_insert(cur_axis_pulses);
+    d.actual_pulses_delta = cur_axis_pulses - start_pulses;
 
     render_modal_backdrop(ctx, "axis_calib_modal_backdrop");
 
@@ -1766,6 +1790,8 @@ fn render_axis_calib_dialog(
                 {
                     d.commanded_pulses_total = 0;
                     d.commanded_signed_mm = 0.0;
+                    d.start_pos_pulses = Some(cur_axis_pulses);
+                    d.actual_pulses_delta = 0;
                 }
             });
 
@@ -1775,14 +1801,25 @@ fn render_axis_calib_dialog(
                     .num_columns(2)
                     .spacing([14.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Commanded Net Displacement:");
+                        let actual_disp_mm = (d.actual_pulses_delta as f64) / cur_ppm.max(0.001);
+                        ui.label("Actual Displacement:");
                         ui.label(
                             RichText::new(format!(
-                                "{:+.3} {} ({} pulses)",
-                                d.commanded_signed_mm, unit, d.commanded_pulses_total
+                                "{:+.3} {}  ({} pulses)",
+                                actual_disp_mm, unit, d.actual_pulses_delta
                             ))
                             .strong()
                             .color(Color32::from_rgb(130, 215, 255)),
+                        );
+                        ui.end_row();
+
+                        ui.label("Commanded Target:");
+                        ui.label(
+                            RichText::new(format!(
+                                "{:+.3} {}  ({} pulses)",
+                                d.commanded_signed_mm, unit, d.commanded_pulses_total
+                            ))
+                            .color(Color32::from_rgb(175, 190, 210)),
                         );
                         ui.end_row();
 

@@ -23,7 +23,7 @@ pub const CONTINUOUS_JOG_PULSES_XY: i32 = 472_000;
 pub const CONTINUOUS_JOG_PULSES_Z: i32 = 1_000_000;
 
 /// Default Z-axis jog speed register value on Port 999 (SC2000 `ZFFastJogSpeed = 50`).
-pub const DEFAULT_Z_JOG_SPEED: u32 = 50;
+pub const DEFAULT_Z_JOG_SPEED: u32 = 120;
 
 /// Wireless remote control button bitmasks reported by the controller board in `R1042` (`regs[42]`)
 /// (`RegName43` = LCR real-time key value) and mirrored in `R1043` (`regs[43]`, `RegName44` = LCR matched code value).
@@ -270,18 +270,32 @@ pub struct MachineStatus {
     pub gas_pressure_bar: f32,
     pub capacitive_height_mm: f32,
     pub capacitance_pf: f32,
+    pub raw_capacitance: u32,
     pub follower_active: bool,
     pub remote_button_mask: u32,
     pub xy_homed: bool,
     pub z_homed: bool,
     pub is_homing_xy: bool,
     pub is_homing_z: bool,
+    pub is_calibrating_z: bool,
+    pub z_state_code: u32,
+    pub z_velocity: i32,
     pub is_moving: bool,
     pub z_pos_sensor: bool,
     pub z_neg_sensor: bool,
     /// Upper byte of `R1002` (`(regs[2] >> 16) & 0xFF`): hardware limit sensor bitmask
     /// (observed: `0x01` = X+, `0x02` = X-, `0x90` = Y1-/Y2- dual-drive).
     pub limit_sensor_mask: u32,
+    /// Safety error message if capacitive height calibration failed or detected a sheet collision.
+    pub z_cal_error: Option<String>,
+    /// Recorded Z pulse position at sheet touchdown during the last completed calibration.
+    pub z_touchdown_pos_z: Option<i32>,
+    /// Sheet thickness (mm) present on the bed when `z_touchdown_pos_z` was recorded.
+    pub z_calibrated_thickness_mm: f64,
+    /// Current material thickness (mm) entered by the operator for material-line detection.
+    pub z_material_thickness_mm: f64,
+    /// Z-axis displacement scaling in pulses per mm (e.g., 2000.0).
+    pub z_pulses_per_mm: f64,
     pub raw_registers: Vec<u32>,
 }
 
@@ -302,16 +316,25 @@ impl Default for MachineStatus {
             gas_pressure_bar: 0.0,
             capacitive_height_mm: 50.0,
             capacitance_pf: 12.4,
+            raw_capacitance: 0,
             follower_active: false,
             remote_button_mask: 0,
             xy_homed: false,
             z_homed: false,
             is_homing_xy: false,
             is_homing_z: false,
+            is_calibrating_z: false,
+            z_state_code: 0,
+            z_velocity: 0,
             is_moving: false,
             z_pos_sensor: false,
             z_neg_sensor: false,
             limit_sensor_mask: 0,
+            z_cal_error: None,
+            z_touchdown_pos_z: None,
+            z_calibrated_thickness_mm: 1.0,
+            z_material_thickness_mm: 1.0,
+            z_pulses_per_mm: 2_000.0,
             raw_registers: Vec::new(),
         }
     }
@@ -381,12 +404,65 @@ impl MachineStatus {
             z_homed: false,
             is_homing_xy,
             is_homing_z: false,
+            is_calibrating_z: false,
             is_moving,
             z_pos_sensor: false,
             z_neg_sensor: false,
             limit_sensor_mask,
+            raw_capacitance: 0,
+            z_state_code: 0,
+            z_velocity: 0,
+            z_cal_error: None,
+            z_touchdown_pos_z: None,
+            z_calibrated_thickness_mm: 1.0,
+            z_material_thickness_mm: 1.0,
+            z_pulses_per_mm: 2_000.0,
             raw_registers: regs.to_vec(),
         }
+    }
+
+    /// Current Z displacement downward from upper Z-home in mm (`pos_z` is negative downward).
+    pub fn z_mm_from_home(&self) -> f64 {
+        -(self.pos_z as f64) / self.z_pulses_per_mm.max(1.0)
+    }
+
+    /// Recorded sheet top surface position (mm below Z-home) from the last calibration, if any.
+    pub fn z_sheet_surface_mm_from_home(&self) -> Option<f64> {
+        self.z_touchdown_pos_z
+            .map(|pz| -(pz as f64) / self.z_pulses_per_mm.max(1.0))
+    }
+
+    /// Computed table/bed surface position (mm below Z-home) from touchdown + calibrated sheet thickness.
+    pub fn z_bed_mm_from_home(&self) -> Option<f64> {
+        self.z_sheet_surface_mm_from_home()
+            .map(|surf| surf + self.z_calibrated_thickness_mm.max(0.0))
+    }
+
+    /// Computed material-line Z position (pulses) for the current `z_material_thickness_mm`.
+    pub fn z_material_line_pos_z(&self) -> Option<i32> {
+        let td = self.z_touchdown_pos_z?;
+        let ppm = self.z_pulses_per_mm.max(1.0);
+        let bed_pos_z = (td as f64) - self.z_calibrated_thickness_mm.max(0.0) * ppm;
+        let mat_line_pos_z = bed_pos_z + self.z_material_thickness_mm.max(0.0) * ppm;
+        Some(mat_line_pos_z.round() as i32)
+    }
+
+    /// Computed material-line distance (mm below Z-home) for the current `z_material_thickness_mm`.
+    pub fn z_material_line_mm_from_home(&self) -> Option<f64> {
+        self.z_bed_mm_from_home()
+            .map(|bed| bed - self.z_material_thickness_mm.max(0.0))
+    }
+
+    /// Signed clearance above the material line in mm (`> 0` = safely above sheet, `< 0` = below material line / pushing sheet).
+    pub fn z_clearance_above_material_mm(&self) -> Option<f64> {
+        let mat_z = self.z_material_line_pos_z()?;
+        Some(((self.pos_z - mat_z) as f64) / self.z_pulses_per_mm.max(1.0))
+    }
+
+    /// Returns `true` if the cutting head is more than `0.05 mm` below the calibrated material line.
+    pub fn is_below_material_line(&self) -> bool {
+        self.z_clearance_above_material_mm()
+            .map_or(false, |c| c < -0.05)
     }
 
     /// Returns true if any limit sensor on `axis` is currently active in `R1002`.
@@ -425,11 +501,30 @@ impl MachineStatus {
     /// Merge status decoded from the Port 999 Z-axis / capacitive follower poll response.
     pub fn apply_z_status(&mut self, pos_z: i32, raw_cap: u32, follower_state: u32) {
         self.pos_z = pos_z;
+        self.raw_capacitance = raw_cap;
+        self.z_state_code = follower_state;
         if raw_cap > 0 {
             self.capacitance_pf = (raw_cap as f32) / 10_000.0;
         }
         self.capacitive_height_mm = ((pos_z as f32).abs() / 1_000.0).clamp(0.0, 150.0);
         self.follower_active = follower_state == 2;
+        self.is_calibrating_z = follower_state == 7;
+    }
+
+    /// Merge full Port 999 Z-axis / capacitive height sensor telemetry decoded from `010380...`.
+    pub fn apply_z_telemetry(&mut self, zt: ZPollTelemetry) {
+        self.pos_z = zt.pos_z;
+        self.raw_capacitance = zt.raw_cap;
+        self.z_state_code = zt.state_code;
+        self.z_velocity = zt.z_velocity;
+        self.capacitance_pf = (zt.raw_cap as f32) / 10_000.0;
+        self.capacitive_height_mm = (zt.height_um as f32) / 1_000.0;
+        self.follower_active = zt.state_code == 2;
+        self.z_homed = zt.z_homed;
+        self.z_pos_sensor = zt.z_pos_sensor;
+        self.z_neg_sensor = zt.z_neg_sensor;
+        self.is_homing_z = zt.state_code == 2 && !zt.z_homed;
+        self.is_calibrating_z = zt.state_code == 7;
     }
 }
 
@@ -755,6 +850,17 @@ pub fn build_z_home_packet() -> Vec<u8> {
     encode_modbus_rtu(&body)
 }
 
+/// Build a Port 999 Z-axis capacitive height sensor calibration packet (`cmd = 7`).
+/// The Z-controller runs fast descent (`+300`) until capacitance changes, slow 10% descent (`+30`)
+/// to sheet touchdown (`D7=0`, `D8=0`), slow retract (`-30`), and fast Z-home (`-300`).
+/// Matches SC2000 packet: `01100065000204000700008479`.
+pub fn build_z_calibrate_packet() -> Vec<u8> {
+    let body: [u8; 11] = [
+        0x01, 0x10, 0x00, 0x65, 0x00, 0x02, 0x04, 0x00, 0x07, 0x00, 0x00,
+    ];
+    encode_modbus_rtu(&body)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct HomeConfig {
     /// +1 = home X toward +X (Right), -1 = home X toward -X (Left)
@@ -858,6 +964,195 @@ pub fn decode_z_sensors_from_poll(bytes: &[u8]) -> Option<(bool, bool)> {
 /// Note: Hardware `D9` is 0 at the top limit and becomes negative as the head moves down
 /// (or decreases when raw negative pulses raise the head), so we negate `D9` so `pos_z`
 /// increases when `Z+` raises the head and decreases when `Z-` lowers the head.
+/// Live telemetry decoded from a Port 999 `010380...` Z-controller poll response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZPollTelemetry {
+    pub pos_z: i32,
+    pub raw_cap: u32,
+    pub height_um: u32,
+    pub state_code: u32,
+    pub z_velocity: i32,
+    pub z_homed: bool,
+    pub z_pos_sensor: bool,
+    pub z_neg_sensor: bool,
+}
+
+/// Monitors Port 999 telemetry during capacitive height sensor calibration (`cmd = 7`)
+/// to detect nozzle collisions, sheet pressing, or sensor faults before hardware damage occurs.
+#[derive(Debug, Clone)]
+pub struct CalibrationMonitor {
+    baseline_cap: Option<u32>,
+    last_motion_pos_z: Option<i32>,
+    last_motion_at: std::time::Instant,
+    downward_started_at: Option<std::time::Instant>,
+    touchdown_while_driving_at: Option<std::time::Instant>,
+    saw_active_cal_state: bool,
+    touchdown_pos_z: Option<i32>,
+    min_pos_z: Option<i32>,
+}
+
+impl CalibrationMonitor {
+    pub fn new(now: std::time::Instant) -> Self {
+        Self {
+            baseline_cap: None,
+            last_motion_pos_z: None,
+            last_motion_at: now,
+            downward_started_at: None,
+            touchdown_while_driving_at: None,
+            saw_active_cal_state: false,
+            touchdown_pos_z: None,
+            min_pos_z: None,
+        }
+    }
+
+    /// Returns the Z pulse position recorded at touchdown (or lowest Z reached during calibration).
+    pub fn touchdown_pos_z(&self) -> Option<i32> {
+        self.touchdown_pos_z.or(self.min_pos_z)
+    }
+
+    /// Returns true once calibration has entered `state_code == 7` and then cleanly returned to idle (`0`).
+    pub fn is_finished(&self, zt: &ZPollTelemetry) -> bool {
+        self.saw_active_cal_state && zt.state_code == 0 && zt.z_velocity == 0
+    }
+
+    /// Inspect a fresh Port 999 poll sample. Returns `Err(reason)` if calibration is failing
+    /// or pressing into the sheet and must be aborted + Z-homed immediately.
+    pub fn check(&mut self, zt: &ZPollTelemetry, now: std::time::Instant) -> Result<(), String> {
+        if zt.state_code == 7 {
+            self.saw_active_cal_state = true;
+            self.min_pos_z = Some(match self.min_pos_z {
+                Some(prev) => prev.min(zt.pos_z),
+                None => zt.pos_z,
+            });
+            if zt.raw_cap == 0 || zt.height_um == 0 {
+                self.touchdown_pos_z = Some(match self.touchdown_pos_z {
+                    Some(prev) => prev.min(zt.pos_z),
+                    None => zt.pos_z,
+                });
+            }
+        }
+        // Only check once the controller has entered calibration or started driving down.
+        if !self.saw_active_cal_state && zt.z_velocity <= 0 {
+            return Ok(());
+        }
+
+        if zt.z_neg_sensor {
+            return Err(format!(
+                "Nozzle collision / Z- limit triggered (raw_cap={})",
+                zt.raw_cap
+            ));
+        }
+
+        if self.baseline_cap.is_none() && zt.raw_cap > 10_000 {
+            self.baseline_cap = Some(zt.raw_cap);
+        }
+        if let Some(base) = self.baseline_cap {
+            if zt.z_velocity > 0 && zt.raw_cap > base.saturating_mul(3) / 2 {
+                return Err(format!(
+                    "Abnormal capacitance spike ({} vs baseline {}) — possible nozzle contact/short",
+                    zt.raw_cap, base
+                ));
+            }
+        }
+
+        if zt.z_velocity > 0 {
+            let down_start = *self.downward_started_at.get_or_insert(now);
+            if now.duration_since(down_start) > std::time::Duration::from_secs(40) {
+                return Err("Calibration downward timeout (>40s without touchdown)".to_string());
+            }
+
+            // Fast descent (>100) into zero/near-zero height means it failed to slow to 10%.
+            if zt.z_velocity > 100 && (zt.raw_cap == 0 || zt.height_um < 500) {
+                return Err(format!(
+                    "Fast descent hit near-sheet zone without slowing (vel={}, height_um={}, raw_cap={})",
+                    zt.z_velocity, zt.height_um, zt.raw_cap
+                ));
+            }
+
+            // Touchdown (raw_cap == 0 or height_um == 0) while still commanding downward velocity.
+            if zt.raw_cap == 0 || zt.height_um == 0 {
+                let td_at = *self.touchdown_while_driving_at.get_or_insert(now);
+                if now.duration_since(td_at) >= std::time::Duration::from_millis(250) {
+                    return Err(
+                        "Touchdown detected while Z still driving downward (pressing against sheet)"
+                            .to_string(),
+                    );
+                }
+            } else {
+                self.touchdown_while_driving_at = None;
+            }
+
+            // Mechanical stall check: commanding downward motion, yet pos_z stops changing.
+            match self.last_motion_pos_z {
+                None => {
+                    self.last_motion_pos_z = Some(zt.pos_z);
+                    self.last_motion_at = now;
+                }
+                Some(prev_z) => {
+                    if (zt.pos_z - prev_z).abs() >= 25 {
+                        self.last_motion_pos_z = Some(zt.pos_z);
+                        self.last_motion_at = now;
+                    } else if now.duration_since(self.last_motion_at)
+                        >= std::time::Duration::from_millis(450)
+                    {
+                        return Err(format!(
+                            "Z-axis stalled while driving down (pos_z={} pls, vel={}) — pressing against sheet",
+                            zt.pos_z, zt.z_velocity
+                        ));
+                    }
+                }
+            }
+        } else {
+            // Stopped or retracting upward: reset downward timers.
+            self.downward_started_at = None;
+            self.touchdown_while_driving_at = None;
+            self.last_motion_pos_z = Some(zt.pos_z);
+            self.last_motion_at = now;
+        }
+
+        Ok(())
+    }
+}
+
+/// Decode full Port 999 `010380...` Z-controller telemetry.
+pub fn decode_z_poll_telemetry(bytes: &[u8]) -> Option<ZPollTelemetry> {
+    if bytes.len() < 133 || bytes[0] != 0x01 || bytes[1] != 0x03 || bytes[2] != 0x80 {
+        return None;
+    }
+    let received_crc = u16::from_le_bytes([bytes[131], bytes[132]]);
+    let computed_crc = modbus_crc16(&bytes[..131]);
+    if received_crc != computed_crc {
+        return None;
+    }
+
+    let read_dword_ws = |dword_idx: usize| -> u32 {
+        let base = 3 + dword_idx * 4;
+        let w0 = u16::from_be_bytes([bytes[base], bytes[base + 1]]) as u32;
+        let w1 = u16::from_be_bytes([bytes[base + 2], bytes[base + 3]]) as u32;
+        (w1 << 16) | w0
+    };
+
+    let d2 = read_dword_ws(2);
+    let d3 = read_dword_ws(3);
+    let d5 = read_dword_ws(5);
+    let state_code = read_dword_ws(6);
+    let raw_cap = read_dword_ws(7);
+    let height_um = read_dword_ws(8);
+    let raw_d9 = read_dword_ws(9) as i32;
+    let z_velocity = read_dword_ws(12) as i32;
+
+    Some(ZPollTelemetry {
+        pos_z: raw_d9.saturating_neg(),
+        raw_cap,
+        height_um,
+        state_code,
+        z_velocity,
+        z_homed: (d5 & 0x01) != 0,
+        z_pos_sensor: d2 != 0 || (d5 & 0x10) != 0,
+        z_neg_sensor: d3 != 0 || raw_cap > 650_000,
+    })
+}
+
 pub fn decode_z_poll_response(bytes: &[u8]) -> Option<(i32, u32, u32)> {
     if bytes.len() < 133 || bytes[0] != 0x01 || bytes[1] != 0x03 || bytes[2] != 0x80 {
         return None;
@@ -1033,6 +1328,117 @@ mod tests {
             decode_z_sensors_from_poll(&make_poll(0, 1, 0, 0x8000_0001, 383_162)),
             Some((false, true))
         );
+    }
+
+    #[test]
+    fn test_z_calibrate_packet_and_telemetry_decode() {
+        assert_eq!(
+            hex::encode(build_z_calibrate_packet()),
+            "01100065000204000700008479"
+        );
+
+        let mut buf = vec![0u8; 133];
+        buf[0] = 0x01;
+        buf[1] = 0x03;
+        buf[2] = 0x80;
+        let mut write_dw = |idx: usize, val: u32| {
+            let base = 3 + idx * 4;
+            let w0 = (val & 0xFFFF) as u16;
+            let w1 = ((val >> 16) & 0xFFFF) as u16;
+            buf[base..base + 2].copy_from_slice(&w0.to_be_bytes());
+            buf[base + 2..base + 4].copy_from_slice(&w1.to_be_bytes());
+        };
+        write_dw(5, 0x8000_0011); // homed + Z+ limit sensor bit 0x10
+        write_dw(6, 7);           // state_code = 7 (Calibrating)
+        write_dw(7, 383_200);     // raw_cap
+        write_dw(8, 12_345);      // height_um = 12.345 mm
+        write_dw(9, 15_000);      // raw_d9 -> pos_z = -15_000
+        write_dw(12, 30);         // z_velocity = +30 (10% slow descent)
+        let crc = modbus_crc16(&buf[..131]);
+        buf[131..133].copy_from_slice(&crc.to_le_bytes());
+
+        let zt = decode_z_poll_telemetry(&buf).expect("valid Z poll telemetry");
+        assert_eq!(zt.state_code, 7);
+        assert_eq!(zt.raw_cap, 383_200);
+        assert_eq!(zt.height_um, 12_345);
+        assert_eq!(zt.pos_z, -15_000);
+        assert_eq!(zt.z_velocity, 30);
+        assert!(zt.z_homed);
+        assert!(zt.z_pos_sensor);
+        assert!(!zt.z_neg_sensor);
+
+        let mut st = MachineStatus::default();
+        st.apply_z_telemetry(zt);
+        assert!(st.is_calibrating_z);
+        assert_eq!(st.z_state_code, 7);
+        assert_eq!(st.raw_capacitance, 383_200);
+        assert!((st.capacitive_height_mm - 12.345).abs() < 0.001);
+        assert_eq!(st.z_velocity, 30);
+    }
+
+    #[test]
+    fn test_calibration_monitor_detects_sheet_press_and_allows_normal_cycle() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let make_zt = |pos_z: i32, raw_cap: u32, height_um: u32, z_vel: i32, z_neg: bool| ZPollTelemetry {
+            pos_z,
+            raw_cap,
+            height_um,
+            state_code: 7,
+            z_velocity: z_vel,
+            z_homed: false,
+            z_pos_sensor: false,
+            z_neg_sensor: z_neg,
+        };
+
+        // Normal calibration: fast descent -> slow descent -> brief touchdown -> retract
+        let mut mon = CalibrationMonitor::new(t0);
+        assert!(mon.check(&make_zt(-5_000, 383_200, 25_000, 300, false), t0 + Duration::from_millis(100)).is_ok());
+        assert!(mon.check(&make_zt(-20_000, 350_000, 12_000, 30, false), t0 + Duration::from_millis(300)).is_ok());
+        assert!(mon.check(&make_zt(-25_000, 0, 0, 30, false), t0 + Duration::from_millis(400)).is_ok());
+        assert!(mon.check(&make_zt(-25_000, 0, 0, -30, false), t0 + Duration::from_millis(500)).is_ok());
+
+        // Failure 1: Z stalls while driving downward (pressing against sheet)
+        let mut mon_stall = CalibrationMonitor::new(t0);
+        assert!(mon_stall.check(&make_zt(-25_000, 120_000, 2_000, 30, false), t0).is_ok());
+        let err = mon_stall
+            .check(&make_zt(-25_005, 120_000, 2_000, 30, false), t0 + Duration::from_millis(500))
+            .unwrap_err();
+        assert!(err.contains("stalled"));
+
+        // Failure 2: touchdown (raw_cap == 0) persists >250ms while z_velocity > 0
+        let mut mon_td = CalibrationMonitor::new(t0);
+        assert!(mon_td.check(&make_zt(-25_000, 0, 0, 30, false), t0).is_ok());
+        let err = mon_td
+            .check(&make_zt(-25_200, 0, 0, 30, false), t0 + Duration::from_millis(300))
+            .unwrap_err();
+        assert!(err.contains("pressing against sheet"));
+
+        // Failure 3: fast descent crashes into zero-height zone without slowing
+        let mut mon_fast = CalibrationMonitor::new(t0);
+        let err = mon_fast
+            .check(&make_zt(-10_000, 383_200, 200, 300, false), t0 + Duration::from_millis(100))
+            .unwrap_err();
+        assert!(err.contains("Fast descent"));
+
+        // Material-line math at 2000 pulses/mm with a 1.0 mm sheet calibrated at -50,000 pls (25.0 mm down)
+        let mut st = MachineStatus::default();
+        st.z_pulses_per_mm = 2_000.0;
+        st.z_calibrated_thickness_mm = 1.0;
+        st.z_material_thickness_mm = 1.0;
+        st.z_touchdown_pos_z = Some(-50_000);
+        assert!((st.z_sheet_surface_mm_from_home().unwrap() - 25.0).abs() < 1e-6);
+        assert!((st.z_bed_mm_from_home().unwrap() - 26.0).abs() < 1e-6);
+        assert_eq!(st.z_material_line_pos_z(), Some(-50_000));
+
+        st.pos_z = -48_000; // 1.0 mm above sheet
+        assert!((st.z_clearance_above_material_mm().unwrap() - 1.0).abs() < 1e-6);
+        assert!(!st.is_below_material_line());
+
+        st.pos_z = -50_400; // 0.2 mm below material line (pushing into 1.0 mm sheet)
+        assert!((st.z_clearance_above_material_mm().unwrap() + 0.2).abs() < 1e-6);
+        assert!(st.is_below_material_line());
     }
 }
 

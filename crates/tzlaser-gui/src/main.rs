@@ -321,11 +321,17 @@ impl eframe::App for TzlaserApp {
         }
 
         // Enforce cutting-area bounds on the head position every frame.
-        // Skip while hardware is unhomed (unreferenced coordinates) or actively homing.
+        // Skip while hardware is unhomed (unreferenced coordinates), actively homing,
+        // or running a physical table-axis measurement.
+        let measuring_axis = self
+            .props_window_state
+            .measure_axis
+            .as_ref()
+            .is_some_and(|m| m.is_running());
         let can_enforce_bounds = if hw_connected {
-            self.status.xy_homed && !self.status.is_homing_xy && !self.status.is_homing_z
+            self.status.xy_homed && !self.status.is_homing_xy && !self.status.is_homing_z && !measuring_axis
         } else {
-            true
+            !measuring_axis
         };
         if can_enforce_bounds && (self.status.pos_x != 0 || self.status.pos_y != 0) {
             let head_world = panels::head_world_mm(&self.status, &self.pulse_config);
@@ -748,6 +754,235 @@ impl eframe::App for TzlaserApp {
                 });
             if close_prompt {
                 self.panel_state.show_home_prompt = false;
+            }
+        }
+
+        // 9. Capacitive Height Sensor Calibration Dialog
+        if self.ribbon_state.show_sensor_cal_dialog {
+            let mut close_cal_dialog = false;
+            let is_calibrating = self.status.is_calibrating_z || self.status.z_state_code == 7;
+            if self.ribbon_state.sensor_cal_started && !is_calibrating && self.status.z_state_code == 0 {
+                if !self.status.z_pos_sensor && !self.status.z_homed {
+                    self.ribbon_state.sensor_cal_aborted = true;
+                }
+            }
+
+            let (phase_text, phase_color): (String, Color32) = if let Some(ref err) = self.status.z_cal_error {
+                let suffix = if self.status.is_homing_z || self.status.z_state_code == 2 {
+                    " — retracting Z-axis to home..."
+                } else if self.status.z_pos_sensor || self.status.z_homed {
+                    " — Z-axis returned to home."
+                } else {
+                    ""
+                };
+                (format!("Calibration FAILED: {}{}", err, suffix), Color32::from_rgb(255, 95, 95))
+            } else if is_calibrating {
+                if self.status.z_velocity > 100 {
+                    ("Phase 1/3: Fast Descent (Z-homing speed) — searching for sheet...".to_string(), Color32::from_rgb(100, 200, 255))
+                } else if self.status.z_velocity > 0 {
+                    ("Phase 2/3: Slow Touchdown (10% speed) — approaching sheet...".to_string(), Color32::from_rgb(255, 210, 80))
+                } else if self.status.z_velocity == 0 && self.status.raw_capacitance == 0 {
+                    ("Touchdown detected! Recording surface zero...".to_string(), Color32::from_rgb(120, 235, 180))
+                } else if self.status.z_velocity < 0 && self.status.z_velocity > -100 {
+                    ("Phase 3/3: Slow Retract off sheet...".to_string(), Color32::from_rgb(160, 220, 255))
+                } else if self.status.z_velocity <= -100 {
+                    ("Phase 3/3: Fast Z-Home Retract to upper limit...".to_string(), Color32::from_rgb(120, 200, 255))
+                } else {
+                    ("Calibrating capacitive height sensor...".to_string(), Color32::from_rgb(255, 215, 0))
+                }
+            } else if self.ribbon_state.sensor_cal_aborted {
+                if self.status.is_homing_z || self.status.z_state_code == 2 {
+                    ("Calibration STOPPED — returning Z-axis to home (max height)...".to_string(), Color32::from_rgb(255, 165, 80))
+                } else if self.status.z_pos_sensor || self.status.z_homed {
+                    ("Calibration STOPPED — Z-axis returned to home.".to_string(), Color32::from_rgb(255, 120, 120))
+                } else {
+                    ("Calibration STOPPED.".to_string(), Color32::from_rgb(255, 110, 110))
+                }
+            } else if self.ribbon_state.sensor_cal_started && (self.status.z_homed || self.status.z_pos_sensor) {
+                ("Calibration COMPLETE — head returned to upper Z-home.".to_string(), Color32::from_rgb(120, 235, 180))
+            } else {
+                ("Ready. Descends at Z-homing speed, slows to 10% near sheet for touchdown, then Z-homes.".to_string(), Color32::from_rgb(200, 210, 225))
+            };
+
+            egui::Window::new("🎯 Capacitive Height Sensor Calibration")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(470.0);
+                    ui.label(RichText::new(phase_text).size(13.0).strong().color(phase_color));
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // Sync Z scale & material thickness to controller when changed or when dialog is open
+                    let ppm_z = self.pulse_config.pulses_per_mm_z.max(1.0);
+                    if (self.status.z_material_thickness_mm - self.ribbon_state.cal_material_thickness_mm).abs() > 1e-4
+                        || (self.status.z_pulses_per_mm - ppm_z).abs() > 1e-3
+                    {
+                        if let Some(ref c) = self.controller {
+                            c.set_z_material_config(self.ribbon_state.cal_material_thickness_mm, ppm_z);
+                        }
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Material Thickness (mm):").strong())
+                            .on_hover_text("Thickness of the metal sheet under the laser head.\nUsed with Z pulses/mm after calibration to compute the sheet top ('material line') and bed depth.");
+                        let thick_resp = ui.add(
+                            egui::DragValue::new(&mut self.ribbon_state.cal_material_thickness_mm)
+                                .speed(0.05)
+                                .range(0.0..=50.0)
+                                .fixed_decimals(2)
+                                .suffix(" mm"),
+                        );
+                        if thick_resp.changed() {
+                            if let Some(ref c) = self.controller {
+                                c.set_z_material_config(self.ribbon_state.cal_material_thickness_mm, ppm_z);
+                            }
+                        }
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(format!("Z Scale: {:.0} pls/mm", ppm_z))
+                                .size(11.5)
+                                .color(Color32::from_rgb(165, 180, 200)),
+                        )
+                        .on_hover_text("Z-axis displacement calibration from Machine Settings (pulses per mm).");
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    let z_down_mm = -(self.status.pos_z as f64) / ppm_z;
+
+                    egui::Grid::new("sensor_cal_telemetry_grid")
+                        .num_columns(2)
+                        .spacing([24.0, 6.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Sensor Height Above Sheet (D8)").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Live calibrated capacitive distance from nozzle tip to the metal sheet (0.000 mm = touchdown, 25.000 mm = out of range).");
+                            ui.label(RichText::new(format!("{:.3} mm", self.status.capacitive_height_mm)).strong().monospace());
+                            ui.end_row();
+
+                            ui.label(RichText::new("Raw Capacitance Reading (D7)").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Raw capacitive sensor counts from the Z board (~383,200 in open air, drops toward 0 at sheet touchdown).");
+                            ui.label(RichText::new(format!("{}  ({:.2} pF)", self.status.raw_capacitance, self.status.capacitance_pf)).monospace());
+                            ui.end_row();
+
+                            ui.label(RichText::new("Z-Axis Position From Home (D9)").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Live Z-axis displacement downward from upper Z-home, converted using Z pulses/mm.");
+                            ui.label(RichText::new(format!("{:.3} mm  ({} pls)", z_down_mm, self.status.pos_z)).monospace());
+                            ui.end_row();
+
+                            ui.label(RichText::new("Z-Axis Velocity Command (D12)").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Live motor velocity command on Port 999:\n+300 = Fast descent\n+30 = 10% slow touchdown\n-30 = Slow retract\n-300 = Fast Z-home up");
+                            ui.label(RichText::new(format!("{}", self.status.z_velocity)).monospace());
+                            ui.end_row();
+
+                            ui.label(RichText::new("Z Controller Mode (D6)").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Internal state code reported by the Port 999 Z-axis / capacitive follower controller.");
+                            ui.label(RichText::new(format!("{} ({})", self.status.z_state_code, match self.status.z_state_code {
+                                0 => "Idle",
+                                2 => "Homing",
+                                7 => "Calibrating",
+                                9 => "Jogging",
+                                _ => "Active",
+                            })).monospace());
+                            ui.end_row();
+
+                            ui.label(RichText::new("Upper Z+ Home Limit Switch (D5)").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Upper Z-axis home sensor state (TRIGGERED when head is at max height).");
+                            let (sensor_lbl, sensor_col) = if self.status.z_pos_sensor {
+                                ("TRIGGERED", Color32::from_rgb(120, 235, 180))
+                            } else {
+                                ("Clear", Color32::from_rgb(180, 190, 205))
+                            };
+                            ui.label(RichText::new(sensor_lbl).color(sensor_col).monospace());
+                            ui.end_row();
+
+                            ui.label(RichText::new("Calibrated Material Line").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Sheet top surface ('material line') and table bed depth below Z-home, computed from the last completed calibration touchdown + Material Thickness.");
+                            if let (Some(mat_mm), Some(bed_mm)) = (
+                                self.status.z_material_line_mm_from_home(),
+                                self.status.z_bed_mm_from_home(),
+                            ) {
+                                ui.label(RichText::new(format!("{:.3} mm from home  (Bed: {:.3} mm)", mat_mm, bed_mm)).monospace());
+                            } else {
+                                ui.label(RichText::new("Not calibrated yet").color(Color32::from_rgb(150, 160, 175)).monospace());
+                            }
+                            ui.end_row();
+
+                            ui.label(RichText::new("Material Line Clearance").color(Color32::from_rgb(175, 185, 200)))
+                                .on_hover_text("Distance of the laser head above the calibrated material line.\nNegative values mean the head is BELOW the material line and pushing against the sheet!");
+                            if let Some(clearance) = self.status.z_clearance_above_material_mm() {
+                                if self.status.is_below_material_line() {
+                                    ui.label(
+                                        RichText::new(format!("⚠ BELOW MATERIAL LINE ({:.3} mm) — PUSHING SHEET!", clearance))
+                                            .strong()
+                                            .color(Color32::from_rgb(255, 85, 85))
+                                            .monospace(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!("{:+.3} mm above sheet", clearance))
+                                            .color(Color32::from_rgb(120, 235, 180))
+                                            .monospace(),
+                                    );
+                                }
+                            } else {
+                                ui.label(RichText::new("--").color(Color32::from_rgb(150, 160, 175)).monospace());
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        let can_start = self.controller.is_some() && self.status.is_connected && !is_calibrating;
+                        let start_btn = egui::Button::new(
+                            RichText::new("▶ Start Calibration").color(Color32::WHITE).strong(),
+                        )
+                        .fill(if can_start { Color32::from_rgb(28, 125, 78) } else { Color32::from_rgb(45, 55, 50) })
+                        .min_size(egui::Vec2::new(140.0, 30.0));
+                        if ui.add_enabled(can_start, start_btn).clicked() {
+                            if let Some(ref c) = self.controller {
+                                c.set_z_material_config(self.ribbon_state.cal_material_thickness_mm, ppm_z);
+                                c.calibrate_height_sensor();
+                                self.ribbon_state.sensor_cal_started = true;
+                                self.ribbon_state.sensor_cal_aborted = false;
+                                self.status_message = "Height sensor calibration started (fast descent -> 10% slow touchdown -> Z-home)...".to_string();
+                            }
+                        }
+
+                        let stop_btn = egui::Button::new(
+                            RichText::new("⏹ STOP").color(Color32::WHITE).strong(),
+                        )
+                        .fill(Color32::from_rgb(185, 38, 38))
+                        .min_size(egui::Vec2::new(96.0, 30.0));
+                        if ui.add_enabled(self.controller.is_some(), stop_btn).clicked() {
+                            if let Some(ref c) = self.controller {
+                                c.stop();
+                                self.ribbon_state.sensor_cal_aborted = true;
+                                self.ribbon_state.sensor_cal_started = false;
+                                self.status_message = "Height sensor calibration stopped.".to_string();
+                            }
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let close_btn = egui::Button::new(RichText::new("Close").size(12.0))
+                                .fill(Color32::from_rgb(48, 52, 62))
+                                .min_size(egui::Vec2::new(72.0, 30.0));
+                            if ui.add(close_btn).clicked() {
+                                close_cal_dialog = true;
+                            }
+                        });
+                    });
+                });
+
+            if close_cal_dialog {
+                self.ribbon_state.show_sensor_cal_dialog = false;
             }
         }
 

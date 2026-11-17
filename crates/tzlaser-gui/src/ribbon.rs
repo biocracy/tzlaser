@@ -46,6 +46,10 @@ pub struct RibbonState {
     pub draw_line_deg: f64,
     pub draw_ellipse_rx: f64,
     pub draw_ellipse_ry: f64,
+    pub show_sensor_cal_dialog: bool,
+    pub sensor_cal_started: bool,
+    pub sensor_cal_aborted: bool,
+    pub cal_material_thickness_mm: f64,
 }
 
 impl Default for RibbonState {
@@ -66,6 +70,10 @@ impl Default for RibbonState {
             draw_line_deg: 0.0,
             draw_ellipse_rx: 40.0,
             draw_ellipse_ry: 25.0,
+            show_sensor_cal_dialog: false,
+            sensor_cal_started: false,
+            sensor_cal_aborted: false,
+            cal_material_thickness_mm: 1.0,
         }
     }
 }
@@ -1141,11 +1149,10 @@ fn render_laser_tab(
         ribbon_group(ui, "Head Calibration (Capacitive)", |ui| {
             let cal_btn = Button::new(RichText::new("🎯 Calibrate Sensor").size(12.0).color(Color32::from_rgb(255, 215, 0)).strong())
                 .fill(Color32::from_rgb(50, 42, 20));
-            if ui.add(cal_btn).on_hover_text("Calibrate capacitive height sensor (measures capacitance vs distance curve on metal sheet)").clicked() {
-                if let Some(ref c) = controller {
-                    c.calibrate_height_sensor();
-                    *status_message = "Height sensor calibration started. Head searching surface...".to_string();
-                } else {
+            if ui.add(cal_btn).on_hover_text("Open capacitive height sensor calibration & live Z telemetry dialog").clicked() {
+                state.show_sensor_cal_dialog = true;
+                state.sensor_cal_aborted = false;
+                if controller.is_none() {
                     *status_message = "Controller offline. Connect controller before calibrating sensor.".to_string();
                 }
             }
