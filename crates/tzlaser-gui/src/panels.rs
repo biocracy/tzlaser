@@ -136,11 +136,10 @@ pub fn head_world_mm(status: &MachineStatus, pulse_config: &PulseConfig) -> kurb
     )
 }
 
-/// Convert a `MotionSegment` trajectory into a continuous 1-ms Motion FIFO tick stream `(dx, dy, flags)`.
+/// Convert a `MotionSegment` trajectory into a continuous 4-kHz Motion FIFO tick stream `(dx, dy, flags)`.
 /// Groups smooth consecutive segments (e.g. circle/arc chords) into continuous chains with
-/// trapezoidal acceleration/deceleration ramps so curves flow without stopping and corners/starts
+/// S-curve acceleration/deceleration ramps so curves flow without stopping and corners/starts
 /// accelerate smoothly without shocking the machine.
-#[allow(dead_code)]
 pub fn build_trajectory_fifo_ticks(
     traj: &[MotionSegment],
     origin_world: kurbo::Point,
@@ -151,14 +150,14 @@ pub fn build_trajectory_fifo_ticks(
     let mut ticks = Vec::new();
     let mut cur_px = start_px;
     let mut cur_py = start_py;
-    // Conservative safety limits for Dry-Cut: cap speed to 3.0 mm/s and accel to 12.0 mm/s^2
-    let dev_speed_mm_s = pulses_cfg.jog_speed_mm_s.clamp(1.0, 3.0);
-    let accel = pulses_cfg.jog_accel_mm_s2.clamp(5.0, 12.0);
+    // Dry-Cut FIFO speed/accel limits (matching validated 10-15 mm/s Dry-Cut speed)
+    let dev_speed_mm_s = pulses_cfg.jog_speed_mm_s.clamp(3.0, 15.0);
+    let accel = pulses_cfg.jog_accel_mm_s2.clamp(15.0, 60.0);
     let max_tick_x =
-        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_x.max(1.0) / 1000.0).ceil() as i32 + 1)
+        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_x.max(1.0) / 4000.0).ceil() as i32 + 1)
             .clamp(1, 15);
     let max_tick_y =
-        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_y.max(1.0) / 1000.0).ceil() as i32 + 1)
+        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_y.max(1.0) / 4000.0).ceil() as i32 + 1)
             .clamp(1, 15);
 
     let segs: Vec<&MotionSegment> = traj.iter().filter(|s| s.length_mm > 1e-6).collect();
@@ -167,9 +166,9 @@ pub fn build_trajectory_fifo_ticks(
     }
 
     // SC2000 Motion FIFO stream preamble: tick 0 = 0x30, followed by 58 zero-motion 0x02 warmup ticks
-    ticks.push((0, 0, 0x30));
+    ticks.push((0, 0, tzlaser_protocol::fifo_flags::PREAMBLE_START));
     for _ in 0..58 {
-        ticks.push((0, 0, 0x02));
+        ticks.push((0, 0, tzlaser_protocol::fifo_flags::PREAMBLE_IDLE));
     }
 
     let seg_dir = |s: &MotionSegment| -> (f64, f64) {
@@ -263,7 +262,7 @@ pub fn build_trajectory_fifo_ticks(
             let next_px = pulses_cfg.mm_to_pulses_x(wx - origin_world.x);
             let next_py = pulses_cfg.mm_to_pulses_y(wy - origin_world.y);
             // SC2000 Motion FIFO ticks carry unsigned 7-bit pulse magnitudes (0..=127)
-            // with axis direction encoded in `flags`: bit 0 (0x01) = -X (R1008--), bit 1 (0x02) = -Y (R1009--).
+            // packed on wire as [dy, dx, 0, flags] with fifo_flags::X_NEG (0x01) = -X, Y_NEG (0x02) = -Y.
             let dx_req = next_px - cur_px;
             let dy_req = next_py - cur_py;
             let mag_x = dx_req.abs().min(max_tick_x) as u8;
@@ -272,13 +271,7 @@ pub fn build_trajectory_fifo_ticks(
             let step_y = if dy_req < 0 { -(mag_y as i32) } else { mag_y as i32 };
             cur_px += step_x;
             cur_py += step_y;
-            let mut flags = 0u8;
-            if step_x < 0 {
-                flags |= 0x01;
-            }
-            if step_y < 0 {
-                flags |= 0x02;
-            }
+            let flags = tzlaser_protocol::fifo_flags::from_steps(step_x, step_y);
             ticks.push((mag_x as i8, mag_y as i8, flags));
         }
 
@@ -292,13 +285,7 @@ pub fn build_trajectory_fifo_ticks(
             let step_y = if dy_req < 0 { -(mag_y as i32) } else { mag_y as i32 };
             cur_px += step_x;
             cur_py += step_y;
-            let mut flags = 0u8;
-            if step_x < 0 {
-                flags |= 0x01;
-            }
-            if step_y < 0 {
-                flags |= 0x02;
-            }
+            let flags = tzlaser_protocol::fifo_flags::from_steps(step_x, step_y);
             ticks.push((mag_x as i8, mag_y as i8, flags));
         }
 
@@ -306,7 +293,7 @@ pub fn build_trajectory_fifo_ticks(
     }
 
     // SC2000 Motion FIFO stream end-of-stream marker
-    ticks.push((0, 0, 0xF0));
+    ticks.push((0, 0, tzlaser_protocol::fifo_flags::STREAM_END));
     ticks
 }
 
@@ -580,9 +567,8 @@ impl PanelState {
         }
     }
 
-    /// Convert the active trajectory into a 1-ms Motion FIFO tick stream and dispatch it
+    /// Convert the active trajectory into a 4-kHz Motion FIFO tick stream and dispatch it
     /// to the connected controller for continuous, stutter-free Dry-Cut curve tracing.
-    #[allow(dead_code)]
     pub fn start_hw_dry_cut_fifo(
         &mut self,
         controller: &Option<LaserController>,
@@ -606,8 +592,16 @@ impl PanelState {
         if ticks.is_empty() {
             return;
         }
-        let sum_dx: i32 = ticks.iter().map(|t| t.0 as i32).sum();
-        let sum_dy: i32 = ticks.iter().map(|t| t.1 as i32).sum();
+        let sum_dx: i32 = ticks
+            .iter()
+            .filter(|t| t.2 <= 0x03)
+            .map(|&(dx, _, fl)| if (fl & tzlaser_protocol::fifo_flags::X_NEG) != 0 { -(dx as i32) } else { dx as i32 })
+            .sum();
+        let sum_dy: i32 = ticks
+            .iter()
+            .filter(|t| t.2 <= 0x03)
+            .map(|&(_, dy, fl)| if (fl & tzlaser_protocol::fifo_flags::Y_NEG) != 0 { -(dy as i32) } else { dy as i32 })
+            .sum();
         let max_dx: i32 = ticks.iter().map(|t| (t.0 as i32).abs()).max().unwrap_or(0);
         let max_dy: i32 = ticks.iter().map(|t| (t.1 as i32).abs()).max().unwrap_or(0);
         self.pending_logs.push(format!(
@@ -1243,6 +1237,13 @@ impl PanelState {
     ) -> Option<String> {
         if self.run_mode == RunMode::Idle || self.is_paused || self.trajectory.is_empty() {
             return None;
+        }
+
+        // If the Stop button on the wireless remote (or software stop flag) is pressed,
+        // immediately stop the running job/dry-cut simulation.
+        if (status.remote_button_mask & tzlaser_protocol::remote_buttons::ANY_STOP) != 0 {
+            self.stop_run(controller, status);
+            return Some("Motion stopped by remote Stop button.".to_string());
         }
 
         let now = std::time::Instant::now();
@@ -2027,6 +2028,7 @@ pub fn render_right_panels(
                         match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
                             Ok(()) => {
                                 *status_message = panel_state.start_run(RunMode::DryCut, doc, current_head, controller);
+                                panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
                             }
                             Err(msg) => {
                                 *status_message = msg;
@@ -2051,6 +2053,9 @@ pub fn render_right_panels(
                             Ok(()) => {
                                 if let Some(msg) = panel_state.continue_run(doc, current_head, controller) {
                                     *status_message = msg;
+                                    if panel_state.run_mode == RunMode::DryCut {
+                                        panel_state.start_hw_dry_cut_fifo(controller, status, pulses_cfg);
+                                    }
                                 }
                             }
                             Err(msg) => {
@@ -2898,7 +2903,7 @@ mod tests {
         let sum_x: i32 = ticks
             .iter()
             .filter(|t| t.2 <= 0x03)
-            .map(|&(dx, _, fl)| if (fl & 0x01) != 0 { -(dx as i32) } else { dx as i32 })
+            .map(|&(dx, _, fl)| if (fl & tzlaser_protocol::fifo_flags::X_NEG) != 0 { -(dx as i32) } else { dx as i32 })
             .sum();
         assert_eq!(sum_x, cfg.mm_to_pulses_x(20.0));
         // First motion tick velocity should be small (accelerating gently from rest)
@@ -2928,12 +2933,12 @@ mod tests {
         let sx: i32 = ticks
             .iter()
             .filter(|t| t.2 <= 0x03)
-            .map(|&(dx, _, fl)| if (fl & 0x01) != 0 { -(dx as i32) } else { dx as i32 })
+            .map(|&(dx, _, fl)| if (fl & tzlaser_protocol::fifo_flags::X_NEG) != 0 { -(dx as i32) } else { dx as i32 })
             .sum();
         let sy: i32 = ticks
             .iter()
             .filter(|t| t.2 <= 0x03)
-            .map(|&(_, dy, fl)| if (fl & 0x02) != 0 { -(dy as i32) } else { dy as i32 })
+            .map(|&(_, dy, fl)| if (fl & tzlaser_protocol::fifo_flags::Y_NEG) != 0 { -(dy as i32) } else { dy as i32 })
             .sum();
         println!("seg0 ticks={} sx={} sy={}", ticks.len(), sx, sy);
         assert!((sx - (-13115)).abs() < 50, "sx={}", sx);

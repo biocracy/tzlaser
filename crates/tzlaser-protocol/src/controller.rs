@@ -9,8 +9,8 @@ use crate::motion::{
     build_initial_enable_packets, build_jog_packet, build_stop_packets, build_xy_home_packets,
     build_xy_move_packet, build_z_handshake_packets, build_z_home_packet, build_z_jog_packet,
     build_z_poll_packet, build_z_stop_packet, decode_remote_jog, decode_z_homed_from_poll,
-    decode_z_poll_response, decode_z_sensors_from_poll, registers, remote_buttons, Axis,
-    HomeConfig, JogConfig, MachineStatus, SignalTelemetry, CONTINUOUS_JOG_PULSES_XY,
+    decode_z_poll_response, decode_z_sensors_from_poll, fifo_flags, registers, remote_buttons,
+    Axis, HomeConfig, JogConfig, MachineStatus, SignalTelemetry, CONTINUOUS_JOG_PULSES_XY,
     CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
@@ -883,12 +883,19 @@ impl LaserController {
                             let rising_mask = new_st.remote_button_mask & !prev_remote_mask;
                             prev_remote_mask = new_st.remote_button_mask;
 
-                            if (rising_mask & remote_buttons::STOP) != 0 {
+                            if (rising_mask & remote_buttons::ANY_STOP) != 0 {
                                 auto_stop_at = None;
                                 active_step_watch = None;
                                 active_z_step_watch = None;
                                 active_remote_jog = None;
                                 pending_remote_stop_at = None;
+                                if active_fifo.take().is_some() {
+                                    for fpkt in build_fifo_finish_packets(|| {
+                                        seq_clone.fetch_add(1, Ordering::Relaxed)
+                                    }) {
+                                        let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                                    }
+                                }
                                 let (p1, _p2) = build_stop_packets(|| {
                                     seq_clone.fetch_add(1, Ordering::Relaxed)
                                 });
@@ -914,7 +921,13 @@ impl LaserController {
                                 let _ = socket.send_to(&pkt_red.encode(), target_addr);
                             }
 
-                            let remote_jog = decode_remote_jog(new_st.remote_button_mask);
+                            // If Stop button is currently held down, do not start or continue any remote jog.
+                            let is_stop_active = (new_st.remote_button_mask & remote_buttons::ANY_STOP) != 0;
+                            let remote_jog = if is_stop_active {
+                                None
+                            } else {
+                                decode_remote_jog(new_st.remote_button_mask)
+                            };
                             if remote_jog != active_remote_jog {
                                 // Stop previous remote jog if one was active
                                 if let Some((prev_axis, _)) = active_remote_jog.take() {
@@ -1181,8 +1194,8 @@ impl LaserController {
                         let slice = &fifo.ticks[fifo.telemetry_cursor..target_tel_cursor];
                         let (sum_x, sum_y) = slice.iter().fold((0i32, 0i32), |acc, &(dx, dy, fl)| {
                             if fl <= 0x03 {
-                                let sx = if (fl & 0x01) != 0 { -(dx as i32) } else { dx as i32 };
-                                let sy = if (fl & 0x02) != 0 { -(dy as i32) } else { dy as i32 };
+                                let sx = if (fl & fifo_flags::X_NEG) != 0 { -(dx as i32) } else { dx as i32 };
+                                let sy = if (fl & fifo_flags::Y_NEG) != 0 { -(dy as i32) } else { dy as i32 };
                                 (acc.0 + sx, acc.1 + sy)
                             } else {
                                 acc

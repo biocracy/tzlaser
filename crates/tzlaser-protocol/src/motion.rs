@@ -44,15 +44,18 @@ pub mod remote_buttons {
     pub const Z_MINUS: u32 = 0x0001_0000;   // Bit 16: Jog Z- (lower head)
     pub const X_PLUS: u32 = 0x0002_0000;    // Bit 17: Jog X+
     pub const Z_PLUS: u32 = 0x0004_0000;    // Bit 18: Jog Z+ (raise head toward upper limit)
-    pub const STOP: u32 = 0x0008_0000;      // Bit 19: Stop
+    pub const STOP: u32 = 0x0008_0000;      // Bit 19: Stop (legacy / PC UI flag)
     pub const ZERO: u32 = 0x0010_0000;      // Bit 20: Return to Zero
     pub const FN_MOD: u32 = 0x0020_0000;    // Bit 21: Fn modifier flag
     pub const FOLLOW: u32 = 0x0040_0000;    // Bit 22: Capacitive follower toggle
     pub const CLEAR: u32 = 0x0080_0000;     // Bit 23: Clear
     pub const STEP_FLAG: u32 = 0x0100_0000; // Bit 24: Remote step mode state flag
     pub const FAST_FLAG: u32 = 0x0200_0000; // Bit 25: Remote fast speed state flag
+    pub const STOP_REMOTE: u32 = 0x0800_0000; // Bit 27: Physical Stop button on wireless remote (verified via pcapng)
     pub const ORIGIN: u32 = 0x1000_0000;    // Bit 28: Return to Origin
     pub const PULSE: u32 = 0x4000_0000;     // Bit 30: Laser Burst / Pulse
+    /// Composite mask for any stop signal (Bit 19 or Bit 27).
+    pub const ANY_STOP: u32 = STOP | STOP_REMOTE;
     /// Sticky modifier/mode state bits in the upper byte of R1042 that may remain set when no action key is held.
     pub const STICKY_FLAGS: u32 = STEP_FLAG | FAST_FLAG | FN_MOD;
 }
@@ -86,6 +89,9 @@ pub fn format_remote_button(mask: u32) -> String {
     if key == 0 {
         return "Idle".to_string();
     }
+    if (key & remote_buttons::ANY_STOP) != 0 {
+        return format!("Stop (0x{:X})", key);
+    }
     if let Some((axis, dir)) = decode_remote_jog(key) {
         let sign = if dir >= 0 { "+" } else { "-" };
         let speed_tag = if (mask & remote_buttons::FAST_FLAG) != 0 {
@@ -99,8 +105,6 @@ pub fn format_remote_button(mask: u32) -> String {
         "Start"
     } else if (key & remote_buttons::PAUSE) != 0 {
         "Pause"
-    } else if (key & remote_buttons::STOP) != 0 {
-        "Stop"
     } else if (key & remote_buttons::FRAME) != 0 {
         "Frame"
     } else if (key & remote_buttons::SPEED) != 0 {
@@ -556,17 +560,65 @@ pub fn build_xy_move_packet(seq: u16, dx: i32, dy: i32, config: &JogConfig) -> P
     Packet::write_request(seq, registers::REG_JOG_MOTION, payload)
 }
 
-/// Pack a single 1 ms FIFO motion tick `[dx, dy, dz, flags]` into a little-endian `u32`.
-pub fn encode_fifo_tick(dx: i8, dy: i8, dz: i8, flags: u8) -> u32 {
-    u32::from_le_bytes([dx as u8, dy as u8, dz as u8, flags])
+/// Real-world machine axis directions vs on-screen canvas coordinates (`Bottom-Right` origin / `R1008` & `R1009`).
+///
+/// Verified by live jogging, homing, and `MoveXY` tests:
+/// - **Screen Right (`+X_screen`)**: `R1008` increases (`+1`, `MACHINE_X_RIGHT = +1`).
+/// - **Screen Left (`-X_screen`)**: `R1008` decreases (`-1`, `MACHINE_X_LEFT = -1`).
+/// - **Screen Up (`+Y_screen`)**: `R1009` increases (`+1`, `MACHINE_Y_UP = +1`).
+/// - **Screen Down (`-Y_screen`)**: `R1009` decreases (`-1`, `MACHINE_Y_DOWN = -1`).
+pub mod machine_directions {
+    pub const SCREEN_X_RIGHT: i32 = 1;
+    pub const SCREEN_X_LEFT: i32 = -1;
+    pub const SCREEN_Y_UP: i32 = 1;
+    pub const SCREEN_Y_DOWN: i32 = -1;
 }
 
-/// Build a Port 502 Motion FIFO packet (`REG_FIFO_DATA = 100`) containing up to 60 1-ms ticks.
+/// Hardware Motion FIFO tick wire-format constants (verified against SC2000 captures & live machine).
+///
+/// Each 4-kHz FIFO tick on the wire is packed as `[byte0 = dy_mag, byte1 = dx_mag, byte2 = dz_mag, byte3 = flags]`:
+/// - `byte 0`: Y-axis pulse magnitude (`0..=127`, drives `R1009` / machine Y)
+/// - `byte 1`: X-axis pulse magnitude (`0..=127`, drives `R1008` / machine X)
+/// - `byte 3`: direction & control flags:
+///   - `X_NEG` (`0x01`): when set, X steps in `-X` (`R1008--`, screen left); when clear, `+X` (`R1008++`, screen right).
+///   - `Y_NEG` (`0x02`): when set, Y steps in `-Y` (`R1009--`, screen down); when clear, `+Y` (`R1009++`, screen up).
+pub mod fifo_flags {
+    pub const X_NEG: u8 = 0x01;
+    pub const Y_NEG: u8 = 0x02;
+    pub const PREAMBLE_START: u8 = 0x30;
+    pub const PREAMBLE_IDLE: u8 = 0x02;
+    pub const STREAM_END: u8 = 0xF0;
+
+    /// Compute the FIFO direction flag byte for a signed `(step_x, step_y)` pulse step.
+    #[inline]
+    pub const fn from_steps(step_x: i32, step_y: i32) -> u8 {
+        let mut f = 0u8;
+        if step_x < 0 {
+            f |= X_NEG;
+        }
+        if step_y < 0 {
+            f |= Y_NEG;
+        }
+        f
+    }
+}
+
+/// Pack a single 4-kHz FIFO motion tick `[dy, dx, dz, flags]` into a little-endian `u32`.
+/// - byte 0 = `dy` magnitude (`0..=127`, `R1009`)
+/// - byte 1 = `dx` magnitude (`0..=127`, `R1008`)
+/// - byte 2 = `dz`
+/// - byte 3 = `flags` (see [`fifo_flags`])
+pub fn encode_fifo_tick(dy: i8, dx: i8, dz: i8, flags: u8) -> u32 {
+    u32::from_le_bytes([dy as u8, dx as u8, dz as u8, flags])
+}
+
+/// Build a Port 502 Motion FIFO packet (`REG_FIFO_DATA = 100`) containing up to 60 ticks.
+/// Input tuples are `(dx, dy, flags)` where `dx` is X (`R1008`) and `dy` is Y (`R1009`).
 pub fn build_fifo_packet(seq: u16, fifo_seq: u32, ticks: &[(i8, i8, u8)]) -> Packet {
     let mut payload = Vec::with_capacity(1 + ticks.len() * 2);
     payload.push(fifo_seq);
     for &(dx, dy, flags) in ticks {
-        payload.push(encode_fifo_tick(dx, dy, 0, flags));
+        payload.push(encode_fifo_tick(dy, dx, 0, flags));
         payload.push(0);
     }
     Packet::write_request(seq, registers::REG_FIFO_DATA, payload)
@@ -887,6 +939,8 @@ mod tests {
         assert_eq!(format_remote_button(0x0000_0020), "Frame (0x20)");
         assert_eq!(format_remote_button(0x0100_0000), "Idle");
         assert_eq!(format_remote_button(0x0202_0000), "Jog X+ [Fast] (0x20000)");
+        assert_eq!(format_remote_button(0x0800_0000), "Stop (0x8000000)");
+        assert_eq!(format_remote_button(0x0800_0002), "Stop (0x8000002)");
     }
 
     #[test]
