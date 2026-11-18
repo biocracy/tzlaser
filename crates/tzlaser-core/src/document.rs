@@ -74,6 +74,47 @@ pub(crate) fn adaptive_arc_segments(radius: f64, sweep_rad: f64, min_segs: usize
     by_sagitta.max(by_step).clamp(min_segs, 1440)
 }
 
+fn reanchor_closed_polygon(points: &mut Vec<Point>, target_pt: Point) -> bool {
+    let n = points.len();
+    if n < 2 {
+        return false;
+    }
+    let mut best: Option<(usize, Point, f64)> = None;
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 1e-12 {
+            (((target_pt.x - a.x) * dx + (target_pt.y - a.y) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let proj = Point::new(a.x + dx * t, a.y + dy * t);
+        let dist = proj.distance(target_pt);
+        if best.map_or(true, |(_, _, bd)| dist < bd) {
+            best = Some((i, proj, dist));
+        }
+    }
+    let Some((seg_i, proj, _)) = best else {
+        return false;
+    };
+    let next_i = (seg_i + 1) % n;
+    if proj.distance(points[seg_i]) < 1e-4 {
+        points.rotate_left(seg_i);
+    } else if proj.distance(points[next_i]) < 1e-4 {
+        points.rotate_left(next_i);
+    } else {
+        let mut rotated = Vec::with_capacity(n + 1);
+        rotated.push(proj);
+        rotated.extend_from_slice(&points[seg_i + 1..]);
+        rotated.extend_from_slice(&points[..=seg_i]);
+        *points = rotated;
+    }
+    true
+}
+
 impl Entity {
     pub fn bounding_box(&self) -> Rect {
         match self {
@@ -274,41 +315,22 @@ impl Entity {
                     return false;
                 }
                 if *closed {
-                    let n = points.len();
-                    let mut best: Option<(usize, Point, f64)> = None;
-                    for i in 0..n {
-                        let a = points[i];
-                        let b = points[(i + 1) % n];
-                        let dx = b.x - a.x;
-                        let dy = b.y - a.y;
-                        let len2 = dx * dx + dy * dy;
-                        let t = if len2 > 1e-12 {
-                            (((target_pt.x - a.x) * dx + (target_pt.y - a.y) * dy) / len2)
-                                .clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        let proj = Point::new(a.x + dx * t, a.y + dy * t);
-                        let dist = proj.distance(target_pt);
-                        if best.map_or(true, |(_, _, bd)| dist < bd) {
-                            best = Some((i, proj, dist));
-                        }
-                    }
-                    let Some((seg_i, proj, _)) = best else {
+                    reanchor_closed_polygon(points, target_pt)
+                } else if let Some((old_lead, contour_slice)) =
+                    crate::lead_line::split_lead_contour(points)
+                {
+                    let old_lead_owned = old_lead.to_vec();
+                    let mut contour = contour_slice.to_vec();
+                    let was_inside =
+                        crate::lead_line::point_in_polygon(old_lead_owned[0], &contour);
+                    if !reanchor_closed_polygon(&mut contour, target_pt) {
                         return false;
-                    };
-                    let next_i = (seg_i + 1) % n;
-                    if proj.distance(points[seg_i]) < 1e-4 {
-                        points.rotate_left(seg_i);
-                    } else if proj.distance(points[next_i]) < 1e-4 {
-                        points.rotate_left(next_i);
-                    } else {
-                        let mut rotated = Vec::with_capacity(n + 1);
-                        rotated.push(proj);
-                        rotated.extend_from_slice(&points[seg_i + 1..]);
-                        rotated.extend_from_slice(&points[..=seg_i]);
-                        *points = rotated;
                     }
+                    *points = crate::lead_line::rebuild_lead_from_existing(
+                        &old_lead_owned,
+                        &contour,
+                        was_inside,
+                    );
                     true
                 } else {
                     if target_pt.distance(*points.last().unwrap()) < target_pt.distance(points[0]) {
@@ -355,6 +377,20 @@ impl Entity {
             Entity::Circle { .. } => true,
             Entity::Arc { .. } => false,
             Entity::Group { children } => !children.is_empty() && children.iter().all(|c| c.is_closed()),
+        }
+    }
+
+    /// True if this entity represents a closed cutting contour, including `Polyline { closed: false }`
+    /// with an attached lead-in whose contour loop closes back onto the entry point.
+    pub fn has_closed_contour(&self) -> bool {
+        match self {
+            Entity::Polyline { points, closed } => {
+                *closed || crate::lead_line::split_lead_contour(points).is_some()
+            }
+            Entity::Group { children } => {
+                !children.is_empty() && children.iter().all(|c| c.has_closed_contour())
+            }
+            _ => self.is_closed(),
         }
     }
 
@@ -1761,38 +1797,58 @@ impl Document {
         let mut open_paths: Vec<Entity> = Vec::new();
 
         for ent in chained {
-            if ent.is_closed() {
+            if ent.has_closed_contour() {
                 closed_shapes.push(ent);
             } else {
                 open_paths.push(ent);
             }
         }
 
+        let contour_for_shape = |ent: &Entity| -> Option<Vec<Point>> {
+            match ent {
+                Entity::Circle { .. } => Some(ent.sample_points()),
+                Entity::Polyline { points, closed: false } => {
+                    crate::lead_line::split_lead_contour(points).map(|(_, c)| c.to_vec())
+                }
+                Entity::Polyline { points, closed: true } => Some(points.clone()),
+                _ => None,
+            }
+        };
+
+        let area_for_shape = |ent: &Entity| -> f64 {
+            if let Entity::Polyline { points, closed: false } = ent {
+                if let Some((_, c)) = crate::lead_line::split_lead_contour(points) {
+                    let mut sum = 0.0;
+                    for i in 0..c.len() {
+                        let a = c[i];
+                        let b = c[(i + 1) % c.len()];
+                        sum += a.x * b.y - b.x * a.y;
+                    }
+                    return 0.5 * sum.abs();
+                }
+            }
+            ent.area()
+        };
+
         // Sort closed shapes by area descending (outer perimeters have larger area)
-        closed_shapes.sort_by(|a, b| b.area().partial_cmp(&a.area()).unwrap_or(std::cmp::Ordering::Equal));
+        closed_shapes.sort_by(|a, b| {
+            area_for_shape(b)
+                .partial_cmp(&area_for_shape(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut outer_shapes: Vec<Entity> = Vec::new();
         let mut interior_shapes: Vec<Entity> = Vec::new();
 
         for shape in closed_shapes {
-            let test_pt = match &shape {
-                Entity::Circle { center, .. } => *center,
-                Entity::Polyline { points, .. } => {
-                    if points.len() >= 3 {
-                        Point::new(
-                            (points[0].x + points[1].x + points[2].x) / 3.0,
-                            (points[0].y + points[1].y + points[2].y) / 3.0,
-                        )
-                    } else if !points.is_empty() {
-                        points[0]
-                    } else {
-                        Point::ORIGIN
-                    }
-                }
-                _ => Point::ORIGIN,
+            let is_inside_outer = if let Some(c) = contour_for_shape(&shape) {
+                outer_shapes.iter().any(|outer| {
+                    contour_for_shape(outer)
+                        .is_some_and(|oc| crate::lead_line::polygon_enclosed_by(&c, &oc))
+                })
+            } else {
+                false
             };
-
-            let is_inside_outer = outer_shapes.iter().any(|outer| outer.contains_point(test_pt));
 
             if is_inside_outer {
                 interior_shapes.push(shape);
@@ -1913,7 +1969,7 @@ impl Document {
                 match entity {
                     Entity::Group { children } => {
                         for (c_idx, child) in children.iter().enumerate() {
-                            let open = !child.is_closed();
+                            let open = !child.has_closed_contour();
                             let is_bend = is_bend_layer || open;
                             let is_interior = is_interior_layer;
                             raw_paths.push(CutPathInfo {
@@ -1928,7 +1984,7 @@ impl Document {
                         }
                     }
                     _ => {
-                        let open = !entity.is_closed();
+                        let open = !entity.has_closed_contour();
                         let is_bend = is_bend_layer || open;
                         let is_interior = is_interior_layer;
                         raw_paths.push(CutPathInfo {
@@ -2466,6 +2522,435 @@ impl Document {
             _ => return false,
         };
         target.set_start_point_near(target_pt)
+    }
+
+    /// Collect sampled polylines for only the outermost profiles (skipping any profile completely
+    /// enclosed inside another closed profile on visible non-obstacle, non-travel layers).
+    fn outermost_profile_polylines(&self) -> Vec<(Vec<Point>, bool)> {
+        let mut all_items: Vec<(usize, usize, Vec<Point>, bool)> = Vec::new();
+        let mut closed_polys: Vec<(usize, usize, Vec<Point>)> = Vec::new();
+
+        for (l_idx, layer) in self.layers.iter().enumerate() {
+            if !layer.visible || layer.is_obstacle || layer.is_travel {
+                continue;
+            }
+            for (e_idx, ent) in layer.entities.iter().enumerate() {
+                let pts = ent.sample_points();
+                if pts.is_empty() {
+                    continue;
+                }
+                let closed = ent.has_closed_contour();
+                if closed {
+                    let contour = match ent {
+                        Entity::Polyline { points, closed: false } => {
+                            if let Some((_, c)) = crate::lead_line::split_lead_contour(points) {
+                                c.to_vec()
+                            } else {
+                                pts.clone()
+                            }
+                        }
+                        _ => pts.clone(),
+                    };
+                    if contour.len() >= 3 {
+                        closed_polys.push((l_idx, e_idx, contour));
+                    }
+                }
+                all_items.push((l_idx, e_idx, pts, closed));
+            }
+        }
+
+        all_items
+            .into_iter()
+            .filter(|(l_idx, e_idx, pts, _)| {
+                !closed_polys.iter().any(|(ol, oe, outer)| {
+                    !(*ol == *l_idx && *oe == *e_idx)
+                        && crate::lead_line::polygon_enclosed_by(pts, outer)
+                })
+            })
+            .map(|(_, _, pts, closed)| (pts, closed))
+            .collect()
+    }
+
+    /// Compute the 2D convex hull (CCW, non-redundant vertices) of all sampled points across
+    /// outermost visible, non-obstacle, non-travel profiles using Andrew's monotone chain.
+    pub fn compute_convex_hull(&self) -> Vec<Point> {
+        let mut pts: Vec<Point> = Vec::new();
+        for (poly, _) in self.outermost_profile_polylines() {
+            pts.extend(poly);
+        }
+        if pts.is_empty() {
+            return Vec::new();
+        }
+        pts.sort_by(|a, b| {
+            a.x.partial_cmp(&b.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        pts.dedup_by(|a, b| a.distance(*b) < 1e-6);
+        if pts.len() <= 2 {
+            return pts;
+        }
+
+        let cross = |o: Point, a: Point, b: Point| -> f64 {
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        };
+
+        let mut lower: Vec<Point> = Vec::new();
+        for &p in &pts {
+            while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 1e-9 {
+                lower.pop();
+            }
+            lower.push(p);
+        }
+
+        let mut upper: Vec<Point> = Vec::new();
+        for &p in pts.iter().rev() {
+            while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 1e-9 {
+                upper.pop();
+            }
+            upper.push(p);
+        }
+
+        lower.pop();
+        upper.pop();
+        lower.extend(upper);
+        lower
+    }
+
+    /// Compute an axis-aligned bounding rectangle polygon enclosing all active profiles.
+    pub fn compute_bounding_rect_poly(&self) -> Vec<Point> {
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        let mut any = false;
+        for layer in &self.layers {
+            if !layer.visible || layer.is_obstacle || layer.is_travel {
+                continue;
+            }
+            for ent in &layer.entities {
+                for p in ent.sample_points() {
+                    min_x = min_x.min(p.x);
+                    max_x = max_x.max(p.x);
+                    min_y = min_y.min(p.y);
+                    max_y = max_y.max(p.y);
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            return Vec::new();
+        }
+        if (max_x - min_x).abs() < 1e-6 && (max_y - min_y).abs() < 1e-6 {
+            return vec![Point::new(min_x, min_y)];
+        }
+        vec![
+            Point::new(min_x, min_y),
+            Point::new(max_x, min_y),
+            Point::new(max_x, max_y),
+            Point::new(min_x, max_y),
+        ]
+    }
+
+    /// Compute a shrink-wrap 2D concave hull enclosing only the outermost profiles.
+    /// Iteratively pulls convex-hull edges inward onto nearby profile points while strictly
+    /// guaranteeing that no framing segment ever enters the interior of, or crosses, any closed profile.
+    pub fn compute_concave_hull(&self) -> Vec<Point> {
+        let mut hull = self.compute_convex_hull();
+        if hull.len() < 3 {
+            return hull;
+        }
+
+        let outer_polys = self.outermost_profile_polylines();
+        let mut dense_pts: Vec<Point> = Vec::new();
+        let mut closed_profiles: Vec<Vec<Point>> = Vec::new();
+        let mut profile_edges: Vec<(Point, Point)> = Vec::new();
+
+        for (raw, closed) in &outer_polys {
+            if raw.is_empty() {
+                continue;
+            }
+            if *closed && raw.len() >= 3 {
+                let mut clean = raw.clone();
+                if clean.len() >= 4 && clean.first().unwrap().distance(*clean.last().unwrap()) < 1e-5 {
+                    clean.pop();
+                }
+                if clean.len() >= 3 {
+                    closed_profiles.push(clean);
+                }
+            }
+            dense_pts.push(raw[0]);
+            for w in raw.windows(2) {
+                if w[0].distance(w[1]) > 1e-6 {
+                    profile_edges.push((w[0], w[1]));
+                }
+                let len = w[0].distance(w[1]);
+                let steps = (len / 2.0).ceil().clamp(1.0, 64.0) as usize;
+                for s in 1..=steps {
+                    let t = (s as f64) / (steps as f64);
+                    dense_pts.push(Point::new(
+                        w[0].x + (w[1].x - w[0].x) * t,
+                        w[0].y + (w[1].y - w[0].y) * t,
+                    ));
+                }
+            }
+            if *closed && raw.len() >= 3 && raw[0].distance(*raw.last().unwrap()) > 1e-5 {
+                profile_edges.push((*raw.last().unwrap(), raw[0]));
+            }
+        }
+
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for &p in &hull {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+        let diag = (max_x - min_x).hypot(max_y - min_y);
+        let min_edge_len = (diag * 0.005).clamp(1.5, 3.5);
+
+        let point_to_seg_dist = |p: Point, a: Point, b: Point| -> f64 {
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let len2 = dx * dx + dy * dy;
+            if len2 <= 1e-12 {
+                return p.distance(a);
+            }
+            let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+            p.distance(Point::new(a.x + t * dx, a.y + t * dy))
+        };
+
+        let dist_to_poly_boundary = |p: Point, poly: &[Point]| -> f64 {
+            let mut min_d = f64::INFINITY;
+            for i in 0..poly.len() {
+                let d = point_to_seg_dist(p, poly[i], poly[(i + 1) % poly.len()]);
+                if d < min_d {
+                    min_d = d;
+                }
+            }
+            min_d
+        };
+
+        let segs_intersect = |p1: Point, p2: Point, q1: Point, q2: Point| -> bool {
+            let orient = |a: Point, b: Point, c: Point| -> f64 {
+                (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+            };
+            let on_seg = |a: Point, b: Point, c: Point| -> bool {
+                c.x >= a.x.min(b.x) - 1e-6
+                    && c.x <= a.x.max(b.x) + 1e-6
+                    && c.y >= a.y.min(b.y) - 1e-6
+                    && c.y <= a.y.max(b.y) + 1e-6
+            };
+            let o1 = orient(p1, p2, q1);
+            let o2 = orient(p1, p2, q2);
+            let o3 = orient(q1, q2, p1);
+            let o4 = orient(q1, q2, p2);
+            if ((o1 > 1e-9 && o2 < -1e-9) || (o1 < -1e-9 && o2 > 1e-9))
+                && ((o3 > 1e-9 && o4 < -1e-9) || (o3 < -1e-9 && o4 > 1e-9))
+            {
+                return true;
+            }
+            if o1.abs() <= 1e-9 && on_seg(p1, p2, q1) {
+                return true;
+            }
+            if o2.abs() <= 1e-9 && on_seg(p1, p2, q2) {
+                return true;
+            }
+            if o3.abs() <= 1e-9 && on_seg(q1, q2, p1) {
+                return true;
+            }
+            if o4.abs() <= 1e-9 && on_seg(q1, q2, p2) {
+                return true;
+            }
+            false
+        };
+
+        // Ensure candidate segment (u, v) never enters the strict interior of any closed profile
+        // and never properly crosses a profile edge (ignoring edges on which u or v lies).
+        let segment_valid_against_profiles = |u: Point, v: Point| -> bool {
+            for poly in &closed_profiles {
+                for &t in &[0.25, 0.5, 0.75] {
+                    let probe = Point::new(u.x + (v.x - u.x) * t, u.y + (v.y - u.y) * t);
+                    if crate::lead_line::point_in_polygon(probe, poly)
+                        && dist_to_poly_boundary(probe, poly) > 0.35
+                    {
+                        return false;
+                    }
+                }
+            }
+            let orient = |a: Point, b: Point, c: Point| -> f64 {
+                (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+            };
+            for &(q1, q2) in &profile_edges {
+                if point_to_seg_dist(u, q1, q2) <= 0.35 || point_to_seg_dist(v, q1, q2) <= 0.35 {
+                    continue;
+                }
+                let o1 = orient(u, v, q1);
+                let o2 = orient(u, v, q2);
+                let o3 = orient(q1, q2, u);
+                let o4 = orient(q1, q2, v);
+                if ((o1 > 1e-7 && o2 < -1e-7) || (o1 < -1e-7 && o2 > 1e-7))
+                    && ((o3 > 1e-7 && o4 < -1e-7) || (o3 < -1e-7 && o4 > 1e-7))
+                {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let max_iters = 4096;
+        for _ in 0..max_iters {
+            let n = hull.len();
+            let mut candidates: Vec<(usize, f64)> = (0..n)
+                .map(|i| (i, hull[i].distance(hull[(i + 1) % n])))
+                .filter(|&(_, len)| len > min_edge_len)
+                .collect();
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut modified = false;
+            for (edge_idx, edge_len) in candidates {
+                let a = hull[edge_idx];
+                let b = hull[(edge_idx + 1) % n];
+
+                // Score candidates by shortest perimeter increase (da + db - edge_len) so
+                // shrink-wrap steps into concave notches and wraps splines/circles snugly.
+                let mut scored: Vec<(Point, f64)> = Vec::new();
+                for &p in &dense_pts {
+                    if p.distance(a) < 1e-4 || p.distance(b) < 1e-4 {
+                        continue;
+                    }
+                    if hull.iter().any(|&hv| hv.distance(p) < 1e-4) {
+                        continue;
+                    }
+                    // Hull is CCW, so interior is to the left of (a -> b): require inward pull only
+                    let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+                    let perp = cross / edge_len;
+                    if perp <= 1e-3 {
+                        continue;
+                    }
+                    let da = p.distance(a);
+                    let db = p.distance(b);
+                    if da >= edge_len - 0.5 || db >= edge_len - 0.5 {
+                        continue;
+                    }
+                    let abx = b.x - a.x;
+                    let aby = b.y - a.y;
+                    let proj = ((p.x - a.x) * abx + (p.y - a.y) * aby) / (edge_len * edge_len);
+                    if proj < -0.15 || proj > 1.15 {
+                        continue;
+                    }
+                    scored.push((p, (da + db) - edge_len));
+                }
+                scored.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                for (p, _) in scored {
+                    if !segment_valid_against_profiles(a, p)
+                        || !segment_valid_against_profiles(p, b)
+                    {
+                        continue;
+                    }
+                    let mut intersects_hull = false;
+                    for j in 0..n {
+                        if j == edge_idx {
+                            continue;
+                        }
+                        let q1 = hull[j];
+                        let q2 = hull[(j + 1) % n];
+                        let shares_a = j == (edge_idx + n - 1) % n;
+                        let shares_b = j == (edge_idx + 1) % n;
+                        if !shares_a && segs_intersect(a, p, q1, q2) {
+                            intersects_hull = true;
+                            break;
+                        }
+                        if !shares_b && segs_intersect(p, b, q1, q2) {
+                            intersects_hull = true;
+                            break;
+                        }
+                    }
+                    if !intersects_hull {
+                        hull.insert(edge_idx + 1, p);
+                        modified = true;
+                        break;
+                    }
+                }
+                if modified {
+                    break;
+                }
+            }
+            if !modified {
+                break;
+            }
+        }
+        hull
+    }
+
+    /// Compute the closed framing polygon for the requested `FrameMode`.
+    pub fn compute_frame_polygon(&self, mode: crate::FrameMode) -> Vec<Point> {
+        match mode {
+            crate::FrameMode::Rectangle => self.compute_bounding_rect_poly(),
+            crate::FrameMode::ConvexHull => self.compute_convex_hull(),
+            crate::FrameMode::ConcaveHull => self.compute_concave_hull(),
+        }
+    }
+
+    /// Build a framing trajectory (`laser_on = false`) from `start_origin` around the selected
+    /// framing polygon (`Rectangle`, `ConvexHull`, or `ConcaveHull`), then back to `start_origin`.
+    pub fn build_frame_trajectory(
+        &self,
+        start_origin: Point,
+        frame_speed_mm_s: f64,
+        mode: crate::FrameMode,
+    ) -> Vec<MotionSegment> {
+        let mut hull = self.compute_frame_polygon(mode);
+        if hull.is_empty() {
+            return Vec::new();
+        }
+
+        let speed = frame_speed_mm_s.max(1.0);
+        // Start at the hull vertex closest to the current head position
+        if let Some((best_idx, _)) = hull
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.distance(start_origin)
+                    .partial_cmp(&b.distance(start_origin))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            hull.rotate_left(best_idx);
+        }
+
+        let mut segments = Vec::new();
+        let mut push_seg = |start: Point, end: Point, is_rapid: bool| {
+            let len = start.distance(end);
+            if len > 1e-4 {
+                segments.push(MotionSegment {
+                    start,
+                    end,
+                    is_rapid,
+                    speed_mm_s: speed,
+                    length_mm: len,
+                    path_index_1based: if is_rapid { 0 } else { 1 },
+                });
+            }
+        };
+
+        let first = hull[0];
+        push_seg(start_origin, first, true);
+        if hull.len() == 1 {
+            push_seg(first, start_origin, true);
+            return segments;
+        }
+        for i in 0..hull.len() {
+            let a = hull[i];
+            let b = hull[(i + 1) % hull.len()];
+            push_seg(a, b, false);
+        }
+        push_seg(first, start_origin, true);
+        segments
     }
 
     pub fn build_motion_trajectory(&self, start_origin: Point, rapid_speed_mm_s: f64) -> Vec<MotionSegment> {
@@ -3899,6 +4384,112 @@ mod tests {
         assert_eq!(seq[0].child_idx, Some(2));
         assert_eq!(seq[1].child_idx, Some(0));
         assert_eq!(seq[2].child_idx, Some(1));
+    }
+
+    #[test]
+    fn test_concave_hull_never_cuts_profile_or_dips_inside() {
+        let mut doc = Document::new();
+        // Outer rectangle (0,0)-(200,100) with outward lead-in at bottom-middle (100, -3.5)
+        doc.layers[0].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(200.0, 0.0),
+                Point::new(200.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        // Inner circle inside the rectangle
+        doc.layers[0].entities.push(Entity::Circle {
+            center: Point::new(100.0, 50.0),
+            radius: 30.0,
+        });
+        let _ = crate::apply_lead_lines(&mut doc, &[], &crate::LeadConfig::default());
+
+        let hull = doc.compute_concave_hull();
+        assert!(hull.len() >= 4);
+
+        // No segment of the concave hull may pass strictly inside the rectangle (1..199, 1..99)
+        for i in 0..hull.len() {
+            let a = hull[i];
+            let b = hull[(i + 1) % hull.len()];
+            let mid = Point::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y));
+            assert!(
+                !(mid.x > 1.0 && mid.x < 199.0 && mid.y > 1.0 && mid.y < 99.0),
+                "Concave hull segment ({:?} -> {:?}) cut through interior of outer rectangle at {:?}",
+                a, b, mid
+            );
+        }
+
+        // L-shape shrink-wrap test: concave hull must wrap into the inner corner (50, 50)
+        let mut l_doc = Document::new();
+        l_doc.layers[0].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(100.0, 0.0),
+                Point::new(100.0, 40.0),
+                Point::new(40.0, 40.0),
+                Point::new(40.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        let l_hull = l_doc.compute_concave_hull();
+        assert!(
+            l_hull.iter().any(|p| p.x <= 45.0 && p.y <= 45.0 && p.x >= 35.0 && p.y >= 35.0),
+            "Concave hull should hug the L-shape inner corner near (40,40), got {:?}",
+            l_hull
+        );
+
+        // Rectangle (0,0)-(200,100) + circle at (155,105) r=20 protruding above top edge:
+        // Concave hull should follow the rectangle top edge to near the circle base (~x=135, y=100)
+        let mut combo_doc = Document::new();
+        combo_doc.layers[0].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(200.0, 0.0),
+                Point::new(200.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        combo_doc.layers[0].entities.push(Entity::Circle {
+            center: Point::new(155.0, 105.0),
+            radius: 20.0,
+        });
+        let combo_hull = combo_doc.compute_concave_hull();
+        assert!(
+            combo_hull.iter().any(|p| (p.x - 100.0).abs() <= 2.5 && (p.y - 100.0).abs() <= 0.5),
+            "Concave hull should follow the rectangle top edge before rising onto the circle, got {:?}",
+            combo_hull
+        );
+        assert!(
+            combo_hull.len() > 60,
+            "Concave hull should follow the circle smoothly, got {} points",
+            combo_hull.len()
+        );
+
+        // Also test when circle sits slightly above the rectangle (gap = 5 mm):
+        let mut gap_doc = Document::new();
+        gap_doc.layers[0].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(200.0, 0.0),
+                Point::new(200.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        gap_doc.layers[0].entities.push(Entity::Circle {
+            center: Point::new(155.0, 125.0),
+            radius: 20.0,
+        });
+        let gap_hull = gap_doc.compute_concave_hull();
+        assert!(
+            gap_hull.iter().any(|p| (p.x - 100.0).abs() <= 2.5 && (p.y - 100.0).abs() <= 0.5),
+            "Gap concave hull should follow the rectangle top edge until under the circle, got {:?}",
+            gap_hull
+        );
     }
 }
 

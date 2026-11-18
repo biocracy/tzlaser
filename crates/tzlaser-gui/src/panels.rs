@@ -65,6 +65,7 @@ pub struct PanelState {
     pub sim_vy_pls: f32,
     pub sim_ax_pls: f32,
     pub sim_ay_pls: f32,
+    pub active_frame_polygon: Vec<kurbo::Point>,
 }
 
 impl Default for PanelState {
@@ -107,6 +108,7 @@ impl Default for PanelState {
             sim_vy_pls: 0.0,
             sim_ax_pls: 0.0,
             sim_ay_pls: 0.0,
+            active_frame_polygon: Vec::new(),
         }
     }
 }
@@ -140,6 +142,7 @@ pub fn head_world_mm(status: &MachineStatus, pulse_config: &PulseConfig) -> kurb
 /// Groups smooth consecutive segments (e.g. circle/arc chords) into continuous chains with
 /// S-curve acceleration/deceleration ramps so curves flow without stopping and corners/starts
 /// accelerate smoothly without shocking the machine.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_trajectory_fifo_ticks(
     traj: &[MotionSegment],
     origin_world: kurbo::Point,
@@ -147,11 +150,29 @@ pub fn build_trajectory_fifo_ticks(
     start_px: i32,
     start_py: i32,
 ) -> Vec<(i8, i8, u8)> {
+    let dev_speed_mm_s = pulses_cfg.jog_speed_mm_s.clamp(3.0, 15.0);
+    build_trajectory_fifo_ticks_with_speed(
+        traj,
+        origin_world,
+        pulses_cfg,
+        start_px,
+        start_py,
+        dev_speed_mm_s,
+    )
+}
+
+pub fn build_trajectory_fifo_ticks_with_speed(
+    traj: &[MotionSegment],
+    origin_world: kurbo::Point,
+    pulses_cfg: &PulseConfig,
+    start_px: i32,
+    start_py: i32,
+    speed_mm_s: f64,
+) -> Vec<(i8, i8, u8)> {
     let mut ticks = Vec::new();
     let mut cur_px = start_px;
     let mut cur_py = start_py;
-    // Dry-Cut FIFO speed/accel limits (matching validated 10-15 mm/s Dry-Cut speed)
-    let dev_speed_mm_s = pulses_cfg.jog_speed_mm_s.clamp(3.0, 15.0);
+    let dev_speed_mm_s = speed_mm_s.clamp(3.0, 100.0);
     let accel = pulses_cfg.jog_accel_mm_s2.clamp(15.0, 60.0);
     let max_tick_x =
         ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_x.max(1.0) / 4000.0).ceil() as i32 + 1)
@@ -542,6 +563,7 @@ impl PanelState {
         self.hw_fifo_total_secs = 0.0;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
+        self.active_frame_polygon.clear();
         self.reset_filtered_velocity();
 
         let est_str = format_duration_secs(self.estimated_job_secs);
@@ -567,6 +589,60 @@ impl PanelState {
         }
     }
 
+    /// Start framing along the selected framing polygon (`Rectangle`, `ConvexHull`, or `ConcaveHull`)
+    /// enclosing all active profiles on the table.
+    /// Uses `RunMode::DryCut` so offline simulation and live hardware FIFO tracing share the exact same path.
+    pub fn start_frame_run(
+        &mut self,
+        doc: &Document,
+        current_head: kurbo::Point,
+        frame_speed_mm_s: f64,
+        frame_mode: tzlaser_core::FrameMode,
+        controller: &Option<LaserController>,
+    ) -> String {
+        let speed = frame_speed_mm_s.max(1.0);
+        let hull = doc.compute_frame_polygon(frame_mode);
+        let traj = doc.build_frame_trajectory(current_head, speed, frame_mode);
+        if traj.is_empty() {
+            self.active_frame_polygon.clear();
+            return "No active geometry to frame on visible layers.".to_string();
+        }
+        self.total_length_mm = traj.iter().map(|s| s.length_mm).sum();
+        self.job_start_pos = current_head;
+        self.estimated_job_secs = self.total_length_mm / speed;
+        self.full_trajectory = traj.clone();
+        self.trajectory = traj;
+        self.current_seg_idx = 0;
+        self.seg_progress_mm = 0.0;
+        self.traveled_length_mm = 0.0;
+        self.is_paused = false;
+        self.run_mode = RunMode::DryCut;
+        self.last_tick = Some(std::time::Instant::now());
+        self.last_hw_dispatched_seg = None;
+        self.hw_seg_dispatched_at = None;
+        self.hw_seg_seen_moving = false;
+        self.hw_fifo_active = false;
+        self.hw_fifo_started_at = None;
+        self.hw_fifo_total_secs = 0.0;
+        self.paused_checkpoint = None;
+        self.pause_buffer.clear();
+        self.active_frame_polygon = hull;
+        self.reset_filtered_velocity();
+
+        if let Some(ref c) = controller {
+            if c.is_connected() {
+                c.set_red_pointer(true);
+            }
+        }
+        format!(
+            "{} framing started ({} segments, {:.1} mm @ {:.1} mm/s).",
+            frame_mode.label(),
+            self.trajectory.len(),
+            self.total_length_mm,
+            speed
+        )
+    }
+
     /// Convert the active trajectory into a 4-kHz Motion FIFO tick stream and dispatch it
     /// to the connected controller for continuous, stutter-free Dry-Cut curve tracing.
     pub fn start_hw_dry_cut_fifo(
@@ -575,6 +651,36 @@ impl PanelState {
         status: &MachineStatus,
         pulses_cfg: &PulseConfig,
     ) {
+        self.start_hw_fifo_with_speed(
+            controller,
+            status,
+            pulses_cfg,
+            pulses_cfg.jog_speed_mm_s.clamp(3.0, 15.0),
+        );
+    }
+
+    /// Dispatch the active framing trajectory over Motion FIFO at `pulses_cfg.frame_speed_mm_s`.
+    pub fn start_hw_frame_fifo(
+        &mut self,
+        controller: &Option<LaserController>,
+        status: &MachineStatus,
+        pulses_cfg: &PulseConfig,
+    ) {
+        self.start_hw_fifo_with_speed(
+            controller,
+            status,
+            pulses_cfg,
+            pulses_cfg.frame_speed_mm_s.clamp(3.0, 100.0),
+        );
+    }
+
+    fn start_hw_fifo_with_speed(
+        &mut self,
+        controller: &Option<LaserController>,
+        status: &MachineStatus,
+        pulses_cfg: &PulseConfig,
+        speed_mm_s: f64,
+    ) {
         let Some(ref c) = controller else {
             return;
         };
@@ -582,12 +688,13 @@ impl PanelState {
             return;
         }
         let origin = origin_world_mm(pulses_cfg);
-        let ticks = build_trajectory_fifo_ticks(
+        let ticks = build_trajectory_fifo_ticks_with_speed(
             &self.trajectory,
             origin,
             pulses_cfg,
             status.pos_x,
             status.pos_y,
+            speed_mm_s,
         );
         if ticks.is_empty() {
             return;
@@ -640,6 +747,7 @@ impl PanelState {
         self.estimated_job_secs = 0.0;
         self.paused_checkpoint = None;
         self.pause_buffer.clear();
+        self.active_frame_polygon.clear();
         self.reset_filtered_velocity();
         status.laser_on = false;
         if was_dry {
@@ -2078,57 +2186,27 @@ pub fn render_right_panels(
                     .fill(Color32::from_rgb(48, 42, 22));
                     if ui
                         .add_sized([run_btn_w, 28.0], frame_btn)
-                        .on_hover_text("Trace the active job bounding box with the red guide pointer (laser off)")
+                        .on_hover_text(if is_connected {
+                            format!("Trace {} enclosing all profiles with the red guide pointer (laser off)", pulses_cfg.frame_mode.label())
+                        } else {
+                            format!("Simulate pointer movement along {} enclosing all profiles offline", pulses_cfg.frame_mode.label())
+                        })
                         .clicked()
                     {
-                        if let Err(msg) = panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
-                            *status_message = msg;
-                        } else {
-                        let mut bbox: Option<kurbo::Rect> = None;
-                        for layer in &doc.layers {
-                            if !layer.visible || layer.is_obstacle {
-                                continue;
+                        match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
+                            Ok(()) => {
+                                *status_message = panel_state.start_frame_run(
+                                    doc,
+                                    current_head,
+                                    pulses_cfg.frame_speed_mm_s,
+                                    pulses_cfg.frame_mode,
+                                    controller,
+                                );
+                                panel_state.start_hw_frame_fifo(controller, status, pulses_cfg);
                             }
-                            for ent in &layer.entities {
-                                let b = ent.bounding_box();
-                                bbox = Some(match bbox {
-                                    Some(acc) => acc.union(b),
-                                    None => b,
-                                });
+                            Err(msg) => {
+                                *status_message = msg;
                             }
-                        }
-                        if let Some(b) = bbox {
-                            if let Some(ref c) = controller {
-                                if c.is_connected() {
-                                    c.set_red_pointer(true);
-                                    let corners = [
-                                        kurbo::Point::new(b.x0, b.y0),
-                                        kurbo::Point::new(b.x1, b.y0),
-                                        kurbo::Point::new(b.x1, b.y1),
-                                        kurbo::Point::new(b.x0, b.y1),
-                                        kurbo::Point::new(b.x0, b.y0),
-                                    ];
-                                    let mut prev = current_head;
-                                    for pt in corners {
-                                        let dx = pulses_cfg.mm_to_pulses_x(pt.x - prev.x);
-                                        let dy = pulses_cfg.mm_to_pulses_y(pt.y - prev.y);
-                                        if dx != 0 {
-                                            c.jog(Axis::X, dx);
-                                        }
-                                        if dy != 0 {
-                                            c.jog(Axis::Y, dy);
-                                        }
-                                        prev = pt;
-                                    }
-                                }
-                            }
-                            *status_message = format!(
-                                "Framing job bounds [{:.1}..{:.1}, {:.1}..{:.1}] mm with red guide pointer.",
-                                b.x0, b.x1, b.y0, b.y1
-                            );
-                        } else {
-                            *status_message = "No active cuttable geometry to frame.".to_string();
-                        }
                         }
                     }
 

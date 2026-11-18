@@ -52,6 +52,47 @@ fn default_retract_xy_mm() -> f64 {
 fn default_retract_z_mm() -> f64 {
     5.0
 }
+fn default_fast_jog_speed_mm_s() -> f64 {
+    50.0
+}
+fn default_fast_z_jog_speed_reg() -> u32 {
+    150
+}
+fn default_frame_speed_mm_s() -> f64 {
+    30.0
+}
+fn default_test_pulse_power_pct() -> f32 {
+    20.0
+}
+fn default_test_pulse_duration_ms() -> u32 {
+    50
+}
+fn default_test_pulse_freq_hz() -> u32 {
+    5000
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameMode {
+    Rectangle,
+    ConvexHull,
+    ConcaveHull,
+}
+
+impl Default for FrameMode {
+    fn default() -> Self {
+        Self::ConvexHull
+    }
+}
+
+impl FrameMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rectangle => "Rectangle",
+            Self::ConvexHull => "Convex Hull",
+            Self::ConcaveHull => "Concave Hull (Shrink-Wrap)",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PostJobAction {
@@ -122,12 +163,32 @@ pub struct PulseConfig {
     pub jog_start_speed_mm_s: f64,
     #[serde(default = "default_jog_speed_mm_s")]
     pub jog_speed_mm_s: f64,
+    #[serde(default = "default_jog_speed_mm_s")]
+    pub jog_speed_y_mm_s: f64,
     #[serde(default = "default_jog_accel_mm_s2")]
     pub jog_accel_mm_s2: f64,
     #[serde(default = "default_z_jog_speed_reg")]
     pub z_jog_speed_reg: u32,
+    #[serde(default = "default_fast_jog_speed_mm_s")]
+    pub fast_jog_speed_x_mm_s: f64,
+    #[serde(default = "default_fast_jog_speed_mm_s")]
+    pub fast_jog_speed_y_mm_s: f64,
+    #[serde(default = "default_fast_z_jog_speed_reg")]
+    pub fast_z_jog_speed_reg: u32,
+    #[serde(default = "default_frame_speed_mm_s")]
+    pub frame_speed_mm_s: f64,
+    #[serde(default)]
+    pub frame_mode: FrameMode,
     #[serde(default = "default_step_mm")]
     pub default_step_mm: f64,
+
+    // 3b. Laser Test Pulse Defaults
+    #[serde(default = "default_test_pulse_power_pct")]
+    pub test_pulse_power_pct: f32,
+    #[serde(default = "default_test_pulse_duration_ms")]
+    pub test_pulse_duration_ms: u32,
+    #[serde(default = "default_test_pulse_freq_hz")]
+    pub test_pulse_freq_hz: u32,
 
     // 4. Controller Network Endpoints
     #[serde(default = "default_controller_ip")]
@@ -169,9 +230,18 @@ impl Default for PulseConfig {
             invert_z: false,
             jog_start_speed_mm_s: default_jog_start_speed_mm_s(),
             jog_speed_mm_s: default_jog_speed_mm_s(),
+            jog_speed_y_mm_s: default_jog_speed_mm_s(),
             jog_accel_mm_s2: default_jog_accel_mm_s2(),
             z_jog_speed_reg: default_z_jog_speed_reg(),
+            fast_jog_speed_x_mm_s: default_fast_jog_speed_mm_s(),
+            fast_jog_speed_y_mm_s: default_fast_jog_speed_mm_s(),
+            fast_z_jog_speed_reg: default_fast_z_jog_speed_reg(),
+            frame_speed_mm_s: default_frame_speed_mm_s(),
+            frame_mode: FrameMode::default(),
             default_step_mm: default_step_mm(),
+            test_pulse_power_pct: default_test_pulse_power_pct(),
+            test_pulse_duration_ms: default_test_pulse_duration_ms(),
+            test_pulse_freq_hz: default_test_pulse_freq_hz(),
             controller_ip: default_controller_ip(),
             z_follower_port: default_z_follower_port(),
             post_job_action: PostJobAction::default(),

@@ -5,8 +5,9 @@ use eframe::egui::{
 use kurbo::Point;
 use std::net::SocketAddr;
 use tzlaser_core::{
-    apply_lead_lines, Color, CoolHeuristicSolver, Document, DxfImporter, Entity, HistoryManager,
-    Layer, LeadConfig, LeadType, PostJobAction, PulseConfig, SortMode,
+    apply_lead_lines, flip_lead_lines, remove_lead_lines, Color, CoolHeuristicSolver, Document,
+    DxfImporter, Entity, HistoryManager, Layer, LeadConfig, LeadType, PostJobAction, PulseConfig,
+    SortMode,
 };
 use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 
@@ -16,8 +17,7 @@ pub enum RibbonTab {
     Draw,
     Profiles,
     View,
-    Laser,
-    Properties,
+    LaserTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,7 @@ pub struct RibbonState {
     pub sensor_cal_started: bool,
     pub sensor_cal_aborted: bool,
     pub cal_material_thickness_mm: f64,
+    pub show_jog_presets_dialog: bool,
 }
 
 impl Default for RibbonState {
@@ -74,6 +75,7 @@ impl Default for RibbonState {
             sensor_cal_started: false,
             sensor_cal_aborted: false,
             cal_material_thickness_mm: 1.0,
+            show_jog_presets_dialog: false,
         }
     }
 }
@@ -89,7 +91,7 @@ pub fn render_ribbon(
     pulse_config: &mut PulseConfig,
     props_window_state: &mut crate::properties_window::PropertiesWindowState,
     controller: &mut Option<LaserController>,
-    status: &MachineStatus,
+    _status: &MachineStatus,
     status_message: &mut String,
 ) {
     // 1. Top Ribbon Tab Bar & Quick Access
@@ -141,8 +143,7 @@ pub fn render_ribbon(
             (RibbonTab::Draw, "✏ Draw"),
             (RibbonTab::Profiles, "📐 Profile CAM"),
             (RibbonTab::View, "👁 View & Overlays"),
-            (RibbonTab::Laser, "⚡ Laser & Hardware"),
-            (RibbonTab::Properties, "⚙ Machine & Table"),
+            (RibbonTab::LaserTable, "⚡ Laser & Table"),
         ];
 
         for (tab, label) in tabs {
@@ -171,8 +172,21 @@ pub fn render_ribbon(
             }
         }
 
-        // Right Aligned: Hardware Connection Badge
+        // Right Aligned: E-STOP + Hardware Connection Badge
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let estop_btn = Button::new(RichText::new("🛑 E-STOP").size(11.5).color(Color32::WHITE).strong())
+                .fill(Color32::from_rgb(180, 30, 30));
+            if ui
+                .add(estop_btn)
+                .on_hover_text("IMMEDIATE EMERGENCY STOP - Halts all motion and turns laser OFF")
+                .clicked()
+            {
+                if let Some(ref c) = controller {
+                    c.stop();
+                }
+                *status_message = "EMERGENCY STOP TRIGGERED. All motion halted.".to_string();
+            }
+
             if let Some(ref c) = controller {
                 let (dot, text, color) = if c.is_connected() {
                     ("●", "ONLINE (10.1.1.168:502)", Color32::GREEN)
@@ -232,11 +246,11 @@ pub fn render_ribbon(
             match state.active_tab {
                 RibbonTab::File => render_file_tab(ui, doc, selection, history, status_message),
                 RibbonTab::Draw => render_draw_tab(ui, state, doc, selection, history, canvas_state, status_message),
-                RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, status_message),
+                RibbonTab::Profiles => render_profiles_tab(ui, state, doc, selection, history, canvas_state, pulse_config, status_message),
                 RibbonTab::View => render_view_tab(ui, doc, canvas_state),
-                RibbonTab::Laser => render_laser_tab(ui, state, pulse_config, controller, status, status_message),
-                RibbonTab::Properties => render_properties_tab(
+                RibbonTab::LaserTable => render_laser_table_tab(
                     ui,
+                    state,
                     pulse_config,
                     props_window_state,
                     canvas_state,
@@ -248,6 +262,15 @@ pub fn render_ribbon(
         });
 
     render_sort_overwrite_modal(ui.ctx(), state, doc, selection, history, canvas_state, status_message);
+    render_jog_presets_dialog(
+        ui.ctx(),
+        state,
+        pulse_config,
+        canvas_state,
+        panel_state,
+        controller,
+        status_message,
+    );
 }
 
 fn place_drawn_entity(
@@ -801,6 +824,7 @@ fn render_profiles_tab(
     selection: &mut Vec<(usize, usize)>,
     history: &mut HistoryManager,
     canvas_state: &mut crate::canvas::CanvasState,
+    pulse_config: &mut PulseConfig,
     status_message: &mut String,
 ) {
     ui.horizontal(|ui| {
@@ -890,30 +914,113 @@ fn render_profiles_tab(
         // 4. Lead Lines Group (2 stacked rows)
         ribbon_group(ui, "Lead Lines", |ui| {
             ui.vertical(|ui| {
-                let lead_btn = Button::new(RichText::new("📍 Add Leads").size(11.0).color(Color32::from_rgb(255, 215, 0)))
-                    .fill(Color32::from_rgb(45, 40, 25))
-                    .min_size(Vec2::new(95.0, 19.0));
-                if ui.add(lead_btn).on_hover_text(format!("Attach pierce lead-in lines ({:.1} mm at {:.0}°) to contours", state.lead_config.length_mm, state.lead_config.angle_deg)).clicked() {
-                    history.record(doc, selection, "Add Lead Lines");
-                    let count = apply_lead_lines(doc, selection, &state.lead_config);
-                    *status_message = format!("Added lead-in lines to {} contours.", count);
-                }
+                ui.horizontal(|ui| {
+                    let lead_btn = Button::new(RichText::new("📍 Add Leads").size(11.0).color(Color32::from_rgb(255, 215, 0)))
+                        .fill(Color32::from_rgb(45, 40, 25))
+                        .min_size(Vec2::new(78.0, 19.0));
+                    let hover = match state.lead_config.lead_type {
+                        LeadType::Line => format!(
+                            "Attach straight pierce lead-in ({:.1} mm at {:.0}°, auto inside/outside)",
+                            state.lead_config.length_mm, state.lead_config.angle_deg
+                        ),
+                        LeadType::Arc => format!(
+                            "Attach arc pierce lead-in (R{:.1} mm, L{:.1} mm, auto inside/outside)",
+                            state.lead_config.arc_radius_mm, state.lead_config.arc_length_mm
+                        ),
+                    };
+                    if ui.add(lead_btn).on_hover_text(hover).clicked() {
+                        history.record(doc, selection, "Add Lead Lines");
+                        let count = apply_lead_lines(doc, selection, &state.lead_config);
+                        *status_message = format!("Added lead-in lines to {} contours.", count);
+                    }
 
-                ui.menu_button(RichText::new(format!("⚙ {:.1}mm / {:.0}°", state.lead_config.length_mm, state.lead_config.angle_deg)).size(10.0), |ui| {
+                    let flip_btn = Button::new(RichText::new("🔄 Flip").size(11.0).color(Color32::from_rgb(130, 220, 255)))
+                        .fill(Color32::from_rgb(28, 45, 62))
+                        .min_size(Vec2::new(52.0, 19.0));
+                    if ui
+                        .add(flip_btn)
+                        .on_hover_text("Manually flip lead-in lines between inside and outside of selected/all closed profiles")
+                        .clicked()
+                    {
+                        history.record(doc, selection, "Flip Lead Lines");
+                        let count = flip_lead_lines(doc, selection, &state.lead_config);
+                        *status_message = format!("Flipped lead-in side on {} contours.", count);
+                    }
+
+                    let del_btn = Button::new(RichText::new("🗑").size(11.0).color(Color32::from_rgb(245, 130, 120)))
+                        .fill(Color32::from_rgb(60, 28, 30))
+                        .min_size(Vec2::new(26.0, 19.0));
+                    if ui
+                        .add(del_btn)
+                        .on_hover_text("Remove lead-in lines from selected (or all) profiles")
+                        .clicked()
+                    {
+                        history.record(doc, selection, "Remove Lead Lines");
+                        let count = remove_lead_lines(doc, selection);
+                        *status_message = format!("Removed lead-in lines from {} contours.", count);
+                    }
+                });
+
+                let summary_label = match state.lead_config.lead_type {
+                    LeadType::Line => format!(
+                        "⚙ Line {:.1}mm / {:.0}°",
+                        state.lead_config.length_mm, state.lead_config.angle_deg
+                    ),
+                    LeadType::Arc => format!(
+                        "⚙ Arc R{:.1} / L{:.1}mm",
+                        state.lead_config.arc_radius_mm, state.lead_config.arc_length_mm
+                    ),
+                };
+                ui.menu_button(RichText::new(summary_label).size(10.0), |ui| {
                     ui.label(RichText::new("Lead-In Parameters").strong());
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label("Length:");
-                        ui.add(egui::DragValue::new(&mut state.lead_config.length_mm).speed(0.2).range(0.5..=20.0).suffix(" mm"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Angle:");
-                        ui.add(egui::DragValue::new(&mut state.lead_config.angle_deg).speed(5.0).range(15.0..=90.0).suffix("°"));
-                    });
-                    ui.horizontal(|ui| {
+                        ui.label("Type:");
                         ui.radio_value(&mut state.lead_config.lead_type, LeadType::Line, "Straight");
                         ui.radio_value(&mut state.lead_config.lead_type, LeadType::Arc, "Arc");
                     });
+                    match state.lead_config.lead_type {
+                        LeadType::Line => {
+                            ui.horizontal(|ui| {
+                                ui.label("Length:");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.lead_config.length_mm)
+                                        .speed(0.2)
+                                        .range(0.5..=20.0)
+                                        .suffix(" mm"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Angle:");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.lead_config.angle_deg)
+                                        .speed(5.0)
+                                        .range(15.0..=90.0)
+                                        .suffix("°"),
+                                );
+                            });
+                        }
+                        LeadType::Arc => {
+                            ui.horizontal(|ui| {
+                                ui.label("Arc Radius:");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.lead_config.arc_radius_mm)
+                                        .speed(0.2)
+                                        .range(0.5..=50.0)
+                                        .suffix(" mm"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Arc Length:");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.lead_config.arc_length_mm)
+                                        .speed(0.2)
+                                        .range(0.5..=50.0)
+                                        .suffix(" mm"),
+                                );
+                            });
+                        }
+                    }
                 });
             });
         });
@@ -1133,85 +1240,10 @@ fn render_profiles_tab(
                 });
             });
         });
-    });
-}
 
-fn render_laser_tab(
-    ui: &mut Ui,
-    state: &mut RibbonState,
-    pulse_config: &mut PulseConfig,
-    controller: &mut Option<LaserController>,
-    status: &MachineStatus,
-    status_message: &mut String,
-) {
-    ui.horizontal(|ui| {
-        // 1. Head Calibration (Capacitive Height Sensor)
-        ribbon_group(ui, "Head Calibration (Capacitive)", |ui| {
-            let cal_btn = Button::new(RichText::new("🎯 Calibrate Sensor").size(12.0).color(Color32::from_rgb(255, 215, 0)).strong())
-                .fill(Color32::from_rgb(50, 42, 20));
-            if ui.add(cal_btn).on_hover_text("Open capacitive height sensor calibration & live Z telemetry dialog").clicked() {
-                state.show_sensor_cal_dialog = true;
-                state.sensor_cal_aborted = false;
-                if controller.is_none() {
-                    *status_message = "Controller offline. Connect controller before calibrating sensor.".to_string();
-                }
-            }
+        ui.add_space(2.0);
 
-            let probe_btn = Button::new(RichText::new("⬇ Probe Surface (Z=0)").size(12.0).color(Color32::from_rgb(0, 220, 255)))
-                .fill(Color32::from_rgb(24, 45, 60));
-            if ui.add(probe_btn).on_hover_text("Lower head until nozzle touches sheet metal to zero Z coordinate").clicked() {
-                if let Some(ref c) = controller {
-                    c.probe_surface_z();
-                    *status_message = "Probing surface... Z zero set on contact.".to_string();
-                } else {
-                    *status_message = "Controller offline.".to_string();
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // 2. Optics & Test Pulse
-        ribbon_group(ui, "Laser & Optics", |ui| {
-            let pulse_btn = Button::new(RichText::new(format!("⚡ Pulse {}ms", state.pulse_duration_ms)).size(12.0).color(Color32::from_rgb(255, 230, 80)))
-                .fill(Color32::from_rgb(48, 42, 24));
-            if ui.add(pulse_btn).on_hover_text(format!("Fire laser test burst: {}ms at {:.0}% power", state.pulse_duration_ms, state.pulse_power_pct)).clicked() {
-                if let Some(ref c) = controller {
-                    c.laser_pulse(state.pulse_duration_ms, state.pulse_power_pct);
-                    *status_message = format!("Test pulse fired: {}ms @ {:.0}% power.", state.pulse_duration_ms, state.pulse_power_pct);
-                } else {
-                    *status_message = "Controller offline.".to_string();
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // 3. Work Origin & Homing
-        ribbon_group(ui, "Origin & Homing", |ui| {
-            let is_conn = controller.as_ref().map_or(false, |c| c.is_connected());
-            if ui.add_enabled(is_conn, Button::new(RichText::new("🏠 Home All").size(12.0).color(Color32::from_rgb(130, 235, 180))).fill(Color32::from_rgb(24, 65, 50))).on_hover_text(format!("Home all 3 axes (Z up, then X/Y toward {})", pulse_config.origin_corner)).clicked() {
-                if let Some(ref c) = controller {
-                    c.home_all(crate::panels::home_config_from_pulse(pulse_config));
-                    *status_message = format!("Homing Z (up) and X/Y toward {}...", pulse_config.origin_corner);
-                }
-            }
-
-            if ui.add_enabled(is_conn, Button::new(RichText::new("⬆ Z-Home").size(12.0).color(Color32::from_rgb(130, 210, 255))).fill(Color32::from_rgb(24, 52, 78))).on_hover_text("Home Z-axis only (Z-up until sensor triggers)").clicked() {
-                if let Some(ref c) = controller {
-                    c.home_z();
-                    *status_message = "Homing Z-axis (moving Z-up to sensor)...".to_string();
-                }
-            }
-
-            if ui.add(Button::new(RichText::new("📍 Set Origin").size(12.0).color(Color32::from_rgb(0, 230, 230))).fill(Color32::from_rgb(20, 48, 55))).on_hover_text("Zero Workpiece Origin (G54 X0 Y0) at current head position").clicked() {
-                *status_message = format!("Workpiece Origin set at current position (X: {}, Y: {})", status.pos_x, status.pos_y);
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // 3b. After Job Behavior
+        // 5. After Job Behavior
         ribbon_group(ui, "After Job", |ui| {
             let mut post_changed = false;
             ui.vertical(|ui| {
@@ -1282,30 +1314,17 @@ fn render_laser_tab(
                 let _ = pulse_config.save();
             }
         });
-
-        ui.add_space(4.0);
-
-        // 4. Safety
-        ribbon_group(ui, "Safety", |ui| {
-            let estop_btn = Button::new(RichText::new("🛑 E-STOP").size(12.0).color(Color32::WHITE).strong())
-                .fill(Color32::from_rgb(180, 30, 30));
-            if ui.add(estop_btn).on_hover_text("IMMEDIATE EMERGENCY STOP - Halts all motion and turns laser OFF").clicked() {
-                if let Some(ref c) = controller {
-                    c.stop();
-                }
-                *status_message = "EMERGENCY STOP TRIGGERED. All motion halted.".to_string();
-            }
-        });
     });
 }
 
-fn render_properties_tab(
+fn render_laser_table_tab(
     ui: &mut Ui,
+    state: &mut RibbonState,
     pulse_config: &mut PulseConfig,
     props_window_state: &mut crate::properties_window::PropertiesWindowState,
     canvas_state: &mut crate::canvas::CanvasState,
     panel_state: &mut crate::panels::PanelState,
-    controller: &Option<LaserController>,
+    controller: &mut Option<LaserController>,
     status_message: &mut String,
 ) {
     let mut changed = false;
@@ -1313,7 +1332,45 @@ fn render_properties_tab(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
 
-        // 1. Table Properties Modal Launcher
+        // 1. Head Calibration (Capacitive Height Sensor)
+        ribbon_group(ui, "Head Calibration (Capacitive)", |ui| {
+            let cal_btn = Button::new(RichText::new("🎯 Calibrate Sensor").size(12.0).color(Color32::from_rgb(255, 215, 0)).strong())
+                .fill(Color32::from_rgb(50, 42, 20));
+            if ui.add(cal_btn).on_hover_text("Open capacitive height sensor calibration & live Z telemetry dialog").clicked() {
+                state.show_sensor_cal_dialog = true;
+                state.sensor_cal_aborted = false;
+                if controller.is_none() {
+                    *status_message = "Controller offline. Connect controller before calibrating sensor.".to_string();
+                }
+            }
+        });
+
+        // 2. Idle Presets (Jogging, Framing & Test Pulse)
+        ribbon_group(ui, "Idle Presets", |ui| {
+            let is_open = state.show_jog_presets_dialog;
+            let btn_fill = if is_open {
+                Color32::from_rgb(28, 95, 145)
+            } else {
+                Color32::from_rgb(38, 52, 72)
+            };
+            let presets_btn = Button::new(
+                RichText::new("🏃 Idle Presets")
+                    .size(12.0)
+                    .color(Color32::from_rgb(160, 230, 255))
+                    .strong(),
+            )
+            .fill(btn_fill)
+            .min_size(Vec2::new(124.0, 36.0));
+            if ui
+                .add(presets_btn)
+                .on_hover_text("Configure X/Y/Z jog speeds, fast jog speeds, framing speed, and laser test pulse (intensity, duration, frequency)")
+                .clicked()
+            {
+                state.show_jog_presets_dialog = !state.show_jog_presets_dialog;
+            }
+        });
+
+        // 3. Table Properties Modal Launcher
         ribbon_group(ui, "Table & Machine Setup", |ui| {
             let is_open = props_window_state.open;
             let btn_fill = if is_open {
@@ -1384,95 +1441,241 @@ fn render_properties_tab(
                 });
             });
         });
+    });
 
-        ui.add_space(2.0);
+    if changed {
+        crate::properties_window::sync_and_save_properties(
+            pulse_config,
+            canvas_state,
+            panel_state,
+            controller,
+            status_message,
+        );
+    }
+}
 
-        // 2. Quick Jog Speed & Presets
-        ribbon_group(ui, "Jog Speed & Presets (Auto-Saved)", |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("XY Speed:").size(11.0));
+fn render_jog_presets_dialog(
+    ctx: &egui::Context,
+    state: &mut RibbonState,
+    pulse_config: &mut PulseConfig,
+    canvas_state: &mut crate::canvas::CanvasState,
+    panel_state: &mut crate::panels::PanelState,
+    controller: &Option<LaserController>,
+    status_message: &mut String,
+) {
+    if !state.show_jog_presets_dialog {
+        return;
+    }
+
+    let mut open = state.show_jog_presets_dialog;
+    let mut changed = false;
+
+    egui::Window::new("🏃 Idle Presets")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+
+            ui.label(RichText::new("Normal Jogging Speeds").strong().color(Color32::from_rgb(150, 220, 255)));
+            egui::Grid::new("jog_presets_normal_grid")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("X Jog Speed:");
                     if ui
                         .add(
-                            egui::DragValue::new(&mut pulse_config.jog_speed_mm_s)
+                            DragValue::new(&mut pulse_config.jog_speed_mm_s)
                                 .range(0.5..=500.0)
                                 .speed(0.5)
                                 .suffix(" mm/s"),
                         )
-                        .on_hover_text("Conservative XY jog speed in mm/s")
                         .changed()
                     {
                         changed = true;
                     }
+                    ui.end_row();
 
-                    ui.label(RichText::new("Z Reg:").size(11.0));
+                    ui.label("Y Jog Speed:");
                     if ui
                         .add(
-                            egui::DragValue::new(&mut pulse_config.z_jog_speed_reg)
+                            DragValue::new(&mut pulse_config.jog_speed_y_mm_s)
+                                .range(0.5..=500.0)
+                                .speed(0.5)
+                                .suffix(" mm/s"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Z Jog Speed (Reg):");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.z_jog_speed_reg)
                                 .range(1..=1000)
                                 .speed(1.0),
                         )
-                        .on_hover_text("Z-axis Modbus speed register (conservative: 25, SC2000 capture: 100)")
                         .changed()
                     {
                         changed = true;
                     }
+                    ui.end_row();
                 });
 
-                ui.horizontal(|ui| {
-                    let safe_btn = Button::new(
-                        RichText::new("🛡 Conservative Safe")
-                            .size(11.0)
-                            .color(Color32::from_rgb(130, 240, 175))
-                            .strong(),
-                    )
-                    .fill(Color32::from_rgb(24, 52, 38))
-                    .min_size(Vec2::new(125.0, 19.0));
+            ui.separator();
+            ui.label(RichText::new("Fast Jogging Speeds").strong().color(Color32::from_rgb(255, 210, 120)));
+            egui::Grid::new("jog_presets_fast_grid")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Fast X Jog Speed:");
                     if ui
-                        .add(safe_btn)
-                        .on_hover_text("Reset to slow, conservative safe defaults (200 pls/mm, 10 mm/s jog, 1 mm step)")
-                        .clicked()
+                        .add(
+                            DragValue::new(&mut pulse_config.fast_jog_speed_x_mm_s)
+                                .range(1.0..=1000.0)
+                                .speed(1.0)
+                                .suffix(" mm/s"),
+                        )
+                        .changed()
                     {
-                        let ip = pulse_config.controller_ip.clone();
-                        let w = pulse_config.table_width_mm;
-                        let h = pulse_config.table_height_mm;
-                        *pulse_config = PulseConfig::default();
-                        pulse_config.controller_ip = ip;
-                        pulse_config.table_width_mm = w;
-                        pulse_config.table_height_mm = h;
-                        panel_state.jog_mode = crate::panels::JogMode::Step(pulse_config.default_step_mm);
-                        panel_state.step_index = 1;
                         changed = true;
                     }
+                    ui.end_row();
 
-                    let sc2000_btn = Button::new(
-                        RichText::new("📋 SC2000 (590 / 1000)")
-                            .size(11.0)
-                            .color(Color32::from_rgb(255, 220, 110))
-                            .strong(),
-                    )
-                    .fill(Color32::from_rgb(48, 42, 22))
-                    .min_size(Vec2::new(135.0, 19.0));
+                    ui.label("Fast Y Jog Speed:");
                     if ui
-                        .add(sc2000_btn)
-                        .on_hover_text("Apply SC2000 BkHardPara.xml scaling (2000×3000 mm, 590 pulses/mm XY, 1,000 pulses/mm Z)")
-                        .clicked()
+                        .add(
+                            DragValue::new(&mut pulse_config.fast_jog_speed_y_mm_s)
+                                .range(1.0..=1000.0)
+                                .speed(1.0)
+                                .suffix(" mm/s"),
+                        )
+                        .changed()
                     {
-                        pulse_config.table_width_mm = 2000.0;
-                        pulse_config.table_height_mm = 3000.0;
-                        pulse_config.pulses_per_mm_x = 590.0;
-                        pulse_config.pulses_per_mm_y = 590.0;
-                        pulse_config.pulses_per_mm_z = 1_000.0;
-                        pulse_config.jog_start_speed_mm_s = 10.0;
-                        pulse_config.jog_speed_mm_s = 10.0;
-                        pulse_config.jog_accel_mm_s2 = 100.0;
-                        pulse_config.z_jog_speed_reg = 50;
                         changed = true;
                     }
+                    ui.end_row();
+
+                    ui.label("Fast Z Jog Speed (Reg):");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.fast_z_jog_speed_reg)
+                                .range(1..=2000)
+                                .speed(1.0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
                 });
+
+            ui.separator();
+            ui.label(RichText::new("Framing").strong().color(Color32::from_rgb(160, 240, 180)));
+            egui::Grid::new("idle_presets_frame_grid")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Frame Shape:");
+                    egui::ComboBox::from_id_salt("idle_presets_frame_mode_combo")
+                        .width(190.0)
+                        .selected_text(pulse_config.frame_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                tzlaser_core::FrameMode::Rectangle,
+                                tzlaser_core::FrameMode::ConvexHull,
+                                tzlaser_core::FrameMode::ConcaveHull,
+                            ] {
+                                if ui
+                                    .selectable_value(&mut pulse_config.frame_mode, mode, mode.label())
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Frame Trace Speed:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.frame_speed_mm_s)
+                                .range(1.0..=500.0)
+                                .speed(1.0)
+                                .suffix(" mm/s"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
+                });
+
+            ui.separator();
+            ui.label(RichText::new("Laser Test Pulse Settings").strong().color(Color32::from_rgb(255, 230, 100)));
+            egui::Grid::new("jog_presets_pulse_grid")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Intensity (Power):");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.test_pulse_power_pct)
+                                .range(0.0..=100.0)
+                                .speed(1.0)
+                                .suffix(" %"),
+                        )
+                        .changed()
+                    {
+                        state.pulse_power_pct = pulse_config.test_pulse_power_pct;
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Duration:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.test_pulse_duration_ms)
+                                .range(1..=10_000)
+                                .speed(1.0)
+                                .suffix(" ms"),
+                        )
+                        .changed()
+                    {
+                        state.pulse_duration_ms = pulse_config.test_pulse_duration_ms;
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Frequency:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.test_pulse_freq_hz)
+                                .range(50..=50_000)
+                                .speed(50.0)
+                                .suffix(" Hz"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
+                });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Close").clicked() {
+                    state.show_jog_presets_dialog = false;
+                }
             });
         });
-    });
+
+    if !open {
+        state.show_jog_presets_dialog = false;
+    }
 
     if changed {
         crate::properties_window::sync_and_save_properties(

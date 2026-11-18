@@ -9,3 +9,6 @@
 .vscode/
 *.swp
 *~
+
+# Original software packet (do not commit)
+/org/

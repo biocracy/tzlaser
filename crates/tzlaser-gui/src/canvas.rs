@@ -205,7 +205,7 @@ impl Default for CanvasState {
             show_cut_direction: true,
             show_grid: true,
             show_rulers: true,
-            show_retraction_zone: true,
+            show_retraction_zone: false,
             home_retract_x_mm: 10.0,
             home_retract_y_mm: 10.0,
             color_by_cut_index: false,
@@ -710,6 +710,7 @@ pub fn render_canvas(
     can_context_menu: bool,
     completed_before_path_1based: Option<usize>,
     initial_rapid_waypoints: &[Point],
+    active_frame_polygon: &[Point],
 ) -> Response {
     let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
     state.last_viewport_size = response.rect.size();
@@ -1561,6 +1562,28 @@ pub fn render_canvas(
                             if is_initial_done { 5.0 } else { 4.0 },
                         ));
                     }
+                }
+            }
+
+            if active_frame_polygon.len() >= 2 {
+                let frame_stroke = Stroke::new(2.2_f32, Color32::from_rgb(255, 200, 50));
+                let mut screen_pts: Vec<Pos2> = Vec::with_capacity(active_frame_polygon.len() + 1);
+                for &p in active_frame_polygon {
+                    let sp = state.world_to_screen(p, origin_screen);
+                    if screen_pts.last().is_none_or(|prev| prev.distance(sp) > 0.5) {
+                        screen_pts.push(sp);
+                    }
+                }
+                if screen_pts.len() >= 3 {
+                    screen_pts.push(screen_pts[0]);
+                }
+                if screen_pts.len() >= 2 {
+                    painter.add(egui::Shape::dashed_line(
+                        &screen_pts,
+                        frame_stroke,
+                        8.0,
+                        4.0,
+                    ));
                 }
             }
 

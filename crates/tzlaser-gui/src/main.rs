@@ -625,6 +625,7 @@ impl eframe::App for TzlaserApp {
                 can_context_menu,
                 completed_before,
                 &initial_rapid,
+                &self.panel_state.active_frame_polygon,
             );
             if let Some(target_pt) = self.canvas_state.pending_continue_from_point.take() {
                 if let Some(msg) = self.panel_state.set_pause_at_path_point(

@@ -2,6 +2,7 @@ pub mod controller;
 pub mod crc;
 pub mod motion;
 pub mod packet;
+pub mod sc2000_ref;
 
 pub use controller::{Command, LaserController};
 pub use crc::modbus_crc16;
