@@ -2,6 +2,8 @@
 
 Industrial fiber laser cutting control and CAM software written in Rust, targeting SC2000-compatible motion & capacitive height controller boards over Ethernet/UDP.
 
+![Ţlaser UI](docs/screenshot.jpg)
+
 ## Current Project Status
 
 | Subsystem | Status | Notes |
@@ -55,3 +57,12 @@ cargo run -p tzlaser-gui
 ```bash
 cargo test --workspace
 ```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+- **Attribution Required**: Any copy or substantial portion of this software must retain the copyright notice and permission notice from `LICENSE`.
+- **No Warranty & No Liability**: This software is provided *"as is"*, without warranty of any kind. The authors and copyright holders shall in no event be held liable for any claim, damages, hardware failure, personal injury, or other liability arising from the use of this software. Always verify motion paths, machine limits, and laser safety interlocks before operating physical machinery.
