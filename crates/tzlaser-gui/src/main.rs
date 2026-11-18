@@ -38,6 +38,8 @@ struct TzlaserApp {
     status_message: String,
     last_logged_status: String,
     last_logged_connected: bool,
+    homing_in_progress: bool,
+    home_complete_popup_until: Option<std::time::Instant>,
 }
 
 impl Default for TzlaserApp {
@@ -110,6 +112,8 @@ impl Default for TzlaserApp {
             status_message: "Ready. Auto-connecting to controller (10.1.1.168:502 & :999).".to_string(),
             last_logged_status: String::new(),
             last_logged_connected: false,
+            homing_in_progress: false,
+            home_complete_popup_until: None,
         }
     }
 }
@@ -260,12 +264,49 @@ impl eframe::App for TzlaserApp {
             ctx.set_visuals(windows_dark_visuals());
         }
 
-        // Poll status from background thread if connected
+        // Poll status from background thread if connected, using fast 30ms repaints only while active
         if let Some(ref c) = self.controller {
-            if c.is_connected() {
+            let is_conn = c.is_connected();
+            if is_conn {
                 self.status = c.get_status();
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            if self.status.is_homing_xy {
+                self.homing_in_progress = true;
+            } else if self.homing_in_progress && self.status.xy_homed && !self.status.is_live_cutting {
+                self.homing_in_progress = false;
+                self.home_complete_popup_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                self.status_message = "Homing completed successfully.".to_string();
+            }
+            if !is_conn {
+                self.homing_in_progress = false;
+            }
+            let active_now = self.panel_state.run_mode != panels::RunMode::Idle
+                || self.home_complete_popup_until.is_some()
+                || self.status.is_moving
+                || self.status.is_homing_xy
+                || self.status.is_homing_z
+                || self.status.is_calibrating_z
+                || self.status.z_state_code != 0
+                || self.status.z_velocity != 0
+                || self.status.laser_on
+                || (self.status.remote_button_mask & !0x0100_0000) != 0
+                || self.ribbon_state.show_sensor_cal_dialog
+                || self.ribbon_state.cool_solver.is_some()
+                || self.props_window_state.calib_dialog.is_some()
+                || self
+                    .props_window_state
+                    .measure_axis
+                    .as_ref()
+                    .is_some_and(|m| m.is_running());
+            let repaint_interval = if active_now {
+                std::time::Duration::from_millis(30)
+            } else if is_conn {
+                std::time::Duration::from_millis(250)
+            } else {
+                std::time::Duration::from_millis(500)
+            };
+            ctx.request_repaint_after(repaint_interval);
         }
 
         // Advance active Start / Dry-Cut simulation along toolpaths
@@ -652,10 +693,54 @@ impl eframe::App for TzlaserApp {
                     );
                 }
             }
+            if let Some(target_pt) = self.canvas_state.pending_go_here_point.take() {
+                if self.pulse_config.soft_limits_enabled
+                    && !panels::point_within_cut_area(target_pt, &self.pulse_config)
+                {
+                    self.status_message = format!(
+                        "Target ({:.1}, {:.1} mm) is outside the cuttable area.",
+                        target_pt.x, target_pt.y
+                    );
+                } else if let Some(ref c) = self.controller {
+                    if c.is_connected() {
+                        let head_world = panels::head_world_mm(&self.status, &self.pulse_config);
+                        let dx = self.pulse_config.mm_to_pulses_x(target_pt.x - head_world.x);
+                        let dy = self.pulse_config.mm_to_pulses_y(target_pt.y - head_world.y);
+                        if dx != 0 || dy != 0 {
+                            let (min_speed, jog_speed, accel) = self.pulse_config.jog_pulses_params();
+                            let move_cfg = tzlaser_protocol::JogConfig {
+                                min_speed,
+                                jog_speed,
+                                accel,
+                            };
+                            c.move_xy(dx, dy, move_cfg);
+                        }
+                        self.status_message = format!(
+                            "Moving head to X: {:.1}, Y: {:.1} mm.",
+                            target_pt.x, target_pt.y
+                        );
+                    } else {
+                        self.status.pos_x = self.pulse_config.mm_to_pulses_x(target_pt.x - origin_world.x);
+                        self.status.pos_y = self.pulse_config.mm_to_pulses_y(target_pt.y - origin_world.y);
+                        self.status_message = format!(
+                            "Offline head moved to X: {:.1}, Y: {:.1} mm.",
+                            target_pt.x, target_pt.y
+                        );
+                    }
+                } else {
+                    self.status.pos_x = self.pulse_config.mm_to_pulses_x(target_pt.x - origin_world.x);
+                    self.status.pos_y = self.pulse_config.mm_to_pulses_y(target_pt.y - origin_world.y);
+                    self.status_message = format!(
+                        "Offline head moved to X: {:.1}, Y: {:.1} mm.",
+                        target_pt.x, target_pt.y
+                    );
+                }
+            }
         });
 
         // 5. Floating Selection Coordinates & D-Pad Nudge Pop-up Window (hidden during interactive manual sort)
         if !self.canvas_state.manual_sort_active {
+            let head_world = panels::head_world_mm(&self.status, &self.pulse_config);
             render_selection_hud(
                 ctx,
                 &mut self.hud_state,
@@ -665,6 +750,7 @@ impl eframe::App for TzlaserApp {
                 self.canvas_state.bed_width_mm,
                 self.canvas_state.bed_height_mm,
                 &self.canvas_state.origin_corner,
+                head_world,
             );
         }
 
@@ -755,6 +841,57 @@ impl eframe::App for TzlaserApp {
                 });
             if close_prompt {
                 self.panel_state.show_home_prompt = false;
+            }
+        }
+
+        // 8B. Homing Complete Auto-Closing Popup (closes after 5s or on OK)
+        if let Some(until) = self.home_complete_popup_until {
+            let now = std::time::Instant::now();
+            if now >= until {
+                self.home_complete_popup_until = None;
+            } else {
+                let rem_secs = (until - now).as_secs_f32().max(0.0);
+                let mut close_now = false;
+                egui::Window::new("✅ Homing Complete")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.label(
+                            RichText::new("Machine homing completed successfully.")
+                                .size(13.5)
+                                .strong()
+                                .color(Color32::from_rgb(120, 235, 180)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "X, Y, and Z axes are at origin. Closing automatically in {:.1}s...",
+                                rem_secs
+                            ))
+                            .size(11.5)
+                            .color(Color32::from_rgb(180, 190, 205)),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let ok_btn = egui::Button::new(
+                                    RichText::new("OK").color(Color32::WHITE).strong(),
+                                )
+                                .fill(Color32::from_rgb(28, 125, 78))
+                                .min_size(egui::Vec2::new(80.0, 28.0));
+                                if ui.add(ok_btn).clicked() {
+                                    close_now = true;
+                                }
+                            });
+                        });
+                    });
+                if close_now {
+                    self.home_complete_popup_until = None;
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
             }
         }
 

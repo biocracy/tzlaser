@@ -6,20 +6,25 @@ use std::time::{Duration, Instant};
 
 use crate::motion::{
     build_fifo_finish_packets, build_fifo_packet, build_fifo_start_packets, build_init_packets,
-    build_initial_enable_packets, build_jog_packet, build_stop_packets, build_xy_home_packets,
-    build_xy_move_packet, build_z_calibrate_packet, build_z_handshake_packets,
-    build_z_home_packet, build_z_jog_packet, build_z_poll_packet, build_z_stop_packet,
-    decode_remote_jog, decode_z_poll_response, decode_z_poll_telemetry, fifo_flags, registers,
-    remote_buttons, Axis, CalibrationMonitor, HomeConfig, JogConfig, MachineStatus,
-    SignalTelemetry, CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
+    build_initial_enable_packets, build_jog_packet, build_live_cut_setup_packets,
+    build_live_cut_teardown_packets, build_manual_laser_packets, build_set_shutter_packets,
+    build_stop_packets, build_xy_home_packets,
+    build_xy_move_packet, build_z_calibrate_packet, build_z_follow_packet,
+    build_z_handshake_packets, build_z_home_packet, build_z_jog_packet, build_z_poll_packet,
+    build_z_retract_packet, build_z_stop_packet, decode_remote_jog, decode_z_poll_response,
+    decode_z_poll_telemetry, fifo_flags, registers, remote_buttons, Axis, CalibrationMonitor,
+    HomeConfig, JogConfig, LiveCutContour, MachineStatus, SignalTelemetry,
+    CONTINUOUS_JOG_PULSES_XY, CONTINUOUS_JOG_PULSES_Z, DEFAULT_Z_JOG_SPEED,
 };
 use crate::packet::{Opcode, Packet};
+use crate::sc2000_ref::{build_sc2000_fifo_frame, build_set_do_packet, InterpItem, InterpItemCmd};
 
 pub enum Command {
     Jog { axis: Axis, pulses: i32 },
     JogWithConfig { axis: Axis, pulses: i32, config: JogConfig, auto_stop: bool },
     MoveXY { dx: i32, dy: i32, config: JogConfig },
     StartFifoStream { ticks: Vec<(i8, i8, u8)> },
+    StartLiveCut { contours: Vec<LiveCutContour> },
     StartContinuousJog { axis: Axis, direction: i32 },
     Stop,
     HomeAll(HomeConfig),
@@ -31,6 +36,8 @@ pub enum Command {
     ProbeSurfaceZ,
     SetFollowerServo(bool),
     SetRedPointer(bool),
+    SetShutter(bool),
+    SetManualLaser { on: bool, power_pct: f32 },
     LaserPulse { duration_ms: u32, power_pct: f32 },
     SetGas { gas_type: u8, open: bool },
 }
@@ -101,10 +108,29 @@ impl LaserController {
             let mut last_r1006: u32 = 8000;
             let mut last_r1022: u32 = 0;
             let mut pending_xy_home_after_z: Option<(HomeConfig, Instant, Instant)> = None;
+            #[derive(Clone, Copy)]
+            enum XyHomeStage {
+                SeekY,
+                WaitRetractY(Instant),
+                RetractingY(Instant),
+                SeekX,
+                WaitRetractX(Instant),
+                RetractingX(Instant),
+            }
+            #[derive(Clone, Copy)]
+            struct XyHomeWatch {
+                cfg: HomeConfig,
+                stage: XyHomeStage,
+            }
+            let mut active_xy_home_watch: Option<XyHomeWatch> = None;
+            let mut soft_xy_homed = false;
+            let mut soft_home_origin: Option<(i32, i32)> = None;
+            let mut last_raw_pos: (i32, i32) = (0, 0);
             let mut pending_z_home_after_cal_stop_at: Option<Instant> = None;
             let mut cal_monitor: Option<CalibrationMonitor> = None;
             let mut active_remote_z_fast: bool = false;
             let mut ui_continuous_z_jog: bool = false;
+            let mut remote_laser_firing: bool = false;
             struct FifoStreamState {
                 ticks: Vec<(i8, i8, u8)>,
                 cursor: usize,
@@ -116,8 +142,24 @@ impl LaserController {
                 telemetry_cursor: usize,
                 last_telemetry_at: Instant,
                 last_log_at: Instant,
+                is_live_cut: bool,
             }
             let mut active_fifo: Option<FifoStreamState> = None;
+
+            enum LiveCutStage {
+                StartContour,
+                WaitRapid { started_at: Instant, deadline: Instant },
+                WaitZFollow { started_at: Instant, deadline: Instant },
+                WaitPierce { until: Instant, next_fifo_seq: u32 },
+                StreamingFifo,
+                WaitZRetract { until: Instant },
+            }
+            struct LiveCutState {
+                contours: Vec<LiveCutContour>,
+                idx: usize,
+                stage: LiveCutStage,
+            }
+            let mut active_live_cut: Option<LiveCutState> = None;
 
             // Helper to send a Port 502 packet and wait briefly for its ACK during initialization
             let send_and_wait_ack = |sock: &UdpSocket, pkt: &Packet, recv_buf: &mut [u8]| -> bool {
@@ -232,6 +274,20 @@ impl LaserController {
             let mut last_enable_retry = Instant::now();
 
             while running_clone.load(Ordering::Relaxed) {
+                let loop_started = Instant::now();
+                let mut had_activity = active_fifo.is_some()
+                    || active_live_cut.is_some()
+                    || active_remote_jog.is_some()
+                    || active_step_watch.is_some()
+                    || active_z_step_watch.is_some()
+                    || auto_stop_at.is_some()
+                    || pending_remote_stop_at.is_some()
+                    || pending_stop_p2_at.is_some()
+                    || pending_xy_home_after_z.is_some()
+                    || active_xy_home_watch.is_some()
+                    || pending_z_home_after_cal_stop_at.is_some()
+                    || cal_monitor.is_some();
+
                 // 0. Check scheduled stop-phase-2 (REG_COMMAND = 2 sent ~140ms after REG_JOG_RAMP)
                 if let Some(t_p2) = pending_stop_p2_at {
                     if Instant::now() >= t_p2 {
@@ -304,12 +360,17 @@ impl LaserController {
 
                 // 1. Process pending commands from UI
                 while let Ok(cmd) = command_rx.try_recv() {
+                    had_activity = true;
                     match cmd {
                         Command::Jog { axis, pulses } => {
                             if pulses == 0 {
                                 continue;
                             }
                             if axis == Axis::Z {
+                                if pulses < 0 && status_clone.lock().unwrap().nozzle_touch_alarm {
+                                    eprintln!("[ALARM] Blocked Z- jog: cutting head touching sheet!");
+                                    continue;
+                                }
                                 if let Some(ref zs) = z_socket {
                                     // For a finite Z step jog, `cmd = 9` on Port 999 takes the exact
                                     // relative pulse target (`hw_pulses = -pulses`) and moves to target.
@@ -395,6 +456,10 @@ impl LaserController {
                                 continue;
                             }
                             if axis == Axis::Z {
+                                if pulses < 0 && status_clone.lock().unwrap().nozzle_touch_alarm {
+                                    eprintln!("[ALARM] Blocked Z- jog: cutting head touching sheet!");
+                                    continue;
+                                }
                                 if let Some(ref zs) = z_socket {
                                     let custom_z_speed = ((config.jog_speed as f64) / 200.0)
                                         .round()
@@ -560,11 +625,37 @@ impl LaserController {
                                 telemetry_cursor: 0,
                                 last_telemetry_at: now,
                                 last_log_at: now,
+                                is_live_cut: false,
                             });
+                        }
+                        Command::StartLiveCut { contours } => {
+                            if contours.is_empty() {
+                                continue;
+                            }
+                            if status_clone.lock().unwrap().nozzle_touch_alarm {
+                                eprintln!("[ALARM] Blocked StartLiveCut: cutting head touching sheet!");
+                                continue;
+                            }
+                            active_fifo = None;
+                            active_step_watch = None;
+                            auto_stop_at = None;
+                            active_xy_home_watch = None;
+                            pending_xy_home_after_z = None;
+                            let count = contours.len();
+                            active_live_cut = Some(LiveCutState {
+                                contours,
+                                idx: 0,
+                                stage: LiveCutStage::StartContour,
+                            });
+                            eprintln!("[LIVE-CUT] Starting {} contour(s)", count);
                         }
                         Command::StartContinuousJog { axis, direction } => {
                             let sign = if direction >= 0 { 1 } else { -1 };
                             if axis == Axis::Z {
+                                if sign < 0 && status_clone.lock().unwrap().nozzle_touch_alarm {
+                                    eprintln!("[ALARM] Blocked continuous Z- jog: cutting head touching sheet!");
+                                    continue;
+                                }
                                 if let Some(ref zs) = z_socket {
                                     ui_continuous_z_jog = true;
                                     let eff_z_speed = z_jog_speed.max(120);
@@ -632,7 +723,36 @@ impl LaserController {
                             active_remote_z_fast = false;
                             ui_continuous_z_jog = false;
                             pending_xy_home_after_z = None;
+                            active_xy_home_watch = None;
                             telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Stop"));
+                            if active_live_cut.take().is_some() {
+                                for tpkt in build_live_cut_teardown_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                                }
+                            } else {
+                                // Always turn off laser (DO10), shutter (DO9), and assist gas (DO12) on Stop / E-Stop.
+                                for mpkt in build_manual_laser_packets(
+                                    || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                    false,
+                                    0.0,
+                                ) {
+                                    let _ = socket.send_to(&mpkt.encode(), target_addr);
+                                }
+                                for spkt in build_set_shutter_packets(
+                                    || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                    false,
+                                ) {
+                                    let _ = socket.send_to(&spkt.encode(), target_addr);
+                                }
+                                let s_gas = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let _ = socket.send_to(
+                                    &build_set_do_packet(s_gas, 12, false).encode(),
+                                    target_addr,
+                                );
+                            }
+                            remote_laser_firing = false;
                             if active_fifo.take().is_some() {
                                 for fpkt in build_fifo_finish_packets(|| {
                                     seq_clone.fetch_add(1, Ordering::Relaxed)
@@ -647,10 +767,6 @@ impl LaserController {
                             pending_stop_p2_at = Some(Instant::now() + Duration::from_millis(140));
 
                             if let Some(ref zs) = z_socket {
-                                let was_calibrating = {
-                                    let st = status_clone.lock().unwrap();
-                                    st.is_calibrating_z || st.z_state_code == 7 || cal_monitor.is_some()
-                                };
                                 cal_monitor = None;
                                 let raw_stop = build_z_stop_packet();
                                 send_z_cmd_with_ack(
@@ -663,15 +779,23 @@ impl LaserController {
                                 let at_upper = {
                                     let mut st = status_clone.lock().unwrap();
                                     st.is_calibrating_z = false;
+                                    st.laser_on = false;
+                                    st.gas_valve_open = false;
+                                    st.is_live_cutting = false;
                                     st.z_pos_sensor
                                 };
-                                if was_calibrating && !at_upper {
+                                if !at_upper {
                                     pending_z_home_after_cal_stop_at =
                                         Some(Instant::now() + Duration::from_millis(80));
                                 } else {
                                     pending_z_home_after_cal_stop_at = None;
                                 }
                                 last_z_poll = Instant::now() - Duration::from_secs(1);
+                            } else {
+                                let mut st = status_clone.lock().unwrap();
+                                st.laser_on = false;
+                                st.gas_valve_open = false;
+                                st.is_live_cutting = false;
                             }
                         }
                         Command::HomeAll(home_cfg) => {
@@ -679,6 +803,22 @@ impl LaserController {
                             active_step_watch = None;
                             active_z_step_watch = None;
                             active_remote_jog = None;
+                            active_xy_home_watch = None;
+                            soft_xy_homed = false;
+                            soft_home_origin = None;
+                            if active_live_cut.take().is_some() {
+                                for tpkt in build_live_cut_teardown_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                                }
+                                if let Some(ref zs) = z_socket {
+                                    let raw_stop = build_z_stop_packet();
+                                    send_z_cmd_with_ack(zs, &raw_stop, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                    pending_z_home_after_cal_stop_at =
+                                        Some(Instant::now() + Duration::from_millis(80));
+                                }
+                            }
                             if active_fifo.take().is_some() {
                                 for fpkt in build_fifo_finish_packets(|| {
                                     seq_clone.fetch_add(1, Ordering::Relaxed)
@@ -800,8 +940,39 @@ impl LaserController {
                         }
                         Command::SetRedPointer(enable) => {
                             let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                            let pkt = Packet::write_request(s, 2050, vec![if enable { 1 } else { 0 }]);
+                            let pkt = build_set_do_packet(s, 11, enable);
                             let _ = socket.send_to(&pkt.encode(), target_addr);
+                        }
+                        Command::SetShutter(open) => {
+                            for spkt in build_set_shutter_packets(
+                                || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                open,
+                            ) {
+                                let _ = send_and_wait_ack(&socket, &spkt, &mut buf);
+                            }
+                            if !open {
+                                for mpkt in build_manual_laser_packets(
+                                    || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                    false,
+                                    0.0,
+                                ) {
+                                    let _ = send_and_wait_ack(&socket, &mpkt, &mut buf);
+                                }
+                                remote_laser_firing = false;
+                            }
+                        }
+                        Command::SetManualLaser { on, power_pct } => {
+                            if on && !status_clone.lock().unwrap().shutter_open {
+                                eprintln!("[LASER] Ignored manual Laser ON: Shutter is closed.");
+                                continue;
+                            }
+                            for mpkt in build_manual_laser_packets(
+                                || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                on,
+                                power_pct,
+                            ) {
+                                let _ = send_and_wait_ack(&socket, &mpkt, &mut buf);
+                            }
                         }
                         Command::LaserPulse { duration_ms, power_pct } => {
                             let s = seq_clone.fetch_add(1, Ordering::Relaxed);
@@ -809,10 +980,9 @@ impl LaserController {
                             let pkt = Packet::write_request(s, 2060, vec![duration_ms, power_val]);
                             let _ = socket.send_to(&pkt.encode(), target_addr);
                         }
-                        Command::SetGas { gas_type, open } => {
+                        Command::SetGas { gas_type: _, open } => {
                             let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                            let val = if open { gas_type as u32 } else { 0 };
-                            let pkt = Packet::write_request(s, 2070, vec![val]);
+                            let pkt = build_set_do_packet(s, 12, open);
                             let _ = socket.send_to(&pkt.encode(), target_addr);
                         }
                     }
@@ -835,8 +1005,13 @@ impl LaserController {
                     }
                 }
 
-                // 3. Poll Port 502 machine status every 30ms (matching MCCore=30 in SC2000 ipAdd.ini)
-                if last_poll.elapsed() >= Duration::from_millis(30) {
+                // 3. Poll Port 502 machine status (12ms during XY homing limit watch, 30ms normal)
+                let poll_interval = if active_xy_home_watch.is_some() {
+                    Duration::from_millis(12)
+                } else {
+                    Duration::from_millis(30)
+                };
+                if last_poll.elapsed() >= poll_interval {
                     last_poll = Instant::now();
                     let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                     let poll_pkt = Packet::read_request(s, registers::REG_STATUS_BASE, 144);
@@ -855,6 +1030,7 @@ impl LaserController {
                     Duration::from_millis(50)
                 } else if active_z_step_watch.is_some()
                     || pending_xy_home_after_z.is_some()
+                    || active_xy_home_watch.is_some()
                     || matches!(active_remote_jog, Some((Axis::Z, _)))
                 {
                     Duration::from_millis(80)
@@ -875,6 +1051,7 @@ impl LaserController {
                     if src != target_addr {
                         continue;
                     }
+                    had_activity = true;
                     if let Ok(pkt) = Packet::decode(&buf[..n]) {
                         connected_clone.store(true, Ordering::Relaxed);
 
@@ -968,6 +1145,7 @@ impl LaserController {
                             // pressed button bitmask in `R1042` and `R1043`. The PC software watches this
                             // bitmask and sends the corresponding X/Y (Port 502) or Z (Port 999) jog & stop packets.
                             let rising_mask = new_st.remote_button_mask & !prev_remote_mask;
+                            let falling_mask = prev_remote_mask & !new_st.remote_button_mask;
                             prev_remote_mask = new_st.remote_button_mask;
 
                             if (rising_mask & remote_buttons::ANY_STOP) != 0 {
@@ -976,7 +1154,20 @@ impl LaserController {
                                 active_z_step_watch = None;
                                 active_remote_jog = None;
                                 pending_remote_stop_at = None;
-                                if active_fifo.take().is_some() {
+                                if active_live_cut.take().is_some() {
+                                for tpkt in build_live_cut_teardown_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                                }
+                                if let Some(ref zs) = z_socket {
+                                    let raw_stop = build_z_stop_packet();
+                                    send_z_cmd_with_ack(zs, &raw_stop, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                    pending_z_home_after_cal_stop_at =
+                                        Some(Instant::now() + Duration::from_millis(80));
+                                }
+                            }
+                            if active_fifo.take().is_some() {
                                     for fpkt in build_fifo_finish_packets(|| {
                                         seq_clone.fetch_add(1, Ordering::Relaxed)
                                     }) {
@@ -1017,11 +1208,68 @@ impl LaserController {
                                     last_z_poll = Instant::now() - Duration::from_secs(1);
                                     telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Stop Z"));
                                 }
-                            } else if (rising_mask & remote_buttons::GUIDE) != 0 {
+                            } else if (rising_mask
+                                & (remote_buttons::GUIDE | remote_buttons::CLEAR))
+                                != 0
+                            {
                                 let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                let next_red = if new_st.red_pointer_on { 0 } else { 1 };
-                                let pkt_red = Packet::write_request(s, 2050, vec![next_red]);
+                                let next_red = !new_st.red_pointer_on;
+                                let pkt_red = build_set_do_packet(s, 11, next_red);
                                 let _ = socket.send_to(&pkt_red.encode(), target_addr);
+                                new_st.red_pointer_on = next_red;
+                            } else if (rising_mask
+                                & (remote_buttons::GAS | remote_buttons::SPEED))
+                                != 0
+                            {
+                                let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                let next_gas = !new_st.gas_valve_open;
+                                let pkt_gas = build_set_do_packet(s, 12, next_gas);
+                                let _ = socket.send_to(&pkt_gas.encode(), target_addr);
+                                new_st.gas_valve_open = next_gas;
+                            } else if (rising_mask & remote_buttons::SHUTTER) != 0 {
+                                let next_shutter = !new_st.shutter_open;
+                                for spkt in build_set_shutter_packets(
+                                    || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                    next_shutter,
+                                ) {
+                                    let _ = send_and_wait_ack(&socket, &spkt, &mut buf);
+                                }
+                                new_st.shutter_open = next_shutter;
+                                if !next_shutter && remote_laser_firing {
+                                    for mpkt in build_manual_laser_packets(
+                                        || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                        false,
+                                        0.0,
+                                    ) {
+                                        let _ = send_and_wait_ack(&socket, &mpkt, &mut buf);
+                                    }
+                                    remote_laser_firing = false;
+                                    new_st.laser_on = false;
+                                }
+                            } else if (rising_mask & remote_buttons::LASER_FIRE) != 0 {
+                                if new_st.shutter_open {
+                                    for mpkt in build_manual_laser_packets(
+                                        || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                        true,
+                                        20.0,
+                                    ) {
+                                        let _ = send_and_wait_ack(&socket, &mpkt, &mut buf);
+                                    }
+                                    remote_laser_firing = true;
+                                    new_st.laser_on = true;
+                                }
+                            }
+
+                            if (falling_mask & remote_buttons::LASER_FIRE) != 0 && remote_laser_firing {
+                                for mpkt in build_manual_laser_packets(
+                                    || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                    false,
+                                    0.0,
+                                ) {
+                                    let _ = send_and_wait_ack(&socket, &mpkt, &mut buf);
+                                }
+                                remote_laser_firing = false;
+                                new_st.laser_on = false;
                             }
 
                             // If Stop button is currently held down, do not start or continue any remote jog.
@@ -1165,6 +1413,18 @@ impl LaserController {
                                 }
                             }
 
+                            // Apply supervised home origin offset before step-watch / UI status checks
+                            let raw_pos_x = new_st.pos_x;
+                            let raw_pos_y = new_st.pos_y;
+                            last_raw_pos = (raw_pos_x, raw_pos_y);
+                            if let Some((ox, oy)) = soft_home_origin {
+                                new_st.pos_x = raw_pos_x.saturating_sub(ox);
+                                new_st.pos_y = raw_pos_y.saturating_sub(oy);
+                            }
+                            if soft_xy_homed {
+                                new_st.xy_homed = true;
+                            }
+
                             // 5B. Step-mode position delta watch
                             if let Some((watch_axis, start_pos, target_delta)) = active_step_watch
                             {
@@ -1188,6 +1448,141 @@ impl LaserController {
                                         Some(Instant::now() + Duration::from_millis(140));
                                 }
                             }
+
+                            // 5C. Supervised sequential XY homing:
+                            // Stops each axis immediately when its limit switch triggers, backs off ~3.5 mm
+                            // to clear the switch, then homes the next axis, avoiding firmware overshoot.
+                            if let Some(mut hw) = active_xy_home_watch {
+                                new_st.is_homing_xy = true;
+                                new_st.xy_homed = false;
+                                let x_limit_bit: u32 = if hw.cfg.x_dir >= 0 { 0x01 } else { 0x02 };
+                                let y_limit_mask: u32 = if hw.cfg.y_dir >= 0 { 0x6C } else { 0x90 };
+                                let spd = hw.cfg.fast_speed_pls_s.max(400);
+                                let backoff = ((hw.cfg.max_search_pulses / 600) as i32).clamp(350, 2500);
+                                let seek_cfg = JogConfig {
+                                    min_speed: (spd / 2).max(100),
+                                    jog_speed: spd,
+                                    accel: (spd * 10).max(1000),
+                                };
+
+                                match hw.stage {
+                                    XyHomeStage::SeekY => {
+                                        if (new_st.limit_sensor_mask & y_limit_mask) != 0 {
+                                            let (p1, p2) = build_stop_packets(|| {
+                                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                                            });
+                                            let _ = socket.send_to(&p1.encode(), target_addr);
+                                            let _ = socket.send_to(&p2.encode(), target_addr);
+                                            hw.stage = XyHomeStage::WaitRetractY(
+                                                Instant::now() + Duration::from_millis(80),
+                                            );
+                                            eprintln!(
+                                                "[HOME] Y origin limit triggered (mask=0x{:02X}) -> immediate Stop, backing off",
+                                                new_st.limit_sensor_mask
+                                            );
+                                        }
+                                    }
+                                    XyHomeStage::WaitRetractY(at) => {
+                                        if Instant::now() >= at {
+                                            let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                            let p2 = Packet::write_request(s_rst, registers::REG_COMMAND, vec![2]);
+                                            let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                            let pkt = build_jog_packet(
+                                                s,
+                                                Axis::Y,
+                                                -hw.cfg.y_dir * backoff,
+                                                &seek_cfg,
+                                            );
+                                            let _ = socket.send_to(&pkt.encode(), target_addr);
+                                            hw.stage = XyHomeStage::RetractingY(Instant::now());
+                                        }
+                                    }
+                                    XyHomeStage::RetractingY(started) => {
+                                        if (started.elapsed() >= Duration::from_millis(350) && !new_st.is_moving)
+                                            || started.elapsed() >= Duration::from_millis(1600)
+                                        {
+                                            let (p1, p2) = build_stop_packets(|| {
+                                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                                            });
+                                            let _ = socket.send_to(&p1.encode(), target_addr);
+                                            let _ = socket.send_to(&p2.encode(), target_addr);
+                                            thread::sleep(Duration::from_millis(40));
+                                            if (new_st.limit_sensor_mask & x_limit_bit) != 0 {
+                                                hw.stage = XyHomeStage::WaitRetractX(
+                                                    Instant::now() + Duration::from_millis(40),
+                                                );
+                                            } else {
+                                                let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                                let pkt = build_jog_packet(
+                                                    s,
+                                                    Axis::X,
+                                                    hw.cfg.x_dir * (hw.cfg.max_search_pulses as i32),
+                                                    &seek_cfg,
+                                                );
+                                                let _ = socket.send_to(&pkt.encode(), target_addr);
+                                                hw.stage = XyHomeStage::SeekX;
+                                                eprintln!("[HOME] Y homed & cleared; seeking X origin (x_dir={})...", hw.cfg.x_dir);
+                                            }
+                                        }
+                                    }
+                                    XyHomeStage::SeekX => {
+                                        if (new_st.limit_sensor_mask & x_limit_bit) != 0 {
+                                            let (p1, p2) = build_stop_packets(|| {
+                                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                                            });
+                                            let _ = socket.send_to(&p1.encode(), target_addr);
+                                            let _ = socket.send_to(&p2.encode(), target_addr);
+                                            hw.stage = XyHomeStage::WaitRetractX(
+                                                Instant::now() + Duration::from_millis(80),
+                                            );
+                                            eprintln!(
+                                                "[HOME] X origin limit triggered (mask=0x{:02X}) -> immediate Stop, backing off",
+                                                new_st.limit_sensor_mask
+                                            );
+                                        }
+                                    }
+                                    XyHomeStage::WaitRetractX(at) => {
+                                        if Instant::now() >= at {
+                                            let s_rst = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                            let p2 = Packet::write_request(s_rst, registers::REG_COMMAND, vec![2]);
+                                            let _ = send_and_wait_ack(&socket, &p2, &mut buf);
+                                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                            let pkt = build_jog_packet(
+                                                s,
+                                                Axis::X,
+                                                -hw.cfg.x_dir * backoff,
+                                                &seek_cfg,
+                                            );
+                                            let _ = socket.send_to(&pkt.encode(), target_addr);
+                                            hw.stage = XyHomeStage::RetractingX(Instant::now());
+                                        }
+                                    }
+                                    XyHomeStage::RetractingX(started) => {
+                                        if (started.elapsed() >= Duration::from_millis(350) && !new_st.is_moving)
+                                            || started.elapsed() >= Duration::from_millis(1600)
+                                        {
+                                            let (p1, p2) = build_stop_packets(|| {
+                                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                                            });
+                                            let _ = socket.send_to(&p1.encode(), target_addr);
+                                            let _ = socket.send_to(&p2.encode(), target_addr);
+                                            soft_home_origin = Some((raw_pos_x, raw_pos_y));
+                                            soft_xy_homed = true;
+                                            new_st.pos_x = 0;
+                                            new_st.pos_y = 0;
+                                            new_st.xy_homed = true;
+                                            new_st.is_homing_xy = false;
+                                            active_xy_home_watch = None;
+                                            eprintln!("[HOME] XY homing complete (origin zeroed at raw=({}, {}))", raw_pos_x, raw_pos_y);
+                                            hw.stage = XyHomeStage::RetractingX(started); // unused after clear
+                                        }
+                                    }
+                                }
+                                if active_xy_home_watch.is_some() {
+                                    active_xy_home_watch = Some(hw);
+                                }
+                            }
                             let mut st = status_clone.lock().unwrap();
                             let prev_pos_z = st.pos_z;
                             let prev_cap_height = st.capacitive_height_mm;
@@ -1201,6 +1596,7 @@ impl LaserController {
                             let prev_homing_z = st.is_homing_z;
                             let prev_z_pos_sensor = st.z_pos_sensor;
                             let prev_z_neg_sensor = st.z_neg_sensor;
+                            let prev_nozzle_touch = st.nozzle_touch_alarm;
                             let prev_z_cal_error = st.z_cal_error.take();
                             let prev_z_touchdown = st.z_touchdown_pos_z;
                             let prev_z_cal_thick = st.z_calibrated_thickness_mm;
@@ -1219,11 +1615,13 @@ impl LaserController {
                             st.is_homing_z = prev_homing_z;
                             st.z_pos_sensor = prev_z_pos_sensor;
                             st.z_neg_sensor = prev_z_neg_sensor;
+                            st.nozzle_touch_alarm = prev_nozzle_touch;
                             st.z_cal_error = prev_z_cal_error;
                             st.z_touchdown_pos_z = prev_z_touchdown;
                             st.z_calibrated_thickness_mm = prev_z_cal_thick;
                             st.z_material_thickness_mm = prev_z_mat_thick;
                             st.z_pulses_per_mm = prev_z_ppm;
+                            st.is_live_cutting = active_live_cut.is_some();
                         }
                     }
                 }
@@ -1235,6 +1633,7 @@ impl LaserController {
                     let mut orphaned_z_jog = false;
                     while let Ok((n, src)) = zs.recv_from(&mut z_buf) {
                         if src == z_target_addr {
+                            had_activity = true;
                             if let Some(zt) = decode_z_poll_telemetry(&z_buf[..n]) {
                                 z_status_seen = true;
                                 latest_z = (zt.pos_z, zt.raw_cap, zt.state_code);
@@ -1370,21 +1769,55 @@ impl LaserController {
                             (registers::REG_COMMAND, vec![2]),
                             (1344, vec![0]),
                             (registers::REG_ENABLE_FLAG, vec![1]),
-                            (registers::REG_COMMAND, vec![3]),
+                            (1244, vec![24823]),
+                            (1412, vec![0, 0, 0, 0]),
+                            (
+                                1252,
+                                vec![
+                                    0x7FFF_FFFF,
+                                    0x8000_0000,
+                                    0x7FFF_FFFF,
+                                    0x8000_0000,
+                                    0x7FFF_FFFF,
+                                    0x8000_0000,
+                                    0x7FFF_FFFF,
+                                    0x8000_0000,
+                                ],
+                            ),
                         ] {
                             let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                             let p = Packet::write_request(s, addr, vals);
                             let _ = send_and_wait_ack(&socket, &p, &mut buf);
                         }
                         last_r1004 = 0;
-                        let mut acks = Vec::new();
-                        for hpkt in build_xy_home_packets(
-                            || seq_clone.fetch_add(1, Ordering::Relaxed),
-                            home_cfg,
-                        ) {
-                            acks.push(send_and_wait_ack(&socket, &hpkt, &mut buf));
+                        let y_limit_mask: u32 = if home_cfg.y_dir >= 0 { 0x6C } else { 0x90 };
+                        let spd = home_cfg.fast_speed_pls_s.max(400);
+                        let seek_cfg = JogConfig {
+                            min_speed: (spd / 2).max(100),
+                            jog_speed: spd,
+                            accel: (spd * 10).max(1000),
+                        };
+                        if (r2 & y_limit_mask) != 0 {
+                            active_xy_home_watch = Some(XyHomeWatch {
+                                cfg: home_cfg,
+                                stage: XyHomeStage::WaitRetractY(Instant::now()),
+                            });
+                            eprintln!("[HOME] Y origin already active -> backing off Y first");
+                        } else {
+                            let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let pkt = build_jog_packet(
+                                s,
+                                Axis::Y,
+                                home_cfg.y_dir * (home_cfg.max_search_pulses as i32),
+                                &seek_cfg,
+                            );
+                            let _ = socket.send_to(&pkt.encode(), target_addr);
+                            active_xy_home_watch = Some(XyHomeWatch {
+                                cfg: home_cfg,
+                                stage: XyHomeStage::SeekY,
+                            });
+                            eprintln!("[HOME] Seeking Y origin first (y_dir={}, speed={} pls/s)...", home_cfg.y_dir, spd);
                         }
-                        eprintln!("[HOME] XY home acks: pkts={:?}", acks);
                     }
                 }
 
@@ -1447,6 +1880,11 @@ impl LaserController {
                     if !fifo.sent_run_flag
                         && (fifo.cursor >= fifo.ticks.len() || fifo.estimated_free < 500)
                     {
+                        if fifo.is_live_cut {
+                            let s_fc = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let fc_pkt = Packet::write_request(s_fc, 104, vec![4]);
+                            let _ = send_and_wait_ack(&socket, &fc_pkt, &mut buf);
+                        }
                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                         let pkt = Packet::write_request(s, registers::REG_COMMAND, vec![4]);
                         let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
@@ -1464,17 +1902,289 @@ impl LaserController {
                                 && fifo.started_at.elapsed() >= Duration::from_secs_f64(est_secs)));
 
                     if fifo_done {
-                        for fpkt in build_fifo_finish_packets(|| {
-                            seq_clone.fetch_add(1, Ordering::Relaxed)
-                        }) {
-                            let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                        if fifo.is_live_cut {
+                            let laser_off_items = [
+                                InterpItem {
+                                    cmd: InterpItemCmd::DevCmd,
+                                    axis: [1, 0, 0, 0],
+                                    misc_data: 0,
+                                    ..Default::default()
+                                },
+                                InterpItem {
+                                    cmd: InterpItemCmd::DevCmd,
+                                    axis: [4, 9, 0, 0],
+                                    misc_data: 0,
+                                    ..Default::default()
+                                },
+                            ];
+                            let s_off = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let off_pkt = build_sc2000_fifo_frame(s_off, fifo.fifo_seq, &laser_off_items);
+                            let _ = send_and_wait_ack(&socket, &off_pkt, &mut buf);
+                            for fpkt in build_fifo_finish_packets(|| {
+                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                            }) {
+                                let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                            }
+                            if let Some(ref mut lc) = active_live_cut {
+                                if let Some(c) = lc.contours.get(lc.idx) {
+                                    if let Some(ref zs) = z_socket {
+                                        let raw_ret = build_z_retract_packet(2000, c.up_height_pulses);
+                                        send_z_cmd_with_ack(
+                                            zs,
+                                            &raw_ret,
+                                            &mut z_buf,
+                                            &mut z_status_seen,
+                                            &mut latest_z,
+                                        );
+                                    }
+                                    lc.stage = LiveCutStage::WaitZRetract {
+                                        until: Instant::now() + Duration::from_millis(650),
+                                    };
+                                }
+                            }
+                        } else {
+                            for fpkt in build_fifo_finish_packets(|| {
+                                seq_clone.fetch_add(1, Ordering::Relaxed)
+                            }) {
+                                let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
+                            }
+                            telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Done"));
                         }
-                        telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("Done"));
                     } else {
                         active_fifo = Some(fifo);
                     }
                 } else if status_clone.lock().unwrap().is_moving || auto_stop_at.is_some() {
                     telemetry_clone.lock().unwrap().tick_sample(50);
+                }
+
+                // 9. Advance Live Laser Cut State Machine (Rapid -> Z Follow -> Pierce -> FIFO -> Z Retract)
+                if let Some(mut lc) = active_live_cut.take() {
+                    let mut keep_lc = true;
+                    if status_clone.lock().unwrap().nozzle_touch_alarm {
+                        eprintln!("[LIVE-CUT] ALARM: Cutting head touching sheet -> emergency teardown + Z home!");
+                        active_fifo = None;
+                        for tpkt in build_live_cut_teardown_packets(|| {
+                            seq_clone.fetch_add(1, Ordering::Relaxed)
+                        }) {
+                            let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                        }
+                        let (p1, _p2) = build_stop_packets(|| {
+                            seq_clone.fetch_add(1, Ordering::Relaxed)
+                        });
+                        let _ = socket.send_to(&p1.encode(), target_addr);
+                        pending_stop_p2_at = Some(Instant::now() + Duration::from_millis(140));
+                        if let Some(ref zs) = z_socket {
+                            let raw_stop = build_z_stop_packet();
+                            send_z_cmd_with_ack(zs, &raw_stop, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                            let raw_home = build_z_home_packet();
+                            send_z_cmd_with_ack(zs, &raw_home, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                        }
+                        keep_lc = false;
+                    }
+                    if keep_lc {
+                    match lc.stage {
+                        LiveCutStage::StartContour => {
+                            if lc.idx >= lc.contours.len() {
+                                for tpkt in build_live_cut_teardown_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                                }
+                                if let Some(ref zs) = z_socket {
+                                    let raw_home = build_z_home_packet();
+                                    send_z_cmd_with_ack(zs, &raw_home, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                }
+                                telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("CutDone"));
+                                eprintln!("[LIVE-CUT] All {} contours completed.", lc.contours.len());
+                                keep_lc = false;
+                            } else {
+                                let c = &lc.contours[lc.idx];
+                                let (cur_x, cur_y) = {
+                                    let st = status_clone.lock().unwrap();
+                                    (st.pos_x, st.pos_y)
+                                };
+                                let dx = c.start_pulses.0 - cur_x;
+                                let dy = c.start_pulses.1 - cur_y;
+                                if dx != 0 || dy != 0 {
+                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let pkt = build_xy_move_packet(s, dx, dy, &jog_cfg);
+                                    let _ = socket.send_to(&pkt.encode(), target_addr);
+                                    let dist_pls = ((dx as f64).hypot(dy as f64)).max(1.0);
+                                    let est_s = (dist_pls / jog_cfg.jog_speed.max(100) as f64) + 1.0;
+                                    lc.stage = LiveCutStage::WaitRapid {
+                                        started_at: Instant::now(),
+                                        deadline: Instant::now() + Duration::from_secs_f64(est_s.clamp(1.0, 30.0)),
+                                    };
+                                } else {
+                                    lc.stage = LiveCutStage::WaitZFollow {
+                                        started_at: Instant::now(),
+                                        deadline: Instant::now() + Duration::from_millis(10),
+                                    };
+                                    // Trigger Z follow immediately on next branch below
+                                    if let Some(ref zs) = z_socket {
+                                        let raw_follow = build_z_follow_packet(500, c.cut_height_um);
+                                        send_z_cmd_with_ack(zs, &raw_follow, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                    }
+                                    if c.gas_on {
+                                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                        let _ = socket.send_to(&build_set_do_packet(s, 12, true).encode(), target_addr);
+                                    }
+                                    lc.stage = LiveCutStage::WaitZFollow {
+                                        started_at: Instant::now(),
+                                        deadline: Instant::now() + Duration::from_secs(3),
+                                    };
+                                }
+                            }
+                        }
+                        LiveCutStage::WaitRapid { started_at, deadline } => {
+                            let is_moving = status_clone.lock().unwrap().is_moving;
+                            if (started_at.elapsed() >= Duration::from_millis(150) && !is_moving)
+                                || Instant::now() >= deadline
+                            {
+                                let c = &lc.contours[lc.idx];
+                                if c.gas_on {
+                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let _ = socket.send_to(&build_set_do_packet(s, 12, true).encode(), target_addr);
+                                }
+                                if let Some(ref zs) = z_socket {
+                                    let raw_follow = build_z_follow_packet(500, c.cut_height_um);
+                                    send_z_cmd_with_ack(zs, &raw_follow, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                }
+                                lc.stage = LiveCutStage::WaitZFollow {
+                                    started_at: Instant::now(),
+                                    deadline: Instant::now() + Duration::from_secs(3),
+                                };
+                            }
+                        }
+                        LiveCutStage::WaitZFollow { started_at, deadline } => {
+                            let (cap_mm, z_neg) = {
+                                let st = status_clone.lock().unwrap();
+                                (st.capacitive_height_mm, st.z_neg_sensor)
+                            };
+                            let c = &lc.contours[lc.idx];
+                            if z_neg {
+                                eprintln!("[LIVE-CUT] Z- collision during follow -> aborting!");
+                                for tpkt in build_live_cut_teardown_packets(|| {
+                                    seq_clone.fetch_add(1, Ordering::Relaxed)
+                                }) {
+                                    let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                                }
+                                if let Some(ref zs) = z_socket {
+                                    let raw_stop = build_z_stop_packet();
+                                    send_z_cmd_with_ack(zs, &raw_stop, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                    let raw_home = build_z_home_packet();
+                                    send_z_cmd_with_ack(zs, &raw_home, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                }
+                                keep_lc = false;
+                            } else {
+                                let target_mm = (c.cut_height_um as f32) / 1000.0;
+                                if (started_at.elapsed() >= Duration::from_millis(250) && cap_mm <= target_mm + 0.6)
+                                    || Instant::now() >= deadline
+                                {
+                                    for spkt in build_live_cut_setup_packets(
+                                        || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                        last_raw_pos.0,
+                                        last_raw_pos.1,
+                                    ) {
+                                        let _ = send_and_wait_ack(&socket, &spkt, &mut buf);
+                                    }
+                                    let base_seq = last_r1022.wrapping_add(1);
+                                    let pwm_byte = ((c.power_pct.clamp(0.0, 100.0) / 100.0) * 100.0).round() as i32;
+                                    let hdr_items = [
+                                        InterpItem {
+                                            cmd: InterpItemCmd::ContourStart,
+                                            misc_data: (lc.idx + 1) as i32,
+                                            ..Default::default()
+                                        },
+                                        InterpItem {
+                                            cmd: InterpItemCmd::DevCmd,
+                                            axis: [4, 11, 0, 0],
+                                            misc_data: 1,
+                                            ..Default::default()
+                                        },
+                                        InterpItem {
+                                            cmd: InterpItemCmd::DevCmd,
+                                            axis: [5, 0, 0, 0],
+                                            misc_data: c.freq_hz as i32,
+                                            ..Default::default()
+                                        },
+                                        InterpItem {
+                                            cmd: InterpItemCmd::DevCmd,
+                                            axis: [1, 0, 0, 0],
+                                            misc_data: pwm_byte,
+                                            ..Default::default()
+                                        },
+                                    ];
+                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let h_pkt = build_sc2000_fifo_frame(s, base_seq, &hdr_items);
+                                    let _ = send_and_wait_ack(&socket, &h_pkt, &mut buf);
+                                    let mut full_ticks = Vec::with_capacity(
+                                        (c.pierce_time_ms as usize) * 4 + c.ticks.len(),
+                                    );
+                                    if c.pierce_time_ms > 0 {
+                                        full_ticks.resize(
+                                            (c.pierce_time_ms as usize) * 4,
+                                            (0i8, 0i8, 0u8),
+                                        );
+                                    }
+                                    full_ticks.extend_from_slice(&c.ticks);
+                                    active_fifo = Some(FifoStreamState {
+                                        ticks: full_ticks,
+                                        cursor: 0,
+                                        fifo_seq: base_seq.wrapping_add(1),
+                                        estimated_free: 7900,
+                                        started_at: Instant::now(),
+                                        sent_run_flag: false,
+                                        seen_moving: false,
+                                        telemetry_cursor: 0,
+                                        last_telemetry_at: Instant::now(),
+                                        last_log_at: Instant::now(),
+                                        is_live_cut: true,
+                                    });
+                                    lc.stage = LiveCutStage::StreamingFifo;
+                                }
+                            }
+                        }
+                        LiveCutStage::WaitPierce { until, next_fifo_seq } => {
+                            if Instant::now() >= until {
+                                let c = &lc.contours[lc.idx];
+                                active_fifo = Some(FifoStreamState {
+                                    ticks: c.ticks.clone(),
+                                    cursor: 0,
+                                    fifo_seq: next_fifo_seq,
+                                    estimated_free: 7900,
+                                    started_at: Instant::now(),
+                                    sent_run_flag: false,
+                                    seen_moving: false,
+                                    telemetry_cursor: 0,
+                                    last_telemetry_at: Instant::now(),
+                                    last_log_at: Instant::now(),
+                                    is_live_cut: true,
+                                });
+                                lc.stage = LiveCutStage::StreamingFifo;
+                            }
+                        }
+                        LiveCutStage::StreamingFifo => {}
+                        LiveCutStage::WaitZRetract { until } => {
+                            if Instant::now() >= until {
+                                lc.idx += 1;
+                                lc.stage = LiveCutStage::StartContour;
+                            }
+                        }
+                    }
+                    }
+                    if keep_lc {
+                        active_live_cut = Some(lc);
+                    }
+                }
+
+                // Prevent tight CPU spin when idle or when Windows UDP returns WSAECONNRESET immediately.
+                if !had_activity && loop_started.elapsed() < Duration::from_millis(4) {
+                    if connected_clone.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(5));
+                    } else {
+                        thread::sleep(Duration::from_millis(20));
+                    }
                 }
             }
         });
@@ -1510,6 +2220,10 @@ impl LaserController {
 
     pub fn start_fifo_stream(&self, ticks: Vec<(i8, i8, u8)>) {
         let _ = self.command_tx.send(Command::StartFifoStream { ticks });
+    }
+
+    pub fn start_live_cut(&self, contours: Vec<LiveCutContour>) {
+        let _ = self.command_tx.send(Command::StartLiveCut { contours });
     }
 
     pub fn start_continuous_jog(&self, axis: Axis, direction: i32) {
@@ -1550,6 +2264,16 @@ impl LaserController {
 
     pub fn set_red_pointer(&self, enable: bool) {
         let _ = self.command_tx.send(Command::SetRedPointer(enable));
+    }
+
+    pub fn set_shutter(&self, open: bool) {
+        let _ = self.command_tx.send(Command::SetShutter(open));
+    }
+
+    pub fn set_manual_laser(&self, on: bool, power_pct: f32) {
+        let _ = self
+            .command_tx
+            .send(Command::SetManualLaser { on, power_pct });
     }
 
     pub fn set_z_material_config(&self, material_thickness_mm: f64, pulses_per_mm_z: f64) {

@@ -66,6 +66,7 @@ pub struct PanelState {
     pub sim_ax_pls: f32,
     pub sim_ay_pls: f32,
     pub active_frame_polygon: Vec<kurbo::Point>,
+    pub ui_manual_laser_held: bool,
 }
 
 impl Default for PanelState {
@@ -109,6 +110,7 @@ impl Default for PanelState {
             sim_ax_pls: 0.0,
             sim_ay_pls: 0.0,
             active_frame_polygon: Vec::new(),
+            ui_manual_laser_held: false,
         }
     }
 }
@@ -338,11 +340,13 @@ pub fn home_config_from_pulse(pulse_config: &PulseConfig) -> tzlaser_protocol::H
         .table_width_mm
         .max(pulse_config.table_height_mm)
         .max(500.0);
+    let fast_mm_s = pulse_config.home_speed_mm_s.clamp(1.0, 200.0);
+    let slow_mm_s = (fast_mm_s * 0.25).clamp(1.0, 15.0);
     tzlaser_protocol::HomeConfig {
         x_dir,
         y_dir,
-        fast_speed_pls_s: ((3.0 * ppm).round() as u32).max(400),
-        slow_speed_pls_s: ((1.5 * ppm).round() as u32).max(200),
+        fast_speed_pls_s: ((fast_mm_s * ppm).round() as u32).max(400),
+        slow_speed_pls_s: ((slow_mm_s * ppm).round() as u32).max(200),
         max_search_pulses: ((max_dim * 1.2 * ppm).round() as u32).max(50_000),
     }
 }
@@ -734,6 +738,87 @@ impl PanelState {
         c.start_fifo_stream(ticks);
     }
 
+    /// Build and dispatch per-contour live laser cutting with Z capacitive follower (`cmd = 4` / `cmd = 3`),
+    /// inline laser power/frequency/DO commands, and assist gas.
+    pub fn start_hw_live_cut(
+        &mut self,
+        doc: &Document,
+        controller: &Option<LaserController>,
+        pulses_cfg: &PulseConfig,
+    ) {
+        let Some(ref c) = controller else {
+            return;
+        };
+        if !c.is_connected() || self.trajectory.is_empty() {
+            return;
+        }
+        let origin = origin_world_mm(pulses_cfg);
+        let mut contours: Vec<tzlaser_protocol::LiveCutContour> = Vec::new();
+        let mut i = 0;
+        while i < self.trajectory.len() {
+            if self.trajectory[i].is_rapid {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let path_idx = self.trajectory[i].path_index_1based;
+            while i < self.trajectory.len()
+                && !self.trajectory[i].is_rapid
+                && self.trajectory[i].path_index_1based == path_idx
+            {
+                i += 1;
+            }
+            let slice = &self.trajectory[start..i];
+            if slice.is_empty() {
+                continue;
+            }
+            let params = doc
+                .layers
+                .iter()
+                .find(|l| l.visible && !l.entities.is_empty())
+                .map(|l| l.params.clone())
+                .unwrap_or_default();
+            let start_px = pulses_cfg.mm_to_pulses_x(slice[0].start.x - origin.x);
+            let start_py = pulses_cfg.mm_to_pulses_y(slice[0].start.y - origin.y);
+            let mut ticks = build_trajectory_fifo_ticks_with_speed(
+                slice,
+                origin,
+                pulses_cfg,
+                start_px,
+                start_py,
+                params.speed_mm_s.max(0.5),
+            );
+            if matches!(ticks.last(), Some(&(_, _, fl)) if fl == tzlaser_protocol::fifo_flags::STREAM_END) {
+                ticks.pop();
+            }
+            if ticks.is_empty() {
+                continue;
+            }
+            contours.push(tzlaser_protocol::LiveCutContour {
+                start_pulses: (start_px, start_py),
+                ticks,
+                cut_height_um: (params.cut_height_mm.clamp(0.1, 10.0) * 1000.0).round() as u32,
+                up_height_pulses: (20.0 * pulses_cfg.pulses_per_mm_z.max(1.0)).round() as u32,
+                power_pct: params.power_percent as f32,
+                freq_hz: params.frequency_hz.clamp(50, 20_000) as u16,
+                pierce_time_ms: params.pierce_time_ms,
+                gas_on: params.gas_type != "None",
+            });
+        }
+        if contours.is_empty() {
+            return;
+        }
+        self.pending_logs.push(format!(
+            "[LIVE-CUT] Dispatching {} contour(s) to hardware (Z follower + laser PWM + gas).",
+            contours.len()
+        ));
+        self.hw_fifo_total_secs = self.estimated_job_secs.max(1.0);
+        self.hw_fifo_started_at = Some(std::time::Instant::now());
+        self.hw_fifo_active = true;
+        self.hw_seg_seen_moving = false;
+        c.start_live_cut(contours);
+    }
+
     pub fn stop_run(&mut self, controller: &Option<LaserController>, status: &mut MachineStatus) {
         let was_dry = self.run_mode == RunMode::DryCut;
         self.hw_fifo_active = false;
@@ -750,6 +835,9 @@ impl PanelState {
         self.active_frame_polygon.clear();
         self.reset_filtered_velocity();
         status.laser_on = false;
+        status.gas_valve_open = false;
+        status.shutter_open = false;
+        self.ui_manual_laser_held = false;
         if was_dry {
             status.red_pointer_on = false;
         }
@@ -1353,6 +1441,13 @@ impl PanelState {
             self.stop_run(controller, status);
             return Some("Motion stopped by remote Stop button.".to_string());
         }
+        if self.run_mode == RunMode::Cutting && status.nozzle_touch_alarm {
+            self.stop_run(controller, status);
+            return Some(
+                "ALARM: Cutting head touching sheet metal! Cutting aborted and head retracted."
+                    .to_string(),
+            );
+        }
 
         let now = std::time::Instant::now();
         let dt = self
@@ -1382,8 +1477,12 @@ impl PanelState {
                 .hw_fifo_started_at
                 .map(|t| (now - t).as_secs_f64())
                 .unwrap_or(0.0);
-            let fifo_done = (self.hw_seg_seen_moving && !status.is_moving)
-                || (!status.is_moving && elapsed >= self.hw_fifo_total_secs + 0.5);
+            let fifo_done = if self.run_mode == RunMode::Cutting {
+                elapsed >= 0.5 && !status.is_live_cutting
+            } else {
+                (self.hw_seg_seen_moving && !status.is_moving)
+                    || (!status.is_moving && elapsed >= self.hw_fifo_total_secs + 0.5)
+            };
             if fifo_done {
                 self.current_seg_idx = self.trajectory.len();
                 self.traveled_length_mm = self.total_length_mm;
@@ -1814,6 +1913,22 @@ pub fn render_right_panels(
                     });
                 }
 
+                if status.nozzle_touch_alarm {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(120, 22, 22))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("⚠ ALARM: Cutting head touching sheet metal! Lift Z▲ or Home Z.")
+                                    .color(Color32::WHITE)
+                                    .strong()
+                                    .size(12.0),
+                            );
+                        });
+                    ui.add_space(4.0);
+                }
+
                 ui.add_space(8.0);
 
                 // Jog Control Pad (3x3 Grid: +/-Z to the right of +/-Y, with X+ centered between Z+ and Z-)
@@ -2078,12 +2193,19 @@ pub fn render_right_panels(
                         .on_disabled_hover_text("Controller not connected (Start disabled offline)")
                         .clicked()
                     {
-                        match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
-                            Ok(()) => {
-                                *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
-                            }
-                            Err(msg) => {
-                                *status_message = msg;
+                        if status.nozzle_touch_alarm {
+                            *status_message =
+                                "ALARM: Cutting head touching sheet metal! Lift Z▲ before starting."
+                                    .to_string();
+                        } else {
+                            match panel_state.validate_motion_bounds(doc, current_head, controller, status, pulses_cfg) {
+                                Ok(()) => {
+                                    *status_message = panel_state.start_run(RunMode::Cutting, doc, current_head, controller);
+                                    panel_state.start_hw_live_cut(doc, controller, pulses_cfg);
+                                }
+                                Err(msg) => {
+                                    *status_message = msg;
+                                }
                             }
                         }
                     }
@@ -2305,6 +2427,97 @@ pub fn render_right_panels(
                         *status_message = format!(
                             "Assist gas valve: {}",
                             if status.gas_valve_open { "OPEN" } else { "CLOSED" }
+                        );
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Row 4b: (Laser [hold], Shutter [toggle])
+                ui.horizontal(|ui| {
+                    let laser_bg = if status.laser_on {
+                        Color32::from_rgb(165, 38, 28)
+                    } else if status.shutter_open {
+                        Color32::from_rgb(56, 40, 38)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let laser_fg = if status.laser_on {
+                        Color32::from_rgb(255, 220, 120)
+                    } else if status.shutter_open {
+                        Color32::from_rgb(255, 165, 130)
+                    } else {
+                        Color32::from_rgb(150, 155, 165)
+                    };
+                    let laser_resp = ui
+                        .add_sized(
+                            [run_btn_w, 28.0],
+                            Button::new(RichText::new("⚡ Laser").size(12.5).color(laser_fg).strong())
+                                .fill(laser_bg)
+                                .sense(egui::Sense::click_and_drag()),
+                        )
+                        .on_hover_text("Hold to fire manual laser pulse (requires Shutter OPEN)");
+                    let is_down = laser_resp.is_pointer_button_down_on();
+                    if is_down && !panel_state.ui_manual_laser_held {
+                        if status.shutter_open {
+                            panel_state.ui_manual_laser_held = true;
+                            status.laser_on = true;
+                            if let Some(ref c) = controller {
+                                if c.is_connected() {
+                                    c.set_manual_laser(true, pulses_cfg.test_pulse_power_pct);
+                                }
+                            }
+                            *status_message = format!(
+                                "Manual Laser ON ({:.0}%).",
+                                pulses_cfg.test_pulse_power_pct
+                            );
+                        } else if laser_resp.clicked() || laser_resp.drag_started() {
+                            *status_message =
+                                "Open Shutter before firing Laser.".to_string();
+                        }
+                    } else if !is_down && panel_state.ui_manual_laser_held {
+                        panel_state.ui_manual_laser_held = false;
+                        status.laser_on = false;
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_manual_laser(false, 0.0);
+                            }
+                        }
+                        *status_message = "Manual Laser OFF.".to_string();
+                    }
+
+                    let shutter_bg = if status.shutter_open {
+                        Color32::from_rgb(110, 74, 20)
+                    } else {
+                        Color32::from_rgb(38, 42, 50)
+                    };
+                    let shutter_fg = if status.shutter_open {
+                        Color32::from_rgb(255, 210, 90)
+                    } else {
+                        Color32::WHITE
+                    };
+                    if ui
+                        .add_sized(
+                            [run_btn_w, 28.0],
+                            Button::new(RichText::new("🛡 Shutter").size(12.5).color(shutter_fg).strong())
+                                .fill(shutter_bg),
+                        )
+                        .on_hover_text("Toggle laser shutter (DO9) — required for Laser fire")
+                        .clicked()
+                    {
+                        status.shutter_open = !status.shutter_open;
+                        if !status.shutter_open {
+                            panel_state.ui_manual_laser_held = false;
+                            status.laser_on = false;
+                        }
+                        if let Some(ref c) = controller {
+                            if c.is_connected() {
+                                c.set_shutter(status.shutter_open);
+                            }
+                        }
+                        *status_message = format!(
+                            "Laser Shutter: {}",
+                            if status.shutter_open { "OPEN" } else { "CLOSED" }
                         );
                     }
                 });

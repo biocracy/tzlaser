@@ -52,7 +52,9 @@ pub mod remote_buttons {
     pub const STEP_FLAG: u32 = 0x0100_0000; // Bit 24: Remote step mode state flag
     pub const FAST_FLAG: u32 = 0x0200_0000; // Bit 25: Remote fast speed state flag
     pub const STOP_REMOTE: u32 = 0x0800_0000; // Bit 27: Physical Stop button on wireless remote (verified via pcapng)
-    pub const ORIGIN: u32 = 0x1000_0000;    // Bit 28: Return to Origin
+    pub const ORIGIN: u32 = 0x1000_0000;    // Bit 28: Return to Origin / Laser Fire on handheld remote
+    pub const SHUTTER: u32 = 0x0010_0000;   // Bit 20: Shutter toggle on handheld remote (sc2000 shutter capture)
+    pub const LASER_FIRE: u32 = 0x1000_0000; // Bit 28: Laser Fire / Pulse on handheld remote (sc2000 shutter capture)
     pub const PULSE: u32 = 0x4000_0000;     // Bit 30: Laser Burst / Pulse
     /// Composite mask for any stop signal (Bit 19 or Bit 27).
     pub const ANY_STOP: u32 = STOP | STOP_REMOTE;
@@ -265,6 +267,7 @@ pub struct MachineStatus {
     pub laser_power_pct: f32,
     pub laser_temp_c: f32,
     pub red_pointer_on: bool,
+    pub shutter_open: bool,
     pub gas_valve_open: bool,
     pub gas_type: String,
     pub gas_pressure_bar: f32,
@@ -296,6 +299,9 @@ pub struct MachineStatus {
     pub z_material_thickness_mm: f64,
     /// Z-axis displacement scaling in pulses per mm (e.g., 2000.0).
     pub z_pulses_per_mm: f64,
+    pub is_live_cutting: bool,
+    /// True when Port 999 Z-controller reports nozzle-touching-sheet (`d4 & 0x20 != 0`) outside calibration.
+    pub nozzle_touch_alarm: bool,
     pub raw_registers: Vec<u32>,
 }
 
@@ -311,6 +317,7 @@ impl Default for MachineStatus {
             laser_power_pct: 0.0,
             laser_temp_c: 23.5,
             red_pointer_on: false,
+            shutter_open: false,
             gas_valve_open: false,
             gas_type: "Air".to_string(),
             gas_pressure_bar: 0.0,
@@ -335,6 +342,8 @@ impl Default for MachineStatus {
             z_calibrated_thickness_mm: 1.0,
             z_material_thickness_mm: 1.0,
             z_pulses_per_mm: 2_000.0,
+            is_live_cutting: false,
+            nozzle_touch_alarm: false,
             raw_registers: Vec::new(),
         }
     }
@@ -361,12 +370,14 @@ impl MachineStatus {
         let r43 = regs.get(43).copied().unwrap_or(0);
         let remote_button_mask = r43 | r42;
 
-        let laser_on = regs.get(30).copied().unwrap_or(0) & 0x01 != 0;
+        let do_state = regs.get(28).copied().unwrap_or(0);
+        let laser_on = (regs.get(30).copied().unwrap_or(0) & 0x01 != 0) || (do_state & 0x0200) != 0;
         let laser_power_pct = (regs.get(31).copied().unwrap_or(0) as f32) / 10.0;
         let laser_temp_c = 22.0 + ((regs.get(32).copied().unwrap_or(25) % 15) as f32) * 0.5;
-        let red_pointer_on = regs.get(33).copied().unwrap_or(0) != 0;
+        let red_pointer_on = (do_state & 0x0400) != 0;
+        let shutter_open = (do_state & 0x0100) != 0;
         let gas_val = regs.get(34).copied().unwrap_or(0);
-        let gas_valve_open = gas_val != 0;
+        let gas_valve_open = (do_state & 0x0800) != 0;
         let gas_type = match gas_val {
             1 => "Oxygen (O₂)".to_string(),
             2 => "Nitrogen (N₂)".to_string(),
@@ -393,6 +404,7 @@ impl MachineStatus {
             laser_power_pct,
             laser_temp_c,
             red_pointer_on,
+            shutter_open,
             gas_valve_open,
             gas_type,
             gas_pressure_bar,
@@ -417,6 +429,8 @@ impl MachineStatus {
             z_calibrated_thickness_mm: 1.0,
             z_material_thickness_mm: 1.0,
             z_pulses_per_mm: 2_000.0,
+            is_live_cutting: false,
+            nozzle_touch_alarm: false,
             raw_registers: regs.to_vec(),
         }
     }
@@ -525,6 +539,7 @@ impl MachineStatus {
         self.z_neg_sensor = zt.z_neg_sensor;
         self.is_homing_z = zt.state_code == 2 && !zt.z_homed;
         self.is_calibrating_z = zt.state_code == 7;
+        self.nozzle_touch_alarm = zt.nozzle_touch_alarm && zt.state_code != 7;
     }
 }
 
@@ -861,6 +876,136 @@ pub fn build_z_calibrate_packet() -> Vec<u8> {
     encode_modbus_rtu(&body)
 }
 
+/// Build a Port 999 Z-axis capacitive follow-mode packet (`cmd = 4`, 8 words).
+/// Matches SC2000 live-cut capture (`sc2000 live cut.pcapng` frames 534 & 11533):
+/// - `(500, 1000)` -> `011000650008100004000101f4000003e80000000000009959` (`1.0 mm`)
+/// - `(500, 800)`  -> `011000650008100004000101f400000320000000000000d095` (`0.8 mm`)
+pub fn build_z_follow_packet(follow_speed: u32, height_um: u32) -> Vec<u8> {
+    let words: [u16; 8] = [
+        0x0004,
+        0x0001,
+        (follow_speed & 0xFFFF) as u16,
+        ((follow_speed >> 16) & 0xFFFF) as u16,
+        (height_um & 0xFFFF) as u16,
+        ((height_um >> 16) & 0xFFFF) as u16,
+        0x0000,
+        0x0000,
+    ];
+    let mut body = Vec::with_capacity(7 + 16);
+    body.extend_from_slice(&[0x01, 0x10, 0x00, 0x65, 0x00, 0x08, 0x10]);
+    for w in words {
+        body.extend_from_slice(&w.to_be_bytes());
+    }
+    encode_modbus_rtu(&body)
+}
+
+/// Build a Port 999 Z-axis retract/up-height packet (`cmd = 3`, 6 words).
+/// Matches SC2000 live-cut capture (`sc2000 live cut.pcapng` frame 11727):
+/// - `(2000, 15000)` -> `0110006500060c0003000007d000003a980000f3f4`
+pub fn build_z_retract_packet(speed: u32, target_pulses: u32) -> Vec<u8> {
+    let words: [u16; 6] = [
+        0x0003,
+        0x0000,
+        (speed & 0xFFFF) as u16,
+        ((speed >> 16) & 0xFFFF) as u16,
+        (target_pulses & 0xFFFF) as u16,
+        ((target_pulses >> 16) & 0xFFFF) as u16,
+    ];
+    let mut body = Vec::with_capacity(7 + 12);
+    body.extend_from_slice(&[0x01, 0x10, 0x00, 0x65, 0x00, 0x06, 0x0C]);
+    for w in words {
+        body.extend_from_slice(&w.to_be_bytes());
+    }
+    encode_modbus_rtu(&body)
+}
+
+/// Build Port 502 pre-cut setup packets matching `sc2000 live cut.pcapng` frames 118–144 & 532.
+pub fn build_live_cut_setup_packets(
+    mut seq_gen: impl FnMut() -> u16,
+    raw_pos_x: i32,
+    raw_pos_y: i32,
+) -> Vec<Packet> {
+    let px = raw_pos_x as u32;
+    let py = raw_pos_y as u32;
+    vec![
+        crate::sc2000_ref::build_set_do_packet(seq_gen(), 9, true),
+        Packet::write_request(seq_gen(), 1344, vec![1]),
+        Packet::write_request(seq_gen(), 1388, vec![px, py, px, py]),
+        Packet::write_request(seq_gen(), 1376, vec![0xFFFF_FFFF]),
+        Packet::write_request(seq_gen(), 1244, vec![0x60F4]),
+        Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![2]),
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![3]),
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![1]),
+        Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![3]),
+        Packet::write_request(seq_gen(), 1208, vec![10_000]),
+    ]
+}
+
+/// Build Port 502 live-cut teardown packets matching `sc2000 live cut.pcapng` frames 11709–11731.
+pub fn build_live_cut_teardown_packets(mut seq_gen: impl FnMut() -> u16) -> Vec<Packet> {
+    vec![
+        Packet::write_request(seq_gen(), 1344, vec![0]),
+        Packet::write_request(seq_gen(), 1244, vec![0x60F7]),
+        Packet::write_request(seq_gen(), registers::REG_ENABLE_FLAG, vec![2]),
+        Packet::write_request(seq_gen(), registers::REG_COMMAND, vec![2]),
+        crate::sc2000_ref::build_set_do_packet(seq_gen(), 10, false),
+        crate::sc2000_ref::build_set_do_packet(seq_gen(), 9, false),
+        crate::sc2000_ref::build_set_do_packet(seq_gen(), 12, false),
+    ]
+}
+
+/// Build Port 502 packets to toggle the laser Shutter (`DO9`, `0x0100` in R1028),
+/// matching `sc2000 shutter and laser pulse.pcapng` frames 447–449 and 597.
+pub fn build_set_shutter_packets(mut seq_gen: impl FnMut() -> u16, open: bool) -> Vec<Packet> {
+    if open {
+        vec![
+            crate::sc2000_ref::build_set_do_packet(seq_gen(), 9, true),
+            Packet::write_request(seq_gen(), 1208, vec![10_000]),
+        ]
+    } else {
+        vec![crate::sc2000_ref::build_set_do_packet(seq_gen(), 9, false)]
+    }
+}
+
+/// Build Port 502 packets to fire or stop the manual Laser (`DO10`, `0x0200` in R1028),
+/// matching `sc2000 shutter and laser pulse.pcapng` frames 485–493 (ON) and 507–513 (OFF).
+pub fn build_manual_laser_packets(
+    mut seq_gen: impl FnMut() -> u16,
+    on: bool,
+    power_pct: f32,
+) -> Vec<Packet> {
+    if on {
+        let pwm = (power_pct.clamp(0.0, 100.0).round() as u32).max(1);
+        vec![
+            Packet::write_request(seq_gen(), 1344, vec![1]),
+            Packet::write_request(seq_gen(), 1208, vec![10_000]),
+            crate::sc2000_ref::build_set_do_packet(seq_gen(), 10, true),
+            Packet::write_request(seq_gen(), 1244, vec![0x60F7]),
+            Packet::write_request(seq_gen(), 1216, vec![62, pwm]),
+        ]
+    } else {
+        vec![
+            crate::sc2000_ref::build_set_do_packet(seq_gen(), 10, false),
+            Packet::write_request(seq_gen(), 1244, vec![0x60F7]),
+            Packet::write_request(seq_gen(), 1220, vec![0]),
+            Packet::write_request(seq_gen(), 1344, vec![0]),
+        ]
+    }
+}
+
+/// One closed/open contour to be executed during a supervised live laser cut.
+#[derive(Debug, Clone)]
+pub struct LiveCutContour {
+    pub start_pulses: (i32, i32),
+    pub ticks: Vec<(i8, i8, u8)>,
+    pub cut_height_um: u32,
+    pub up_height_pulses: u32,
+    pub power_pct: f32,
+    pub freq_hz: u16,
+    pub pierce_time_ms: u32,
+    pub gas_on: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct HomeConfig {
     /// +1 = home X toward +X (Right), -1 = home X toward -X (Left)
@@ -882,10 +1027,22 @@ pub struct HomeConfig {
 /// - `1252`: unbounded soft limits `R1063..R1070`
 /// - `112`: `[flags_mask, slow, accel_step, fast, max_dist, slow, slow, slow, 0]`
 ///   where `flags_mask = 0x0103 | (x_dir >= 0 ? 0x10 : 0) | (y_dir >= 0 ? 0x20 : 0)` (`275` for Bottom-Right).
-pub fn build_xy_home_packets(mut seq_gen: impl FnMut() -> u16, cfg: HomeConfig) -> Vec<Packet> {
+pub fn build_xy_home_packets(seq_gen: impl FnMut() -> u16, cfg: HomeConfig) -> Vec<Packet> {
+    build_axis_home_packets(seq_gen, cfg, true, true)
+}
+
+/// Build Port 502 homing packets for one or both XY axes (`home_x`, `home_y`).
+pub fn build_axis_home_packets(
+    mut seq_gen: impl FnMut() -> u16,
+    cfg: HomeConfig,
+    home_x: bool,
+    home_y: bool,
+) -> Vec<Packet> {
+    let x_en = if home_x { 0x01 } else { 0 };
+    let y_en = if home_y { 0x02 } else { 0 };
     let x_bit = if cfg.x_dir >= 0 { 0x10 } else { 0 };
     let y_bit = if cfg.y_dir >= 0 { 0x20 } else { 0 };
-    let flags_mask = 0x0103_u32 | x_bit | y_bit;
+    let flags_mask = 0x0100_u32 | x_en | y_en | x_bit | y_bit;
 
     let slow = cfg.slow_speed_pls_s.max(100);
     let accel_step = (slow / 5).max(50);
@@ -975,6 +1132,7 @@ pub struct ZPollTelemetry {
     pub z_homed: bool,
     pub z_pos_sensor: bool,
     pub z_neg_sensor: bool,
+    pub nozzle_touch_alarm: bool,
 }
 
 /// Monitors Port 999 telemetry during capacitive height sensor calibration (`cmd = 7`)
@@ -1134,6 +1292,7 @@ pub fn decode_z_poll_telemetry(bytes: &[u8]) -> Option<ZPollTelemetry> {
 
     let d2 = read_dword_ws(2);
     let d3 = read_dword_ws(3);
+    let d4 = read_dword_ws(4);
     let d5 = read_dword_ws(5);
     let state_code = read_dword_ws(6);
     let raw_cap = read_dword_ws(7);
@@ -1150,6 +1309,7 @@ pub fn decode_z_poll_telemetry(bytes: &[u8]) -> Option<ZPollTelemetry> {
         z_homed: (d5 & 0x01) != 0,
         z_pos_sensor: d2 != 0 || (d5 & 0x10) != 0,
         z_neg_sensor: d3 != 0 || raw_cap > 650_000,
+        nozzle_touch_alarm: (d4 & 0x20) != 0,
     })
 }
 
@@ -1390,6 +1550,7 @@ mod tests {
             z_homed: false,
             z_pos_sensor: false,
             z_neg_sensor: z_neg,
+            nozzle_touch_alarm: false,
         };
 
         // Normal calibration: fast descent -> slow descent -> brief touchdown -> retract
@@ -1439,6 +1600,111 @@ mod tests {
         st.pos_z = -50_400; // 0.2 mm below material line (pushing into 1.0 mm sheet)
         assert!((st.z_clearance_above_material_mm().unwrap() + 0.2).abs() < 1e-6);
         assert!(st.is_below_material_line());
+    }
+
+    #[test]
+    fn test_gas_and_red_light_do_state_from_wireshark() {
+        use crate::sc2000_ref::build_set_do_packet;
+
+        // Gas ON (DO12 = 0x0800) / OFF at reg 108 (0x6C)
+        let gas_on = build_set_do_packet(1, 12, true);
+        assert_eq!(gas_on.addr, 108);
+        assert_eq!(gas_on.data, vec![0x0800, 0x0800]);
+        let gas_off = build_set_do_packet(2, 12, false);
+        assert_eq!(gas_off.addr, 108);
+        assert_eq!(gas_off.data, vec![0x0800, 0]);
+
+        // Red Light ON (DO11 = 0x0400) / OFF at reg 108 (0x6C)
+        let red_on = build_set_do_packet(3, 11, true);
+        assert_eq!(red_on.addr, 108);
+        assert_eq!(red_on.data, vec![0x0400, 0x0400]);
+        let red_off = build_set_do_packet(4, 11, false);
+        assert_eq!(red_off.addr, 108);
+        assert_eq!(red_off.data, vec![0x0400, 0]);
+
+        // R1028 (DOState) status decoding
+        let mut regs = vec![0u32; 45];
+        regs[28] = 0x0800;
+        let st_gas = MachineStatus::from_status_registers(&regs);
+        assert!(st_gas.gas_valve_open);
+        assert!(!st_gas.red_pointer_on);
+
+        regs[28] = 0x0400;
+        let st_red = MachineStatus::from_status_registers(&regs);
+        assert!(!st_red.gas_valve_open);
+        assert!(st_red.red_pointer_on);
+
+        // Remote capture: Gas = 0x0000_0010, Red Light = 0x0080_0000
+        assert_ne!(remote_buttons::SPEED & 0x0000_0010, 0);
+        assert_ne!(remote_buttons::CLEAR & 0x0080_0000, 0);
+    }
+
+    #[test]
+    fn test_live_cut_z_follow_and_retract_packets_match_wireshark() {
+        assert_eq!(
+            hex::encode(build_z_follow_packet(500, 1000)),
+            "011000650008100004000101f4000003e80000000000009959"
+        );
+        assert_eq!(
+            hex::encode(build_z_follow_packet(500, 800)),
+            "011000650008100004000101f400000320000000000000d095"
+        );
+        assert_eq!(
+            hex::encode(build_z_retract_packet(2000, 15000)),
+            "0110006500060c0003000007d000003a980000f3f4"
+        );
+    }
+
+    #[test]
+    fn test_nozzle_touch_alarm_from_wireshark() {
+        // Build a synthetic 133-byte Port 999 poll response with d4 = 0x20 (frame 650 of
+        // `sc2000 cutting head touch sheet alarm.pcapng`: cap=0, h_um=0, d4=0x20).
+        let mut resp = vec![0u8; 133];
+        resp[0] = 0x01;
+        resp[1] = 0x03;
+        resp[2] = 0x80;
+        let write_dword_ws = |buf: &mut [u8], idx: usize, val: u32| {
+            let base = 3 + idx * 4;
+            let w0 = (val & 0xFFFF) as u16;
+            let w1 = ((val >> 16) & 0xFFFF) as u16;
+            buf[base..base + 2].copy_from_slice(&w0.to_be_bytes());
+            buf[base + 2..base + 4].copy_from_slice(&w1.to_be_bytes());
+        };
+        write_dword_ws(&mut resp, 4, 0x20);
+        write_dword_ws(&mut resp, 6, 0);
+        let crc = modbus_crc16(&resp[..131]).to_le_bytes();
+        resp[131] = crc[0];
+        resp[132] = crc[1];
+
+        let zt = decode_z_poll_telemetry(&resp).expect("valid Z poll");
+        assert!(zt.nozzle_touch_alarm);
+        let mut st = MachineStatus::default();
+        st.apply_z_telemetry(zt);
+        assert!(st.nozzle_touch_alarm);
+
+        // During calibration (state_code == 7), touchdown is intentional and not an alarm.
+        let mut zt_cal = zt;
+        zt_cal.state_code = 7;
+        st.apply_z_telemetry(zt_cal);
+        assert!(!st.nozzle_touch_alarm);
+    }
+
+    #[test]
+    fn test_shutter_and_laser_do_state_from_wireshark() {
+        let mut regs = vec![0u32; 48];
+        // Frame 452: Shutter ON (r1028 = 0x500 = RedDot 0x400 | Shutter 0x100)
+        regs[28] = 0x0500;
+        let st_shutter = MachineStatus::from_status_registers(&regs);
+        assert!(st_shutter.shutter_open);
+        assert!(!st_shutter.laser_on);
+
+        // Frame 496: Shutter ON + Laser ON (r1028 = 0x700 = RedDot 0x400 | Laser 0x200 | Shutter 0x100)
+        regs[28] = 0x0700;
+        let st_laser = MachineStatus::from_status_registers(&regs);
+        assert!(st_laser.shutter_open);
+        assert!(st_laser.laser_on);
+        assert_eq!(remote_buttons::SHUTTER, 0x0010_0000);
+        assert_eq!(remote_buttons::LASER_FIRE, 0x1000_0000);
     }
 }
 

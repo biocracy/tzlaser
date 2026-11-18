@@ -44,6 +44,7 @@ pub fn render_selection_hud(
     bed_width: f32,
     bed_height: f32,
     origin_corner: &str,
+    head_world_mm: kurbo::Point,
 ) {
     if selection.is_empty() {
         return;
@@ -572,11 +573,23 @@ pub fn render_selection_hud(
             ui.separator();
 
             // Quick Snap Origin
-            if ui.add(Button::new("Snap Origin to (0,0)").small()).clicked() {
-                history.record(doc, selection, "Snap Origin");
-                let dx = 0.0 - bounds.min_x();
-                let dy = 0.0 - bounds.min_y();
-                doc.translate_selection(selection, dx, dy);
-            }
+            ui.horizontal(|ui| {
+                if ui.add(Button::new("Snap Origin to (0,0)").small()).clicked() {
+                    history.record(doc, selection, "Snap Origin");
+                    let dx = 0.0 - bounds.min_x();
+                    let dy = 0.0 - bounds.min_y();
+                    doc.translate_selection(selection, dx, dy);
+                }
+                if ui
+                    .add(Button::new("Snap Origin to Head").small())
+                    .on_hover_text("Move selection so its origin aligns with the current laser head marker")
+                    .clicked()
+                {
+                    history.record(doc, selection, "Snap Origin to Head");
+                    let dx = head_world_mm.x - sel_origin_corner.0;
+                    let dy = head_world_mm.y - sel_origin_corner.1;
+                    doc.translate_selection(selection, dx, dy);
+                }
+            });
         });
 }

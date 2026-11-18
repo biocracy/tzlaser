@@ -132,7 +132,7 @@ fn hsv_to_color32(h_deg: f32, s: f32, v: f32) -> Color32 {
 pub struct PathContextMenu {
     pub screen_pos: Pos2,
     pub point_mm: Point,
-    pub path_index_1based: usize,
+    pub path_index_1based: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +181,7 @@ pub struct CanvasState {
     pub context_menu: Option<PathContextMenu>,
     pub pending_continue_from_point: Option<Point>,
     pub pending_set_start_point: Option<(usize, Point)>,
+    pub pending_go_here_point: Option<Point>,
     pub draw_tool: DrawTool,
     pub draw_anchor: Option<Point>,
     pub draw_spline_pts: Vec<Point>,
@@ -217,6 +218,7 @@ impl Default for CanvasState {
             context_menu: None,
             pending_continue_from_point: None,
             pending_set_start_point: None,
+            pending_go_here_point: None,
             draw_tool: DrawTool::None,
             draw_anchor: None,
             draw_spline_pts: Vec::new(),
@@ -738,7 +740,18 @@ pub fn render_canvas(
                 state.context_menu = Some(PathContextMenu {
                     screen_pos,
                     point_mm: snapped_pt,
-                    path_index_1based: path_idx,
+                    path_index_1based: Some(path_idx),
+                });
+                context_menu_just_opened = true;
+            } else if click_world.x >= 0.0
+                && click_world.x <= state.bed_width_mm as f64
+                && click_world.y >= 0.0
+                && click_world.y <= state.bed_height_mm as f64
+            {
+                state.context_menu = Some(PathContextMenu {
+                    screen_pos,
+                    point_mm: click_world,
+                    path_index_1based: None,
                 });
                 context_menu_just_opened = true;
             } else {
@@ -2013,37 +2026,60 @@ pub fn render_canvas(
                     .fill(Color32::from_rgb(28, 31, 38))
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(85, 150, 210)))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Path #{} ({:.1}, {:.1} mm)",
-                                menu.path_index_1based, menu.point_mm.x, menu.point_mm.y
-                            ))
-                            .size(11.0)
-                            .color(Color32::from_rgb(160, 215, 245)),
-                        );
-                        ui.add_space(2.0);
-                        let btn = egui::Button::new(
-                            egui::RichText::new("From this point continue")
-                                .size(12.5)
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(Color32::from_rgb(30, 120, 98));
-                        if ui.add(btn).clicked() {
-                            state.pending_continue_from_point = Some(menu.point_mm);
-                            close_menu = true;
-                        }
-                        ui.add_space(2.0);
-                        let start_btn = egui::Button::new(
-                            egui::RichText::new("Set starting point here")
-                                .size(12.5)
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(Color32::from_rgb(45, 92, 145));
-                        if ui.add(start_btn).clicked() {
-                            state.pending_set_start_point = Some((menu.path_index_1based, menu.point_mm));
-                            close_menu = true;
+                        if let Some(path_idx) = menu.path_index_1based {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Path #{} ({:.1}, {:.1} mm)",
+                                    path_idx, menu.point_mm.x, menu.point_mm.y
+                                ))
+                                .size(11.0)
+                                .color(Color32::from_rgb(160, 215, 245)),
+                            );
+                            ui.add_space(2.0);
+                            let btn = egui::Button::new(
+                                egui::RichText::new("From this point continue")
+                                    .size(12.5)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(30, 120, 98));
+                            if ui.add(btn).clicked() {
+                                state.pending_continue_from_point = Some(menu.point_mm);
+                                close_menu = true;
+                            }
+                            ui.add_space(2.0);
+                            let start_btn = egui::Button::new(
+                                egui::RichText::new("Set starting point here")
+                                    .size(12.5)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(45, 92, 145));
+                            if ui.add(start_btn).clicked() {
+                                state.pending_set_start_point = Some((path_idx, menu.point_mm));
+                                close_menu = true;
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Cut Area ({:.1}, {:.1} mm)",
+                                    menu.point_mm.x, menu.point_mm.y
+                                ))
+                                .size(11.0)
+                                .color(Color32::from_rgb(160, 215, 245)),
+                            );
+                            ui.add_space(2.0);
+                            let go_btn = egui::Button::new(
+                                egui::RichText::new("Go here")
+                                    .size(12.5)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(30, 120, 98));
+                            if ui.add(go_btn).clicked() {
+                                state.pending_go_here_point = Some(menu.point_mm);
+                                close_menu = true;
+                            }
                         }
                     });
             });

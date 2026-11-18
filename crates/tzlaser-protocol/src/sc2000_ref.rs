@@ -351,13 +351,11 @@ pub fn encode_interp_item(item: &InterpItem, prev_freq: &mut u16) -> Vec<u32> {
 /// Build a `WriteRegisters(100, ...)` FIFO frame matching `CVirtualMachine::fillFifo`.
 pub fn build_sc2000_fifo_frame(seq: u16, frame_seq: u32, items: &[InterpItem]) -> Packet {
     let mut prev_freq = 0u16;
-    let mut payload = Vec::with_capacity(2 + items.len() * 2);
-    payload.push(0); // word_count placeholder
+    let mut payload = Vec::with_capacity(1 + items.len() * 2);
     payload.push(frame_seq);
     for item in items {
         payload.extend(encode_interp_item(item, &mut prev_freq));
     }
-    payload[0] = (payload.len() - 2) as u32;
     Packet::write_request(seq, McWoReg::WriteFifo.wire_addr(), payload)
 }
 

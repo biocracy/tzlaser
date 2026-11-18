@@ -887,6 +887,19 @@ pub fn render_properties_window(
                     }
                     ui.end_row();
 
+                    ui.label("Homing Speed:");
+                    if ui
+                        .add(
+                            DragValue::new(&mut pulse_config.home_speed_mm_s)
+                                .range(1.0..=200.0)
+                                .speed(1.0)
+                                .suffix(" mm/s"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
                     ui.label("Default Step:");
                     if ui
                         .add(

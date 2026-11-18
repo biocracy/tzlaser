@@ -61,6 +61,9 @@ fn default_fast_z_jog_speed_reg() -> u32 {
 fn default_frame_speed_mm_s() -> f64 {
     30.0
 }
+fn default_home_speed_mm_s() -> f64 {
+    20.0
+}
 fn default_test_pulse_power_pct() -> f32 {
     20.0
 }
@@ -177,6 +180,8 @@ pub struct PulseConfig {
     pub fast_z_jog_speed_reg: u32,
     #[serde(default = "default_frame_speed_mm_s")]
     pub frame_speed_mm_s: f64,
+    #[serde(default = "default_home_speed_mm_s")]
+    pub home_speed_mm_s: f64,
     #[serde(default)]
     pub frame_mode: FrameMode,
     #[serde(default = "default_step_mm")]
@@ -237,6 +242,7 @@ impl Default for PulseConfig {
             fast_jog_speed_y_mm_s: default_fast_jog_speed_mm_s(),
             fast_z_jog_speed_reg: default_fast_z_jog_speed_reg(),
             frame_speed_mm_s: default_frame_speed_mm_s(),
+            home_speed_mm_s: default_home_speed_mm_s(),
             frame_mode: FrameMode::default(),
             default_step_mm: default_step_mm(),
             test_pulse_power_pct: default_test_pulse_power_pct(),
