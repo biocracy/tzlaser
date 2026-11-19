@@ -773,10 +773,50 @@ pub fn encode_fifo_tick(dy: i8, dx: i8, dz: i8, flags: u8) -> u32 {
 /// Build a Port 502 Motion FIFO packet (`REG_FIFO_DATA = 100`) containing up to 60 ticks.
 /// Input tuples are `(dx, dy, flags)` where `dx` is X (`R1008`) and `dy` is Y (`R1009`).
 pub fn build_fifo_packet(seq: u16, fifo_seq: u32, ticks: &[(i8, i8, u8)]) -> Packet {
+    build_fifo_packet_with_laser(seq, fifo_seq, ticks, 0)
+}
+
+/// Build a Port 502 Motion FIFO packet (`REG_FIFO_DATA = 100`) with an explicit per-tick PWM
+/// duty byte (`0` for dry-cut; `1..=100` for live laser cutting, placed in byte 2 of `word0`
+/// matching SC2000 `encode_interp_item` and `sc2000 live cut.pcapng` frame 1447/11401).
+pub fn build_fifo_packet_with_laser(
+    seq: u16,
+    fifo_seq: u32,
+    ticks: &[(i8, i8, u8)],
+    pwm_pct: u8,
+) -> Packet {
     let mut payload = Vec::with_capacity(1 + ticks.len() * 2);
     payload.push(fifo_seq);
     for &(dx, dy, flags) in ticks {
-        payload.push(encode_fifo_tick(dy, dx, 0, flags));
+        let pwm_byte = if flags <= (fifo_flags::X_NEG | fifo_flags::Y_NEG) {
+            pwm_pct as i8
+        } else {
+            0
+        };
+        payload.push(encode_fifo_tick(dy, dx, pwm_byte, flags));
+        payload.push(0);
+    }
+    Packet::write_request(seq, registers::REG_FIFO_DATA, payload)
+}
+
+/// Build a Port 502 Motion FIFO packet (`REG_FIFO_DATA = 100`) with per-tick PWM duty
+/// (`0` for laser-off microtabs, `1..=100` for cutting/engraving) aligned 1:1 with `ticks`.
+pub fn build_fifo_packet_with_per_tick_laser(
+    seq: u16,
+    fifo_seq: u32,
+    ticks: &[(i8, i8, u8)],
+    tick_pwms: &[u8],
+) -> Packet {
+    let mut payload = Vec::with_capacity(1 + ticks.len() * 2);
+    payload.push(fifo_seq);
+    for (i, &(dx, dy, flags)) in ticks.iter().enumerate() {
+        let pwm_pct = tick_pwms.get(i).copied().unwrap_or(0).clamp(0, 100);
+        let pwm_byte = if flags <= (fifo_flags::X_NEG | fifo_flags::Y_NEG) {
+            pwm_pct as i8
+        } else {
+            0
+        };
+        payload.push(encode_fifo_tick(dy, dx, pwm_byte, flags));
         payload.push(0);
     }
     Packet::write_request(seq, registers::REG_FIFO_DATA, payload)
@@ -1046,12 +1086,15 @@ pub fn build_manual_laser_packets(
 pub struct LiveCutContour {
     pub start_pulses: (i32, i32),
     pub ticks: Vec<(i8, i8, u8)>,
+    /// Optional per-tick PWM (`0..=100`) aligned 1:1 with `ticks` (used for microtabs).
+    pub tick_pwms: Option<Vec<u8>>,
     pub cut_height_um: u32,
     pub up_height_pulses: u32,
     pub power_pct: f32,
     pub freq_hz: u16,
     pub pierce_time_ms: u32,
     pub gas_on: bool,
+    pub gas_between_paths: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

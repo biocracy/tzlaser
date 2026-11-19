@@ -23,6 +23,10 @@ fn default_cut_height_mm() -> f64 {
     1.0
 }
 
+fn default_up_height_mm() -> f64 {
+    20.0
+}
+
 fn default_frequency_hz() -> u32 {
     5000
 }
@@ -35,6 +39,10 @@ pub struct CuttingParams {
     pub gas_type: String,
     #[serde(default = "default_cut_height_mm")]
     pub cut_height_mm: f64,
+    #[serde(default = "default_up_height_mm")]
+    pub up_height_mm: f64,
+    #[serde(default)]
+    pub gas_between_paths: bool,
     #[serde(default = "default_frequency_hz")]
     pub frequency_hz: u32,
 }
@@ -47,6 +55,8 @@ impl Default for CuttingParams {
             pierce_time_ms: 200,
             gas_type: "Air".to_string(),
             cut_height_mm: default_cut_height_mm(),
+            up_height_mm: default_up_height_mm(),
+            gas_between_paths: false,
             frequency_hz: default_frequency_hz(),
         }
     }
@@ -719,6 +729,8 @@ impl Layer {
                 pierce_time_ms: 0,
                 gas_type: "None".to_string(),
                 cut_height_mm: 5.0,
+                up_height_mm: 20.0,
+                gas_between_paths: false,
                 frequency_hz: 0,
             },
             entities: Vec::new(),
@@ -739,6 +751,8 @@ impl Layer {
                 pierce_time_ms: 0,
                 gas_type: "None".to_string(),
                 cut_height_mm: 0.0,
+                up_height_mm: 20.0,
+                gas_between_paths: false,
                 frequency_hz: 0,
             },
             entities: Vec::new(),

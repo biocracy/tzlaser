@@ -1184,6 +1184,15 @@ fn render_profiles_tab(
                             });
                         }
                     }
+                    ui.horizontal(|ui| {
+                        ui.label("Overcut:");
+                        ui.add(
+                            egui::DragValue::new(&mut state.lead_config.overcut_mm)
+                                .speed(0.05)
+                                .range(0.0..=5.0)
+                                .suffix(" mm"),
+                        );
+                    });
                 });
             });
         });

@@ -5,7 +5,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::motion::{
-    build_fifo_finish_packets, build_fifo_packet, build_fifo_start_packets, build_init_packets,
+    build_fifo_finish_packets, build_fifo_packet_with_laser,
+    build_fifo_packet_with_per_tick_laser, build_fifo_start_packets,
+    build_init_packets,
     build_initial_enable_packets, build_jog_packet, build_live_cut_setup_packets,
     build_live_cut_teardown_packets, build_manual_laser_packets, build_set_shutter_packets,
     build_stop_packets, build_xy_home_packets,
@@ -133,24 +135,30 @@ impl LaserController {
             let mut remote_laser_firing: bool = false;
             struct FifoStreamState {
                 ticks: Vec<(i8, i8, u8)>,
+                tick_pwms: Vec<u8>,
                 cursor: usize,
                 fifo_seq: u32,
                 estimated_free: u32,
                 started_at: Instant,
+                run_triggered_at: Option<Instant>,
                 sent_run_flag: bool,
                 seen_moving: bool,
                 telemetry_cursor: usize,
                 last_telemetry_at: Instant,
                 last_log_at: Instant,
                 is_live_cut: bool,
+                laser_pwm: u8,
             }
             let mut active_fifo: Option<FifoStreamState> = None;
 
             enum LiveCutStage {
                 StartContour,
-                WaitRapid { started_at: Instant, deadline: Instant },
+                WaitRapid {
+                    target_x: i32,
+                    target_y: i32,
+                    deadline: Instant,
+                },
                 WaitZFollow { started_at: Instant, deadline: Instant },
-                WaitPierce { until: Instant, next_fifo_seq: u32 },
                 StreamingFifo,
                 WaitZRetract { until: Instant },
             }
@@ -616,16 +624,19 @@ impl LaserController {
                             let now = Instant::now();
                             active_fifo = Some(FifoStreamState {
                                 ticks,
+                                tick_pwms: Vec::new(),
                                 cursor: 0,
                                 fifo_seq: last_r1022.wrapping_add(1),
                                 estimated_free: 8000,
                                 started_at: now,
+                                run_triggered_at: None,
                                 sent_run_flag: false,
                                 seen_moving: false,
                                 telemetry_cursor: 0,
                                 last_telemetry_at: now,
                                 last_log_at: now,
                                 is_live_cut: false,
+                                laser_pwm: 0,
                             });
                         }
                         Command::StartLiveCut { contours } => {
@@ -1857,11 +1868,21 @@ impl LaserController {
                         }
                         let chunk = &fifo.ticks[fifo.cursor..fifo.cursor + take];
                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                        let pkt = build_fifo_packet(
-                            s,
-                            fifo.fifo_seq,
-                            chunk,
-                        );
+                        let pkt = if fifo.is_live_cut && !fifo.tick_pwms.is_empty() {
+                            build_fifo_packet_with_per_tick_laser(
+                                s,
+                                fifo.fifo_seq,
+                                chunk,
+                                &fifo.tick_pwms[fifo.cursor..fifo.cursor + take],
+                            )
+                        } else {
+                            build_fifo_packet_with_laser(
+                                s,
+                                fifo.fifo_seq,
+                                chunk,
+                                fifo.laser_pwm,
+                            )
+                        };
                         let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
                         fifo.cursor += take;
                         fifo.fifo_seq = fifo.fifo_seq.wrapping_add(1);
@@ -1914,17 +1935,29 @@ impl LaserController {
                     }
 
                     if !fifo.sent_run_flag
-                        && (fifo.cursor >= fifo.ticks.len() || fifo.estimated_free < 500)
+                        && (fifo.cursor >= fifo.ticks.len()
+                            || fifo.cursor >= 1200
+                            || fifo.estimated_free < 500)
                     {
                         if fifo.is_live_cut {
-                            let s_fc = seq_clone.fetch_add(1, Ordering::Relaxed);
-                            let fc_pkt = Packet::write_request(s_fc, 104, vec![4]);
-                            let _ = send_and_wait_ack(&socket, &fc_pkt, &mut buf);
+                            let s_do10 = seq_clone.fetch_add(1, Ordering::Relaxed);
+                            let _ = send_and_wait_ack(
+                                &socket,
+                                &build_set_do_packet(s_do10, 10, true),
+                                &mut buf,
+                            );
                         }
                         let s = seq_clone.fetch_add(1, Ordering::Relaxed);
                         let pkt = Packet::write_request(s, registers::REG_COMMAND, vec![4]);
                         let _ = send_and_wait_ack(&socket, &pkt, &mut buf);
                         fifo.sent_run_flag = true;
+                        fifo.run_triggered_at = Some(Instant::now());
+                        eprintln!(
+                            "[LIVE-CUT] FIFO run triggered at t={}ms cursor={}/{}",
+                            fifo.started_at.elapsed().as_millis(),
+                            fifo.cursor,
+                            fifo.ticks.len(),
+                        );
                     }
 
                     let is_moving_now = status_clone.lock().unwrap().is_moving;
@@ -1932,10 +1965,14 @@ impl LaserController {
                         fifo.seen_moving = true;
                     }
                     let est_secs = (fifo.ticks.len() as f64 / 4000.0) + 0.5;
+                    let elapsed_done = fifo
+                        .run_triggered_at
+                        .unwrap_or(fifo.started_at)
+                        .elapsed()
+                        >= Duration::from_secs_f64(est_secs);
                     let fifo_done = fifo.cursor >= fifo.ticks.len()
                         && ((fifo.seen_moving && !is_moving_now)
-                            || (!is_moving_now
-                                && fifo.started_at.elapsed() >= Duration::from_secs_f64(est_secs)));
+                            || (!is_moving_now && elapsed_done));
 
                     if fifo_done {
                         if fifo.is_live_cut {
@@ -1961,10 +1998,44 @@ impl LaserController {
                             }) {
                                 let _ = send_and_wait_ack(&socket, &fpkt, &mut buf);
                             }
+                            for mpkt in build_manual_laser_packets(
+                                || seq_clone.fetch_add(1, Ordering::Relaxed),
+                                false,
+                                0.0,
+                            ) {
+                                let _ = send_and_wait_ack(&socket, &mpkt, &mut buf);
+                            }
                             if let Some(ref mut lc) = active_live_cut {
+                                let has_next = lc.idx + 1 < lc.contours.len();
                                 if let Some(c) = lc.contours.get(lc.idx) {
+                                    let keep_gas = c.gas_on && c.gas_between_paths && has_next;
+                                    if !keep_gas {
+                                        let s_gas = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                        let _ = send_and_wait_ack(
+                                            &socket,
+                                            &build_set_do_packet(s_gas, 12, false),
+                                            &mut buf,
+                                        );
+                                    }
+                                    {
+                                        let mut st = status_clone.lock().unwrap();
+                                        st.laser_on = false;
+                                        st.laser_power_pct = 0.0;
+                                        st.laser_freq_hz = 0.0;
+                                        if !keep_gas {
+                                            st.gas_valve_open = false;
+                                        }
+                                        telemetry_clone.lock().unwrap().set_aux_state(
+                                            st.capacitance_pf,
+                                            0.0,
+                                            0.0,
+                                            st.gas_valve_open,
+                                        );
+                                    }
                                     if let Some(ref zs) = z_socket {
-                                        let raw_ret = build_z_retract_packet(2000, c.up_height_pulses);
+                                        let current_d9 = (-latest_z.0).max(0) as u32;
+                                        let target_d9 = current_d9.saturating_sub(c.up_height_pulses);
+                                        let raw_ret = build_z_retract_packet(2000, target_d9);
                                         send_z_cmd_with_ack(
                                             zs,
                                             &raw_ret,
@@ -1974,7 +2045,7 @@ impl LaserController {
                                         );
                                     }
                                     lc.stage = LiveCutStage::WaitZRetract {
-                                        until: Instant::now() + Duration::from_millis(650),
+                                        until: Instant::now() + Duration::from_millis(1800),
                                     };
                                 }
                             }
@@ -2059,56 +2130,50 @@ impl LaserController {
                                     let pkt = build_xy_move_packet(s, dx, dy, &jog_cfg);
                                     let _ = socket.send_to(&pkt.encode(), target_addr);
                                     let dist_pls = ((dx as f64).hypot(dy as f64)).max(1.0);
-                                    let est_s = (dist_pls / jog_cfg.jog_speed.max(100) as f64) + 1.0;
+                                    let est_s = (dist_pls / 400.0) + 3.0;
                                     lc.stage = LiveCutStage::WaitRapid {
-                                        started_at: Instant::now(),
-                                        deadline: Instant::now() + Duration::from_secs_f64(est_s.clamp(1.0, 30.0)),
+                                        target_x: c.start_pulses.0,
+                                        target_y: c.start_pulses.1,
+                                        deadline: Instant::now() + Duration::from_secs_f64(est_s.clamp(3.0, 45.0)),
                                     };
                                 } else {
-                                    lc.stage = LiveCutStage::WaitZFollow {
-                                        started_at: Instant::now(),
-                                        deadline: Instant::now() + Duration::from_millis(10),
-                                    };
-                                    // Trigger Z follow immediately on next branch below
                                     if let Some(ref zs) = z_socket {
                                         let raw_follow = build_z_follow_packet(500, c.cut_height_um);
                                         send_z_cmd_with_ack(zs, &raw_follow, &mut z_buf, &mut z_status_seen, &mut latest_z);
                                     }
-                                    if c.gas_on {
-                                        let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                        let _ = socket.send_to(&build_set_do_packet(s, 12, true).encode(), target_addr);
-                                    }
                                     lc.stage = LiveCutStage::WaitZFollow {
                                         started_at: Instant::now(),
-                                        deadline: Instant::now() + Duration::from_secs(3),
+                                        deadline: Instant::now() + Duration::from_secs(15),
                                     };
                                 }
                             }
                         }
-                        LiveCutStage::WaitRapid { started_at, deadline } => {
-                            let is_moving = status_clone.lock().unwrap().is_moving;
-                            if (started_at.elapsed() >= Duration::from_millis(150) && !is_moving)
-                                || Instant::now() >= deadline
-                            {
+                        LiveCutStage::WaitRapid {
+                            target_x,
+                            target_y,
+                            deadline,
+                        } => {
+                            let (cur_x, cur_y) = {
+                                let st = status_clone.lock().unwrap();
+                                (st.pos_x, st.pos_y)
+                            };
+                            let arrived = (cur_x - target_x).abs() <= 2 && (cur_y - target_y).abs() <= 2;
+                            if arrived || Instant::now() >= deadline {
                                 let c = &lc.contours[lc.idx];
-                                if c.gas_on {
-                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                    let _ = socket.send_to(&build_set_do_packet(s, 12, true).encode(), target_addr);
-                                }
                                 if let Some(ref zs) = z_socket {
                                     let raw_follow = build_z_follow_packet(500, c.cut_height_um);
                                     send_z_cmd_with_ack(zs, &raw_follow, &mut z_buf, &mut z_status_seen, &mut latest_z);
                                 }
                                 lc.stage = LiveCutStage::WaitZFollow {
                                     started_at: Instant::now(),
-                                    deadline: Instant::now() + Duration::from_secs(3),
+                                    deadline: Instant::now() + Duration::from_secs(15),
                                 };
                             }
                         }
                         LiveCutStage::WaitZFollow { started_at, deadline } => {
-                            let (cap_mm, z_neg) = {
+                            let (cap_mm, z_neg, z_vel) = {
                                 let st = status_clone.lock().unwrap();
-                                (st.capacitive_height_mm, st.z_neg_sensor)
+                                (st.capacitive_height_mm, st.z_neg_sensor, st.z_velocity)
                             };
                             let c = &lc.contours[lc.idx];
                             if z_neg {
@@ -2127,9 +2192,26 @@ impl LaserController {
                                 keep_lc = false;
                             } else {
                                 let target_mm = (c.cut_height_um as f32) / 1000.0;
-                                if (started_at.elapsed() >= Duration::from_millis(250) && cap_mm <= target_mm + 0.6)
-                                    || Instant::now() >= deadline
-                                {
+                                let settled = started_at.elapsed() >= Duration::from_millis(300)
+                                    && cap_mm <= target_mm + 0.5
+                                    && z_vel.abs() <= 100;
+                                if settled {
+                                    // Step 3: Set PWM frequency (while 124=1), start Gas, then Shutter + FIFO setup
+                                    let pwm_freq_reg = (62_500u32 / (c.freq_hz as u32).max(50)).clamp(10, 5_000);
+                                    let s_freq = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                    let _ = send_and_wait_ack(
+                                        &socket,
+                                        &Packet::write_request(s_freq, 1216, vec![pwm_freq_reg]),
+                                        &mut buf,
+                                    );
+                                    if c.gas_on {
+                                        let s_gas = seq_clone.fetch_add(1, Ordering::Relaxed);
+                                        let _ = send_and_wait_ack(
+                                            &socket,
+                                            &build_set_do_packet(s_gas, 12, true),
+                                            &mut buf,
+                                        );
+                                    }
                                     for spkt in build_live_cut_setup_packets(
                                         || seq_clone.fetch_add(1, Ordering::Relaxed),
                                         last_raw_pos.0,
@@ -2138,7 +2220,6 @@ impl LaserController {
                                         let _ = send_and_wait_ack(&socket, &spkt, &mut buf);
                                     }
                                     let base_seq = last_r1022.wrapping_add(1);
-                                    let pwm_byte = ((c.power_pct.clamp(0.0, 100.0) / 100.0) * 100.0).round() as i32;
                                     {
                                         let mut st = status_clone.lock().unwrap();
                                         st.laser_on = true;
@@ -2152,78 +2233,70 @@ impl LaserController {
                                             st.gas_valve_open,
                                         );
                                     }
-                                    let hdr_items = [
-                                        InterpItem {
-                                            cmd: InterpItemCmd::ContourStart,
-                                            misc_data: (lc.idx + 1) as i32,
-                                            ..Default::default()
-                                        },
-                                        InterpItem {
-                                            cmd: InterpItemCmd::DevCmd,
-                                            axis: [4, 11, 0, 0],
-                                            misc_data: 1,
-                                            ..Default::default()
-                                        },
-                                        InterpItem {
-                                            cmd: InterpItemCmd::DevCmd,
-                                            axis: [5, 0, 0, 0],
-                                            misc_data: c.freq_hz as i32,
-                                            ..Default::default()
-                                        },
-                                        InterpItem {
-                                            cmd: InterpItemCmd::DevCmd,
-                                            axis: [1, 0, 0, 0],
-                                            misc_data: pwm_byte,
-                                            ..Default::default()
-                                        },
-                                    ];
-                                    let s = seq_clone.fetch_add(1, Ordering::Relaxed);
-                                    let h_pkt = build_sc2000_fifo_frame(s, base_seq, &hdr_items);
-                                    let _ = send_and_wait_ack(&socket, &h_pkt, &mut buf);
+                                    let pierce_ticks = (c.pierce_time_ms as usize) * 4;
                                     let mut full_ticks = Vec::with_capacity(
-                                        (c.pierce_time_ms as usize) * 4 + c.ticks.len(),
+                                        pierce_ticks + c.ticks.len(),
                                     );
-                                    if c.pierce_time_ms > 0 {
-                                        full_ticks.resize(
-                                            (c.pierce_time_ms as usize) * 4,
-                                            (0i8, 0i8, 0u8),
-                                        );
+                                    if pierce_ticks > 0 {
+                                        full_ticks.resize(pierce_ticks, (0i8, 0i8, 0u8));
                                     }
                                     full_ticks.extend_from_slice(&c.ticks);
+                                    let default_pwm = c.power_pct.clamp(1.0, 100.0).round() as u8;
+                                    let full_pwms = if let Some(ref pwms) = c.tick_pwms {
+                                        let mut v = Vec::with_capacity(pierce_ticks + pwms.len());
+                                        if pierce_ticks > 0 {
+                                            v.resize(pierce_ticks, default_pwm);
+                                        }
+                                        v.extend_from_slice(pwms);
+                                        v
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    eprintln!(
+                                        "[LIVE-CUT] Contour {}/{}: pierce_ms={}, motion_ticks={}, total_ticks={}, cut_um={}, up_pls={}",
+                                        lc.idx + 1,
+                                        lc.contours.len(),
+                                        c.pierce_time_ms,
+                                        c.ticks.len(),
+                                        full_ticks.len(),
+                                        c.cut_height_um,
+                                        c.up_height_pulses,
+                                    );
                                     active_fifo = Some(FifoStreamState {
                                         ticks: full_ticks,
+                                        tick_pwms: full_pwms,
                                         cursor: 0,
-                                        fifo_seq: base_seq.wrapping_add(1),
+                                        fifo_seq: base_seq,
                                         estimated_free: 7900,
                                         started_at: Instant::now(),
+                                        run_triggered_at: None,
                                         sent_run_flag: false,
                                         seen_moving: false,
                                         telemetry_cursor: 0,
                                         last_telemetry_at: Instant::now(),
                                         last_log_at: Instant::now(),
                                         is_live_cut: true,
+                                        laser_pwm: default_pwm,
                                     });
                                     lc.stage = LiveCutStage::StreamingFifo;
+                                } else if Instant::now() >= deadline {
+                                    eprintln!(
+                                        "[LIVE-CUT] Z-follow timed out (cap={:.2}mm target={:.2}mm vel={}) -> aborting!",
+                                        cap_mm, target_mm, z_vel
+                                    );
+                                    for tpkt in build_live_cut_teardown_packets(|| {
+                                        seq_clone.fetch_add(1, Ordering::Relaxed)
+                                    }) {
+                                        let _ = send_and_wait_ack(&socket, &tpkt, &mut buf);
+                                    }
+                                    if let Some(ref zs) = z_socket {
+                                        let raw_stop = build_z_stop_packet();
+                                        send_z_cmd_with_ack(zs, &raw_stop, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                        let raw_home = build_z_home_packet();
+                                        send_z_cmd_with_ack(zs, &raw_home, &mut z_buf, &mut z_status_seen, &mut latest_z);
+                                    }
+                                    keep_lc = false;
                                 }
-                            }
-                        }
-                        LiveCutStage::WaitPierce { until, next_fifo_seq } => {
-                            if Instant::now() >= until {
-                                let c = &lc.contours[lc.idx];
-                                active_fifo = Some(FifoStreamState {
-                                    ticks: c.ticks.clone(),
-                                    cursor: 0,
-                                    fifo_seq: next_fifo_seq,
-                                    estimated_free: 7900,
-                                    started_at: Instant::now(),
-                                    sent_run_flag: false,
-                                    seen_moving: false,
-                                    telemetry_cursor: 0,
-                                    last_telemetry_at: Instant::now(),
-                                    last_log_at: Instant::now(),
-                                    is_live_cut: true,
-                                });
-                                lc.stage = LiveCutStage::StreamingFifo;
                             }
                         }
                         LiveCutStage::StreamingFifo => {}

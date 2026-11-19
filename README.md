@@ -16,7 +16,7 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
 | **Nozzle Touch / Sheet Alarm** | Working | Port `999` capacitive short/sheet-touch detection (`d4 & 0x20`) triggers a UI alarm banner, blocks downward Z jogs and Start, and aborts active cuts with Z retraction. |
 | **XY Dry-Cutting (Curves & Paths)** | Working | Continuous 4-kHz Motion FIFO streaming (`REG_FIFO_DATA`) with S-curve acceleration/deceleration ramps traces circles, arcs, splines, and sharp corners smoothly without step-by-step pauses. |
 | **Offline Simulation & Signal Graph** | Working | Real-time head marker preview, rapid travel path rendering, pause/resume checkpoints, live velocity/acceleration telemetry, plus optional unipolar overlays for Capacitance (pF), Laser Power/Frequency, and Gas Valve state. |
-| **Live Laser Cutting & Capacitive Follower** | In Progress | Z-follow/retract (`cmd = 4` / `3`), continuous FIFO streaming with pierce dwell, and `DO9`/`DO12` setup work; firing `DO10` during FIFO contour cuts is next for hardware validation. |
+| **Live Laser Cutting & Capacitive Follower** | Working | Full 7-step contour cutting (XY rapid arrival -> Z capacitive follow -> assist gas -> shutter + `DO10` laser gate + per-tick 4-kHz FIFO PWM -> relative Z retract by `up_height_mm`, optional `gas_between_paths`), continuous inline microtab PWM modulation (laser-off or alternate-layer power without Z retract), and 180°-flipped arc lead-ins with configurable overcut. |
 
 ---
 
@@ -26,7 +26,7 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
 - **DXF Importer**: Parses `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `ELLIPSE`, and `SPLINE` entities with full WCS/OCS arbitrary-axis transforms and adaptive arc/bulge tessellation.
 - **Automatic Profile Classification & Grouping**: Classifies geometry into Outer profiles, Interior holes, and Bends; supports compound groups, scaling, rotation, mirroring, and undo/redo history.
 - **Cut Sequence & Obstacle Routing**: Greedy nearest-neighbor TSP ordering prioritizing interior holes before outer contours, plus obstacle exclusion polygon offsetting and rapid-travel detour routing.
-- **Lead-In / Lead-Out, Microtabs & Material Library**: Configurable linear/arc lead lines with automatic inside/outside enclosure detection, equally distributed profile **Microtabs** (`No cut` gaps or custom target cutting/engraving layer overrides), pierce times, layer cutting speeds, and material/thickness presets.
+- **Lead-In / Lead-Out, Microtabs & Material Library**: Configurable linear/arc lead lines (180°-tangent arc entry with configurable overcut) and automatic inside/outside enclosure detection, equally distributed profile **Microtabs** (`No cut` laser-off gaps or custom target cutting/engraving layer overrides without Z retract), pierce times, layer cutting speeds, `up_height_mm`, `gas_between_paths`, and material/thickness presets.
 
 ### Hardware Protocol (`tzlaser-protocol`)
 - **Port `502` (XY/W Motion Controller)**:

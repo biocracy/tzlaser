@@ -25,7 +25,7 @@ impl Default for LeadConfig {
             angle_deg: 90.0,
             arc_radius_mm: 3.0,
             arc_length_mm: 3.5,
-            overcut_mm: 0.0,
+            overcut_mm: 0.5,
         }
     }
 }
@@ -71,12 +71,13 @@ pub fn split_lead_contour(points: &[Point]) -> Option<(&[Point], &[Point])> {
     if points.len() < 5 {
         return None;
     }
-    let last = *points.last()?;
     for k in 1..(points.len() - 2) {
-        if points[k].distance(last) < 1e-5 {
-            let contour = &points[k..points.len() - 1];
-            if contour.len() >= 3 {
-                return Some((&points[..=k], contour));
+        for m in ((k + 3)..points.len()).rev() {
+            if points[k].distance(points[m]) < 1e-5 {
+                let contour = &points[k..m];
+                if contour.len() >= 3 {
+                    return Some((&points[..=k], contour));
+                }
             }
         }
     }
@@ -237,7 +238,8 @@ fn generate_lead_points(
             let theta = (arc_len / r).clamp(0.05, std::f64::consts::PI);
             let steps = ((arc_len / 0.25).ceil() as usize).clamp(8, 64);
 
-            // Center offset along desired normal `n` so the arc arrives at `entry` tangent to `t`
+            // Center offset along desired normal `n` so the arc arrives at `entry` tangent to `-t`
+            // (180 deg opposite to the outgoing cut direction `t`)
             let cx = entry.x + r * nx;
             let cy = entry.y + r * ny;
 
@@ -245,8 +247,8 @@ fn generate_lead_points(
             for i in 0..steps {
                 let u = (i as f64) / (steps as f64);
                 let phi = (1.0 - u) * theta;
-                let px = cx - r * phi.cos() * nx - r * phi.sin() * tx;
-                let py = cy - r * phi.cos() * ny - r * phi.sin() * ty;
+                let px = cx - r * phi.cos() * nx + r * phi.sin() * tx;
+                let py = cy - r * phi.cos() * ny + r * phi.sin() * ty;
                 pts.push(Point::new(px, py));
             }
             pts
@@ -314,11 +316,37 @@ pub fn build_poly_with_lead_at_entry(
 
     let lead_pts = generate_lead_points(entry, tx, ty, nx, ny, config);
 
-    let mut out = Vec::with_capacity(lead_pts.len() + n + 1);
+    let mut out = Vec::with_capacity(lead_pts.len() + n + 4);
     out.extend(lead_pts);
     out.extend_from_slice(contour);
     out.push(entry);
+    append_overcut_points(contour, config.overcut_mm, &mut out);
     out
+}
+
+/// Append `overcut_mm` of travel past `contour[0]` along the closed `contour`
+/// so the kerf at the end of the cut overlaps the lead-in entry and leaves no tab.
+fn append_overcut_points(contour: &[Point], overcut_mm: f64, out: &mut Vec<Point>) {
+    if overcut_mm <= 1e-4 || contour.len() < 2 {
+        return;
+    }
+    let mut rem = overcut_mm;
+    let n = contour.len();
+    for i in 0..n {
+        let a = contour[i];
+        let b = contour[(i + 1) % n];
+        let seg_len = a.distance(b);
+        if seg_len <= 1e-9 {
+            continue;
+        }
+        if seg_len >= rem {
+            let t = rem / seg_len;
+            out.push(Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+            return;
+        }
+        out.push(b);
+        rem -= seg_len;
+    }
 }
 
 /// Rebuild a lead-in on `new_contour` (anchored at `new_contour[0]`) inferring straight vs. arc
@@ -554,7 +582,7 @@ mod tests {
             angle_deg: 90.0,
             arc_radius_mm: 3.0,
             arc_length_mm: 3.5,
-            overcut_mm: 0.0,
+            overcut_mm: 0.5,
         };
 
         let applied = apply_lead_lines(&mut doc, &[], &config);
@@ -651,6 +679,14 @@ mod tests {
         if let Entity::Polyline { points, .. } = &doc.layers[0].entities[0] {
             assert!(points.len() > 12, "Arc lead should generate smooth arc segments");
             assert!(!point_in_polygon(points[0], &rect), "Arc pierce should be outside");
+            let (lead, contour) = split_lead_contour(points).expect("lead+contour");
+            let n = lead.len();
+            let lead_end_dir = (lead[n - 1].x - lead[n - 2].x, lead[n - 1].y - lead[n - 2].y);
+            let cut_dir = (contour[1].x - contour[0].x, contour[1].y - contour[0].y);
+            let l_len = lead_end_dir.0.hypot(lead_end_dir.1);
+            let c_len = cut_dir.0.hypot(cut_dir.1);
+            let dot = (lead_end_dir.0 * cut_dir.0 + lead_end_dir.1 * cut_dir.1) / (l_len * c_len);
+            assert!(dot < -0.95, "Arc lead should arrive 180 deg opposite to cut direction, got dot={}", dot);
         }
     }
 
@@ -723,5 +759,39 @@ mod tests {
             .map(|c| (c.layer_idx, c.entity_idx))
             .collect();
         assert_eq!(order_before, order_after_flip);
+    }
+
+    #[test]
+    fn test_lead_overcut_preserves_split_and_extends_past_entry() {
+        let mut doc = Document::default();
+        let mut layer = Layer::new("Cut", Color::GREEN);
+        layer.entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(40.0, 0.0),
+                Point::new(40.0, 40.0),
+                Point::new(0.0, 40.0),
+            ],
+            closed: true,
+        });
+        doc.layers = vec![layer];
+
+        let cfg = LeadConfig {
+            lead_type: LeadType::Arc,
+            arc_radius_mm: 3.0,
+            arc_length_mm: 3.5,
+            overcut_mm: 0.6,
+            ..Default::default()
+        };
+        assert_eq!(apply_lead_lines(&mut doc, &[], &cfg), 1);
+        if let Entity::Polyline { points, .. } = &doc.layers[0].entities[0] {
+            let (lead, contour) = split_lead_contour(points).expect("lead+contour splits cleanly");
+            let entry = *lead.last().unwrap();
+            let last = *points.last().unwrap();
+            assert!((entry.distance(last) - 0.6).abs() < 1e-4, "expected 0.6mm overcut past entry");
+            assert_eq!(contour.len(), 5);
+        } else {
+            panic!("expected polyline");
+        }
     }
 }

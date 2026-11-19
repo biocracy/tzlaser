@@ -177,27 +177,89 @@ pub fn build_trajectory_fifo_ticks_with_speed(
     start_py: i32,
     speed_mm_s: f64,
 ) -> Vec<(i8, i8, u8)> {
+    build_trajectory_fifo_ticks_inner(
+        traj,
+        origin_world,
+        pulses_cfg,
+        start_px,
+        start_py,
+        speed_mm_s,
+        None,
+    )
+    .0
+}
+
+/// Build Motion FIFO ticks and aligned per-tick laser PWM percentages (`0..=100`)
+/// for a single continuous live-cut contour (including inline microtabs).
+pub fn build_live_cut_fifo_ticks(
+    traj: &[MotionSegment],
+    origin_world: kurbo::Point,
+    pulses_cfg: &PulseConfig,
+    start_px: i32,
+    start_py: i32,
+    speed_mm_s: f64,
+    base_power_pct: f32,
+) -> (Vec<(i8, i8, u8)>, Vec<u8>) {
+    build_trajectory_fifo_ticks_inner(
+        traj,
+        origin_world,
+        pulses_cfg,
+        start_px,
+        start_py,
+        speed_mm_s,
+        Some(base_power_pct),
+    )
+}
+
+fn build_trajectory_fifo_ticks_inner(
+    traj: &[MotionSegment],
+    origin_world: kurbo::Point,
+    pulses_cfg: &PulseConfig,
+    start_px: i32,
+    start_py: i32,
+    speed_mm_s: f64,
+    live_base_power_pct: Option<f32>,
+) -> (Vec<(i8, i8, u8)>, Vec<u8>) {
     let mut ticks = Vec::new();
+    let mut pwms = Vec::new();
     let mut cur_px = start_px;
     let mut cur_py = start_py;
-    let dev_speed_mm_s = speed_mm_s.clamp(3.0, 100.0);
+    let default_speed = speed_mm_s.clamp(3.0, 100.0);
     let accel = pulses_cfg.jog_accel_mm_s2.clamp(15.0, 60.0);
-    let max_tick_x =
-        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_x.max(1.0) / 4000.0).ceil() as i32 + 1)
-            .clamp(1, 15);
-    let max_tick_y =
-        ((dev_speed_mm_s * pulses_cfg.pulses_per_mm_y.max(1.0) / 4000.0).ceil() as i32 + 1)
-            .clamp(1, 15);
-
     let segs: Vec<&MotionSegment> = traj.iter().filter(|s| s.length_mm > 1e-6).collect();
     if segs.is_empty() {
-        return ticks;
+        return (ticks, pwms);
     }
+
+    let seg_pwm = |s: &MotionSegment| -> u8 {
+        match live_base_power_pct {
+            None => 0,
+            Some(base_p) => {
+                if s.is_rapid {
+                    0
+                } else {
+                    s.power_pct_override
+                        .unwrap_or(base_p)
+                        .round()
+                        .clamp(0.0, 100.0) as u8
+                }
+            }
+        }
+    };
+    let seg_speed = |s: &MotionSegment| -> f64 {
+        if live_base_power_pct.is_some() && !s.is_rapid && s.power_pct_override.is_some() {
+            s.speed_mm_s.clamp(3.0, 100.0)
+        } else {
+            default_speed
+        }
+    };
 
     // SC2000 Motion FIFO stream preamble: tick 0 = 0x30, followed by 58 zero-motion 0x02 warmup ticks
     ticks.push((0, 0, tzlaser_protocol::fifo_flags::PREAMBLE_START));
+    pwms.push(0);
     for _ in 0..58 {
         ticks.push((0, 0, tzlaser_protocol::fifo_flags::PREAMBLE_IDLE));
+        pwms.push(0);
     }
 
     let seg_dir = |s: &MotionSegment| -> (f64, f64) {
@@ -207,14 +269,18 @@ pub fn build_trajectory_fifo_ticks_with_speed(
         (dx / len, dy / len)
     };
 
-    // Group into continuous chains (break on rapid transitions or sharp corners > ~30 deg)
+    // Group into continuous chains (break on rapid transitions in dry-cut, speed changes, or sharp corners > ~30 deg)
     let mut idx = 0;
     while idx < segs.len() {
         let chain_start = idx;
         let is_rapid = segs[idx].is_rapid;
+        let chain_speed = seg_speed(segs[idx]);
         let mut chain_end = idx + 1;
         while chain_end < segs.len() {
-            if segs[chain_end].is_rapid != is_rapid {
+            if live_base_power_pct.is_none() && segs[chain_end].is_rapid != is_rapid {
+                break;
+            }
+            if (seg_speed(segs[chain_end]) - chain_speed).abs() > 0.5 {
                 break;
             }
             let (ux, uy) = seg_dir(segs[chain_end - 1]);
@@ -226,6 +292,12 @@ pub fn build_trajectory_fifo_ticks_with_speed(
         }
 
         let chain = &segs[chain_start..chain_end];
+        let max_tick_x =
+            ((chain_speed * pulses_cfg.pulses_per_mm_x.max(1.0) / 4000.0).ceil() as i32 + 1)
+                .clamp(1, 15);
+        let max_tick_y =
+            ((chain_speed * pulses_cfg.pulses_per_mm_y.max(1.0) / 4000.0).ceil() as i32 + 1)
+                .clamp(1, 15);
         let mut cum_len = Vec::with_capacity(chain.len() + 1);
         cum_len.push(0.0_f64);
         let mut total_len = 0.0_f64;
@@ -233,7 +305,7 @@ pub fn build_trajectory_fifo_ticks_with_speed(
             total_len += s.length_mm;
             cum_len.push(total_len);
         }
-        let v_target = dev_speed_mm_s;
+        let v_target = chain_speed;
         let half_pi = std::f64::consts::FRAC_PI_2;
         // Raised-cosine S-curve ramp: s(T_a) = 0.5 * v_peak * T_a, peak_accel = (PI/2) * v_peak / T_a
         // Setting T_a = (PI/2) * v_peak / accel ensures peak acceleration <= accel and jerk is C1-smooth.
@@ -302,9 +374,11 @@ pub fn build_trajectory_fifo_ticks_with_speed(
             cur_py += step_y;
             let flags = tzlaser_protocol::fifo_flags::from_steps(step_x, step_y);
             ticks.push((mag_x as i8, mag_y as i8, flags));
+            pwms.push(seg_pwm(seg));
         }
 
         // Flush any remaining quantized pulse difference at the chain end without velocity spikes
+        let last_chain_pwm = seg_pwm(chain.last().unwrap());
         while cur_px != end_px || cur_py != end_py {
             let dx_req = end_px - cur_px;
             let dy_req = end_py - cur_py;
@@ -316,6 +390,7 @@ pub fn build_trajectory_fifo_ticks_with_speed(
             cur_py += step_y;
             let flags = tzlaser_protocol::fifo_flags::from_steps(step_x, step_y);
             ticks.push((mag_x as i8, mag_y as i8, flags));
+            pwms.push(last_chain_pwm);
         }
 
         idx = chain_end;
@@ -323,7 +398,8 @@ pub fn build_trajectory_fifo_ticks_with_speed(
 
     // SC2000 Motion FIFO stream end-of-stream marker
     ticks.push((0, 0, tzlaser_protocol::fifo_flags::STREAM_END));
-    ticks
+    pwms.push(0);
+    (ticks, pwms)
 }
 
 /// Build `HomeConfig` matching the selected `origin_corner` and pulse scaling in `PulseConfig`.
@@ -773,15 +849,12 @@ impl PanelState {
             }
             let start = i;
             let path_idx = self.trajectory[i].path_index_1based;
-            let pwr_ov = self.trajectory[i].power_pct_override;
-            let freq_ov = self.trajectory[i].freq_hz_override;
-            let gas_ov = self.trajectory[i].gas_on_override;
+            i += 1;
+            // Keep all contiguous segments of this contour together (including inline microtabs,
+            // whether laser-off or alternate-layer) so Z stays down and never retracts mid-contour.
             while i < self.trajectory.len()
-                && !self.trajectory[i].is_rapid
                 && self.trajectory[i].path_index_1based == path_idx
-                && self.trajectory[i].power_pct_override == pwr_ov
-                && self.trajectory[i].freq_hz_override == freq_ov
-                && self.trajectory[i].gas_on_override == gas_ov
+                && self.trajectory[i].start.distance(self.trajectory[i - 1].end) < 1e-3
             {
                 i += 1;
             }
@@ -797,21 +870,18 @@ impl PanelState {
                 .unwrap_or_default();
             let start_px = pulses_cfg.mm_to_pulses_x(slice[0].start.x - origin.x);
             let start_py = pulses_cfg.mm_to_pulses_y(slice[0].start.y - origin.y);
-            let eff_speed = if pwr_ov.is_some() {
-                slice[0].speed_mm_s.max(0.5)
-            } else {
-                params.speed_mm_s.max(0.5)
-            };
-            let mut ticks = build_trajectory_fifo_ticks_with_speed(
+            let (mut ticks, mut tick_pwms) = build_live_cut_fifo_ticks(
                 slice,
                 origin,
                 pulses_cfg,
                 start_px,
                 start_py,
-                eff_speed,
+                params.speed_mm_s.max(0.5),
+                params.power_percent as f32,
             );
             if matches!(ticks.last(), Some(&(_, _, fl)) if fl == tzlaser_protocol::fifo_flags::STREAM_END) {
                 ticks.pop();
+                tick_pwms.pop();
             }
             if ticks.is_empty() {
                 continue;
@@ -819,12 +889,16 @@ impl PanelState {
             contours.push(tzlaser_protocol::LiveCutContour {
                 start_pulses: (start_px, start_py),
                 ticks,
+                tick_pwms: Some(tick_pwms),
                 cut_height_um: (params.cut_height_mm.clamp(0.1, 10.0) * 1000.0).round() as u32,
-                up_height_pulses: (20.0 * pulses_cfg.pulses_per_mm_z.max(1.0)).round() as u32,
-                power_pct: pwr_ov.unwrap_or(params.power_percent as f32),
-                freq_hz: freq_ov.unwrap_or_else(|| params.frequency_hz.clamp(50, 20_000) as u16),
-                pierce_time_ms: if pwr_ov.is_some() { 0 } else { params.pierce_time_ms },
-                gas_on: gas_ov.unwrap_or(params.gas_type != "None"),
+                up_height_pulses: (params.up_height_mm.clamp(0.5, 100.0)
+                    * pulses_cfg.pulses_per_mm_z.max(1.0))
+                .round() as u32,
+                power_pct: params.power_percent as f32,
+                freq_hz: params.frequency_hz.clamp(50, 20_000) as u16,
+                pierce_time_ms: params.pierce_time_ms,
+                gas_on: params.gas_type != "None",
+                gas_between_paths: params.gas_between_paths,
             });
         }
         if contours.is_empty() {
@@ -3337,5 +3411,62 @@ mod tests {
         assert!(!state.show_home_prompt);
         let (_, needs_rehome) = state.oob_alert.as_ref().expect("oob_alert");
         assert!(!needs_rehome);
+    }
+
+    #[test]
+    fn test_live_cut_microtabs_modulate_pwm_without_splitting() {
+        let cfg = PulseConfig::default();
+        let origin = kurbo::Point::ZERO;
+        let segs = vec![
+            tzlaser_core::MotionSegment {
+                start: kurbo::Point::new(0.0, 0.0),
+                end: kurbo::Point::new(20.0, 0.0),
+                length_mm: 20.0,
+                speed_mm_s: 30.0,
+                is_rapid: false,
+                path_index_1based: 1,
+                power_pct_override: None,
+                freq_hz_override: None,
+                gas_on_override: None,
+            },
+            tzlaser_core::MotionSegment {
+                start: kurbo::Point::new(20.0, 0.0),
+                end: kurbo::Point::new(25.0, 0.0),
+                length_mm: 5.0,
+                speed_mm_s: 200.0,
+                is_rapid: true, // "No cut" microtab
+                path_index_1based: 1,
+                power_pct_override: None,
+                freq_hz_override: None,
+                gas_on_override: None,
+            },
+            tzlaser_core::MotionSegment {
+                start: kurbo::Point::new(25.0, 0.0),
+                end: kurbo::Point::new(30.0, 0.0),
+                length_mm: 5.0,
+                speed_mm_s: 20.0,
+                is_rapid: false, // Alternate-layer microtab
+                path_index_1based: 1,
+                power_pct_override: Some(15.0),
+                freq_hz_override: None,
+                gas_on_override: None,
+            },
+            tzlaser_core::MotionSegment {
+                start: kurbo::Point::new(30.0, 0.0),
+                end: kurbo::Point::new(50.0, 0.0),
+                length_mm: 20.0,
+                speed_mm_s: 30.0,
+                is_rapid: false,
+                path_index_1based: 1,
+                power_pct_override: None,
+                freq_hz_override: None,
+                gas_on_override: None,
+            },
+        ];
+        let (ticks, pwms) = build_live_cut_fifo_ticks(&segs, origin, &cfg, 0, 0, 30.0, 80.0);
+        assert_eq!(ticks.len(), pwms.len());
+        assert!(pwms.iter().any(|&p| p == 80), "cut segments use 80% PWM");
+        assert!(pwms.iter().any(|&p| p == 0), "no-cut microtab uses 0% PWM");
+        assert!(pwms.iter().any(|&p| p == 15), "alternate-layer microtab uses 15% PWM");
     }
 }

@@ -182,6 +182,15 @@ pub fn render_layer_popup(
                 );
                 ui.end_row();
 
+                ui.label(RichText::new("Up Height:").strong());
+                ui.add(
+                    DragValue::new(&mut params.up_height_mm)
+                        .range(0.5..=100.0)
+                        .speed(0.5)
+                        .suffix(" mm"),
+                );
+                ui.end_row();
+
                 ui.label(RichText::new("Frequency:").strong());
                 ui.add(
                     DragValue::new(&mut params.frequency_hz)
@@ -202,6 +211,10 @@ pub fn render_layer_popup(
                             }
                         }
                     });
+                ui.end_row();
+
+                ui.label(RichText::new("Gas ON between paths:").strong());
+                ui.checkbox(&mut params.gas_between_paths, "Keep ON during travel");
                 ui.end_row();
             });
 
