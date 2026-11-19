@@ -527,6 +527,49 @@ fn desaturate_and_alpha(c: Color32, sat_factor: f32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(nr, ng, nb, alpha)
 }
 
+fn render_entity_with_microtabs(
+    painter: &egui::Painter,
+    entity: &Entity,
+    mt: &tzlaser_core::MicrotabConfig,
+    tab_layer_color: Option<Color32>,
+    is_selected: bool,
+    base_stroke: Stroke,
+    sel_glow_stroke: Stroke,
+    sel_core_stroke: Stroke,
+    state: &CanvasState,
+    origin_screen: Pos2,
+) {
+    let pts = entity.sample_points();
+    if pts.len() < 2 {
+        return;
+    }
+    let spans = tzlaser_core::split_polyline_by_microtabs(&pts, mt.count, mt.width_mm);
+    for (span_pts, is_tab) in spans {
+        if span_pts.len() < 2 {
+            continue;
+        }
+        let screen_pts: Vec<Pos2> = span_pts
+            .iter()
+            .map(|p| state.world_to_screen(*p, origin_screen))
+            .collect();
+        if !is_tab {
+            if is_selected {
+                painter.add(egui::Shape::line(screen_pts.clone(), sel_glow_stroke));
+                painter.add(egui::Shape::line(screen_pts, sel_core_stroke));
+            } else {
+                painter.add(egui::Shape::line(screen_pts, base_stroke));
+            }
+        } else if let Some(tc) = tab_layer_color {
+            let tab_stroke = Stroke::new((base_stroke.width + 0.8).max(2.2), tc);
+            if is_selected {
+                painter.add(egui::Shape::line(screen_pts.clone(), sel_glow_stroke));
+            }
+            painter.add(egui::Shape::line(screen_pts, tab_stroke));
+        }
+        // When tab_layer_color is None ("No cut"), leave the tab span unrendered so the profile shows an interruption.
+    }
+}
+
 fn render_entity(
     painter: &egui::Painter,
     entity: &Entity,
@@ -1403,17 +1446,42 @@ pub fn render_canvas(
                         if state.color_by_cut_index { 2.0 } else { 1.5_f32 },
                         draw_color,
                     );
-                    render_entity(
-                        &painter,
-                        entity,
-                        is_selected,
-                        draw_color,
-                        base_stroke,
-                        sel_glow_stroke,
-                        sel_core_stroke,
-                        state,
-                        origin_screen,
-                    );
+                    if let Some(mt) = doc
+                        .microtabs
+                        .get(&(l_idx, e_idx))
+                        .filter(|m| m.count > 0 && m.width_mm > 1e-4)
+                    {
+                        let tab_col = mt.layer_name.as_ref().and_then(|name| {
+                            doc.layers
+                                .iter()
+                                .find(|l| !l.is_travel && !l.is_obstacle && l.name == *name)
+                                .map(|l| Color32::from_rgb(l.color.r, l.color.g, l.color.b))
+                        });
+                        render_entity_with_microtabs(
+                            &painter,
+                            entity,
+                            mt,
+                            tab_col,
+                            is_selected,
+                            base_stroke,
+                            sel_glow_stroke,
+                            sel_core_stroke,
+                            state,
+                            origin_screen,
+                        );
+                    } else {
+                        render_entity(
+                            &painter,
+                            entity,
+                            is_selected,
+                            draw_color,
+                            base_stroke,
+                            sel_glow_stroke,
+                            sel_core_stroke,
+                            state,
+                            origin_screen,
+                        );
+                    }
                 }
             }
 

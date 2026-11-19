@@ -67,6 +67,9 @@ pub struct PanelState {
     pub sim_ay_pls: f32,
     pub active_frame_polygon: Vec<kurbo::Point>,
     pub ui_manual_laser_held: bool,
+    pub sim_cut_power_pct: f32,
+    pub sim_cut_freq_hz: f32,
+    pub sim_cut_gas_on: bool,
 }
 
 impl Default for PanelState {
@@ -111,6 +114,9 @@ impl Default for PanelState {
             sim_ay_pls: 0.0,
             active_frame_polygon: Vec::new(),
             ui_manual_laser_held: false,
+            sim_cut_power_pct: 80.0,
+            sim_cut_freq_hz: 5000.0,
+            sim_cut_gas_on: true,
         }
     }
 }
@@ -569,6 +575,11 @@ impl PanelState {
         self.pause_buffer.clear();
         self.active_frame_polygon.clear();
         self.reset_filtered_velocity();
+        if let Some(layer) = doc.layers.iter().find(|l| l.visible && !l.entities.is_empty()) {
+            self.sim_cut_power_pct = layer.params.power_percent as f32;
+            self.sim_cut_freq_hz = layer.params.frequency_hz as f32;
+            self.sim_cut_gas_on = layer.params.gas_type != "None";
+        }
 
         let est_str = format_duration_secs(self.estimated_job_secs);
         if mode == RunMode::DryCut {
@@ -762,9 +773,15 @@ impl PanelState {
             }
             let start = i;
             let path_idx = self.trajectory[i].path_index_1based;
+            let pwr_ov = self.trajectory[i].power_pct_override;
+            let freq_ov = self.trajectory[i].freq_hz_override;
+            let gas_ov = self.trajectory[i].gas_on_override;
             while i < self.trajectory.len()
                 && !self.trajectory[i].is_rapid
                 && self.trajectory[i].path_index_1based == path_idx
+                && self.trajectory[i].power_pct_override == pwr_ov
+                && self.trajectory[i].freq_hz_override == freq_ov
+                && self.trajectory[i].gas_on_override == gas_ov
             {
                 i += 1;
             }
@@ -780,13 +797,18 @@ impl PanelState {
                 .unwrap_or_default();
             let start_px = pulses_cfg.mm_to_pulses_x(slice[0].start.x - origin.x);
             let start_py = pulses_cfg.mm_to_pulses_y(slice[0].start.y - origin.y);
+            let eff_speed = if pwr_ov.is_some() {
+                slice[0].speed_mm_s.max(0.5)
+            } else {
+                params.speed_mm_s.max(0.5)
+            };
             let mut ticks = build_trajectory_fifo_ticks_with_speed(
                 slice,
                 origin,
                 pulses_cfg,
                 start_px,
                 start_py,
-                params.speed_mm_s.max(0.5),
+                eff_speed,
             );
             if matches!(ticks.last(), Some(&(_, _, fl)) if fl == tzlaser_protocol::fifo_flags::STREAM_END) {
                 ticks.pop();
@@ -799,10 +821,10 @@ impl PanelState {
                 ticks,
                 cut_height_um: (params.cut_height_mm.clamp(0.1, 10.0) * 1000.0).round() as u32,
                 up_height_pulses: (20.0 * pulses_cfg.pulses_per_mm_z.max(1.0)).round() as u32,
-                power_pct: params.power_percent as f32,
-                freq_hz: params.frequency_hz.clamp(50, 20_000) as u16,
-                pierce_time_ms: params.pierce_time_ms,
-                gas_on: params.gas_type != "None",
+                power_pct: pwr_ov.unwrap_or(params.power_percent as f32),
+                freq_hz: freq_ov.unwrap_or_else(|| params.frequency_hz.clamp(50, 20_000) as u16),
+                pierce_time_ms: if pwr_ov.is_some() { 0 } else { params.pierce_time_ms },
+                gas_on: gas_ov.unwrap_or(params.gas_type != "None"),
             });
         }
         if contours.is_empty() {
@@ -835,6 +857,8 @@ impl PanelState {
         self.active_frame_polygon.clear();
         self.reset_filtered_velocity();
         status.laser_on = false;
+        status.laser_power_pct = 0.0;
+        status.laser_freq_hz = 0.0;
         status.gas_valve_open = false;
         status.shutter_open = false;
         self.ui_manual_laser_held = false;
@@ -1152,6 +1176,9 @@ impl PanelState {
                         speed_mm_s: rapid_speed,
                         is_rapid: true,
                         path_index_1based: cp.path_index_1based,
+                        power_pct_override: None,
+                        freq_hz_override: None,
+                        gas_on_override: None,
                     });
                 }
             }
@@ -1173,6 +1200,9 @@ impl PanelState {
                                 speed_mm_s: orig_seg.speed_mm_s,
                                 is_rapid: true,
                                 path_index_1based: orig_seg.path_index_1based,
+                                power_pct_override: None,
+                                freq_hz_override: None,
+                                gas_on_override: None,
                             });
                         }
                     }
@@ -1184,6 +1214,9 @@ impl PanelState {
                         speed_mm_s: orig_seg.speed_mm_s,
                         is_rapid: orig_seg.is_rapid,
                         path_index_1based: orig_seg.path_index_1based,
+                        power_pct_override: orig_seg.power_pct_override,
+                        freq_hz_override: orig_seg.freq_hz_override,
+                        gas_on_override: orig_seg.gas_on_override,
                     });
                 }
             }
@@ -1222,6 +1255,9 @@ impl PanelState {
                                         speed_mm_s: spd,
                                         is_rapid: true,
                                         path_index_1based: path_idx,
+                                        power_pct_override: None,
+                                        freq_hz_override: None,
+                                        gas_on_override: None,
                                     });
                                 }
                             }
@@ -1714,7 +1750,22 @@ impl PanelState {
             status.pos_x = pulses_cfg.mm_to_pulses_x(cur_x - origin_world.x);
             status.pos_y = pulses_cfg.mm_to_pulses_y(cur_y - origin_world.y);
         }
-        status.laser_on = (self.run_mode == RunMode::Cutting) && !seg.is_rapid;
+        let cutting_now = (self.run_mode == RunMode::Cutting) && !seg.is_rapid;
+        status.laser_on = cutting_now;
+        if !hw_connected {
+            if cutting_now {
+                status.laser_power_pct = seg.power_pct_override.unwrap_or(self.sim_cut_power_pct);
+                status.laser_freq_hz = seg
+                    .freq_hz_override
+                    .map(|f| f as f32)
+                    .unwrap_or(self.sim_cut_freq_hz);
+                status.gas_valve_open = seg.gas_on_override.unwrap_or(self.sim_cut_gas_on);
+            } else {
+                status.laser_power_pct = 0.0;
+                status.laser_freq_hz = 0.0;
+                status.gas_valve_open = (self.run_mode == RunMode::Cutting) && self.sim_cut_gas_on;
+            }
+        }
         status.red_pointer_on = (self.run_mode == RunMode::DryCut) || status.red_pointer_on;
 
         None
@@ -2881,6 +2932,7 @@ mod tests {
                 speed_mm_s: 50.0,
                 is_rapid: false,
                 path_index_1based: 1,
+                ..Default::default()
             },
             MotionSegment {
                 start: kurbo::Point::new(100.0, 0.0),
@@ -2889,6 +2941,7 @@ mod tests {
                 speed_mm_s: 50.0,
                 is_rapid: false,
                 path_index_1based: 1,
+                ..Default::default()
             },
         ];
         state.run_mode = RunMode::Cutting;
@@ -2974,6 +3027,7 @@ mod tests {
                 speed_mm_s: 200.0,
                 is_rapid: true,
                 path_index_1based: 1,
+                ..Default::default()
             },
             // Profile 1: 30mm horizontal + 20mm vertical = 50mm total
             MotionSegment {
@@ -2983,6 +3037,7 @@ mod tests {
                 speed_mm_s: 50.0,
                 is_rapid: false,
                 path_index_1based: 1,
+                ..Default::default()
             },
             MotionSegment {
                 start: kurbo::Point::new(40.0, 0.0),
@@ -2991,6 +3046,7 @@ mod tests {
                 speed_mm_s: 50.0,
                 is_rapid: false,
                 path_index_1based: 1,
+                ..Default::default()
             },
             MotionSegment {
                 start: kurbo::Point::new(40.0, 20.0),
@@ -2999,6 +3055,7 @@ mod tests {
                 speed_mm_s: 200.0,
                 is_rapid: true,
                 path_index_1based: 2,
+                ..Default::default()
             },
             // Profile 2: 40mm horizontal
             MotionSegment {
@@ -3008,6 +3065,7 @@ mod tests {
                 speed_mm_s: 50.0,
                 is_rapid: false,
                 path_index_1based: 2,
+                ..Default::default()
             },
         ];
 
@@ -3078,6 +3136,7 @@ mod tests {
             speed_mm_s: 10.0,
             is_rapid: false,
             path_index_1based: 1,
+            ..Default::default()
         }];
         state.total_length_mm = 500.0;
         state.run_mode = RunMode::Cutting;
@@ -3183,6 +3242,7 @@ mod tests {
             speed_mm_s: 15.0,
             length_mm: 20.0,
             path_index_1based: 1,
+            ..Default::default()
         }];
         let ticks = build_trajectory_fifo_ticks(&traj, origin, &cfg, 0, 0);
         assert!(ticks.len() > 60);
@@ -3219,6 +3279,7 @@ mod tests {
             speed_mm_s: 20.0,
             length_mm: kurbo::Point::new(1235.6, 54.1).distance(kurbo::Point::new(1181.7, 87.9)),
             path_index_1based: 1,
+            ..Default::default()
         }];
         let ticks = build_trajectory_fifo_ticks(&traj, origin, &cfg, -13243, 12849);
         let sx: i32 = ticks

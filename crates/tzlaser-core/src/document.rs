@@ -834,9 +834,9 @@ mod tuple_map_serde {
     ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
-        V: Serialize + Copy,
+        V: Serialize + Clone,
     {
-        let entries: Vec<((usize, usize), V)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+        let entries: Vec<((usize, usize), V)> = map.iter().map(|(&k, v)| (k, v.clone())).collect();
         entries.serialize(serializer)
     }
 
@@ -873,6 +873,131 @@ mod tuple_set_serde {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicrotabConfig {
+    /// Number of equally distributed tabs around the profile perimeter (0 = disabled).
+    pub count: usize,
+    /// Width of each microtab along the profile perimeter in mm.
+    pub width_mm: f64,
+    /// Target cutting layer name for the microtab span (`None` = "No cut" / leave uncut).
+    pub layer_name: Option<String>,
+}
+
+/// Split a sampled polyline into contiguous `(sub_polyline, is_tab)` spans by placing
+/// `tab_count` microtabs of `tab_width_mm` equally distributed along the perimeter.
+pub fn split_polyline_by_microtabs(
+    pts: &[Point],
+    tab_count: usize,
+    tab_width_mm: f64,
+) -> Vec<(Vec<Point>, bool)> {
+    if pts.len() < 2 || tab_count == 0 || tab_width_mm <= 1e-4 {
+        return vec![(pts.to_vec(), false)];
+    }
+
+    let mut total_len = 0.0_f64;
+    for pair in pts.windows(2) {
+        total_len += pair[0].distance(pair[1]);
+    }
+    if total_len <= 1e-4 {
+        return vec![(pts.to_vec(), false)];
+    }
+
+    // Clamp tab width so tabs never swallow the entire perimeter.
+    let step = total_len / (tab_count as f64);
+    let eff_w = tab_width_mm.min(step * 0.90);
+    if eff_w <= 1e-4 {
+        return vec![(pts.to_vec(), false)];
+    }
+
+    // Center each tab at (k + 0.5) * step so start/pierce at s=0 stays on a normal cut span.
+    let intervals: Vec<(f64, f64)> = (0..tab_count)
+        .map(|k| {
+            let center = (k as f64 + 0.5) * step;
+            (center - eff_w * 0.5, center + eff_w * 0.5)
+        })
+        .collect();
+
+    // Collect sorted split distances along [0, total_len] and tag each span.
+    let mut cuts: Vec<f64> = Vec::with_capacity(intervals.len() * 2 + 2);
+    cuts.push(0.0);
+    for &(a, b) in &intervals {
+        cuts.push(a.clamp(0.0, total_len));
+        cuts.push(b.clamp(0.0, total_len));
+    }
+    cuts.push(total_len);
+    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    let is_in_tab = |mid_s: f64| -> bool {
+        intervals.iter().any(|&(a, b)| mid_s >= a && mid_s <= b)
+    };
+
+    // Walk original segments and slice at cut distances.
+    let mut out: Vec<(Vec<Point>, bool)> = Vec::new();
+    let mut seg_idx = 0usize;
+    let mut seg_start_s = 0.0_f64;
+
+    for win in cuts.windows(2) {
+        let s0 = win[0];
+        let s1 = win[1];
+        if s1 - s0 <= 1e-6 {
+            continue;
+        }
+        let is_tab = is_in_tab((s0 + s1) * 0.5);
+        let mut span_pts: Vec<Point> = Vec::new();
+
+        // Advance seg_idx so seg_start_s <= s0 <= seg_end_s
+        while seg_idx + 1 < pts.len() {
+            let seg_len = pts[seg_idx].distance(pts[seg_idx + 1]);
+            if seg_start_s + seg_len >= s0 - 1e-9 {
+                break;
+            }
+            seg_start_s += seg_len;
+            seg_idx += 1;
+        }
+
+        let interp = |idx: usize, s_base: f64, s_target: f64| -> Point {
+            let a = pts[idx];
+            let b = pts[idx + 1];
+            let len = a.distance(b);
+            if len <= 1e-9 {
+                a
+            } else {
+                let t = ((s_target - s_base) / len).clamp(0.0, 1.0);
+                Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+            }
+        };
+
+        if seg_idx + 1 < pts.len() {
+            span_pts.push(interp(seg_idx, seg_start_s, s0));
+        }
+
+        let mut walk_idx = seg_idx;
+        let mut walk_s = seg_start_s;
+        while walk_idx + 1 < pts.len() {
+            let seg_len = pts[walk_idx].distance(pts[walk_idx + 1]);
+            let seg_end_s = walk_s + seg_len;
+            if seg_end_s < s1 - 1e-9 {
+                span_pts.push(pts[walk_idx + 1]);
+                walk_s = seg_end_s;
+                walk_idx += 1;
+            } else {
+                span_pts.push(interp(walk_idx, walk_s, s1));
+                break;
+            }
+        }
+
+        if span_pts.len() >= 2 {
+            out.push((span_pts, is_tab));
+        }
+    }
+
+    if out.is_empty() {
+        out.push((pts.to_vec(), false));
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub layers: Vec<Layer>,
@@ -896,6 +1021,8 @@ pub struct Document {
     pub next_group_id: u64,
     #[serde(default, with = "tuple_set_serde")]
     pub locked_entities: std::collections::HashSet<(usize, usize)>,
+    #[serde(default, with = "tuple_map_serde")]
+    pub microtabs: HashMap<(usize, usize), MicrotabConfig>,
 }
 
 impl Default for Document {
@@ -922,6 +1049,7 @@ impl Document {
             entity_groups: HashMap::new(),
             next_group_id: 0,
             locked_entities: std::collections::HashSet::new(),
+            microtabs: HashMap::new(),
         }
     }
 
@@ -1363,6 +1491,19 @@ impl Document {
                     }
                     self.obstacle_exclusion_mm = next;
                 }
+                if !self.microtabs.is_empty() {
+                    let mut next = HashMap::with_capacity(self.microtabs.len());
+                    for ((ol, oe), mt) in self.microtabs.drain() {
+                        if ol == l_idx {
+                            if let Some(ne) = remap_index(oe) {
+                                next.insert((ol, ne), mt);
+                            }
+                        } else {
+                            next.insert((ol, oe), mt);
+                        }
+                    }
+                    self.microtabs = next;
+                }
                 if !self.locked_entities.is_empty() {
                     let mut next = std::collections::HashSet::with_capacity(self.locked_entities.len());
                     for (ll, le) in self.locked_entities.drain() {
@@ -1732,6 +1873,15 @@ impl Document {
                 remapped.insert((nl, ne), r);
             }
             self.obstacle_exclusion_mm = remapped;
+        }
+
+        if !self.microtabs.is_empty() {
+            let mut remapped = HashMap::with_capacity(self.microtabs.len());
+            for ((old_l, old_e), mt) in self.microtabs.drain() {
+                let (nl, ne) = old_to_new.get(&(old_l, old_e)).copied().unwrap_or((old_l, old_e));
+                remapped.insert((nl, ne), mt);
+            }
+            self.microtabs = remapped;
         }
 
         if !self.entity_groups.is_empty() {
@@ -2934,6 +3084,9 @@ impl Document {
                     speed_mm_s: speed,
                     length_mm: len,
                     path_index_1based: if is_rapid { 0 } else { 1 },
+                    power_pct_override: None,
+                    freq_hz_override: None,
+                    gas_on_override: None,
                 });
             }
         };
@@ -2980,6 +3133,9 @@ impl Document {
                         speed_mm_s: rapid_speed,
                         is_rapid: true,
                         path_index_1based,
+                        power_pct_override: None,
+                        freq_hz_override: None,
+                        gas_on_override: None,
                     });
                 }
             }
@@ -3005,17 +3161,73 @@ impl Document {
             let path_index_1based = idx + 1;
             push_rapid_routed(current_pos, pts[0], path_index_1based, &mut segments);
 
-            for pair in pts.windows(2) {
-                let seg_len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
-                if seg_len > 1e-6 {
-                    segments.push(MotionSegment {
-                        start: pair[0],
-                        end: pair[1],
-                        length_mm: seg_len,
-                        speed_mm_s: cut_speed,
-                        is_rapid: false,
-                        path_index_1based,
-                    });
+            if let Some(mt) = self.microtabs.get(&(info.layer_idx, info.entity_idx)).filter(|m| m.count > 0 && m.width_mm > 1e-4) {
+                let target_layer = mt.layer_name.as_ref().and_then(|name| {
+                    self.layers.iter().find(|l| !l.is_travel && !l.is_obstacle && l.name == *name)
+                });
+                let spans = split_polyline_by_microtabs(&pts, mt.count, mt.width_mm);
+                for (span_pts, is_tab) in spans {
+                    for pair in span_pts.windows(2) {
+                        let seg_len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+                        if seg_len <= 1e-6 {
+                            continue;
+                        }
+                        if !is_tab {
+                            segments.push(MotionSegment {
+                                start: pair[0],
+                                end: pair[1],
+                                length_mm: seg_len,
+                                speed_mm_s: cut_speed,
+                                is_rapid: false,
+                                path_index_1based,
+                                power_pct_override: None,
+                                freq_hz_override: None,
+                                gas_on_override: None,
+                            });
+                        } else if let Some(tl) = target_layer {
+                            segments.push(MotionSegment {
+                                start: pair[0],
+                                end: pair[1],
+                                length_mm: seg_len,
+                                speed_mm_s: tl.params.speed_mm_s.max(0.5),
+                                is_rapid: false,
+                                path_index_1based,
+                                power_pct_override: Some(tl.params.power_percent as f32),
+                                freq_hz_override: Some(tl.params.frequency_hz.clamp(50, 20_000) as u16),
+                                gas_on_override: Some(tl.params.gas_type != "None"),
+                            });
+                        } else {
+                            // "No cut": hop across the microtab with laser off
+                            segments.push(MotionSegment {
+                                start: pair[0],
+                                end: pair[1],
+                                length_mm: seg_len,
+                                speed_mm_s: rapid_speed,
+                                is_rapid: true,
+                                path_index_1based,
+                                power_pct_override: None,
+                                freq_hz_override: None,
+                                gas_on_override: None,
+                            });
+                        }
+                    }
+                }
+            } else {
+                for pair in pts.windows(2) {
+                    let seg_len = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+                    if seg_len > 1e-6 {
+                        segments.push(MotionSegment {
+                            start: pair[0],
+                            end: pair[1],
+                            length_mm: seg_len,
+                            speed_mm_s: cut_speed,
+                            is_rapid: false,
+                            path_index_1based,
+                            power_pct_override: None,
+                            freq_hz_override: None,
+                            gas_on_override: None,
+                        });
+                    }
                 }
             }
 
@@ -3103,7 +3315,7 @@ impl Document {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MotionSegment {
     pub start: Point,
     pub end: Point,
@@ -3111,6 +3323,9 @@ pub struct MotionSegment {
     pub speed_mm_s: f64,
     pub is_rapid: bool,
     pub path_index_1based: usize,
+    pub power_pct_override: Option<f32>,
+    pub freq_hz_override: Option<u16>,
+    pub gas_on_override: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4490,6 +4705,70 @@ mod tests {
             "Gap concave hull should follow the rectangle top edge until under the circle, got {:?}",
             gap_hull
         );
+    }
+
+    #[test]
+    fn test_microtabs_split_and_trajectory() {
+        let mut doc = Document::new();
+        // Square 100x100 => perimeter = 400 mm
+        doc.layers[0].entities.push(Entity::Polyline {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(100.0, 0.0),
+                Point::new(100.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            closed: true,
+        });
+        doc.layers[1].params.power_percent = 2.0;
+        doc.layers[1].params.speed_mm_s = 35.0;
+
+        // 4 tabs of 5 mm each, "No cut"
+        doc.microtabs.insert(
+            (0, 0),
+            MicrotabConfig {
+                count: 4,
+                width_mm: 5.0,
+                layer_name: None,
+            },
+        );
+
+        let pts = doc.layers[0].entities[0].sample_points();
+        let spans = split_polyline_by_microtabs(&pts, 4, 5.0);
+        let tab_spans: Vec<f64> = spans
+            .iter()
+            .filter(|(_, is_tab)| *is_tab)
+            .map(|(sp, _)| sp.windows(2).map(|w| w[0].distance(w[1])).sum::<f64>())
+            .collect();
+        assert_eq!(tab_spans.len(), 4);
+        for len in &tab_spans {
+            assert!((*len - 5.0).abs() < 1e-4, "expected 5.0 mm tab, got {}", len);
+        }
+
+        let traj_nocut = doc.build_motion_trajectory(Point::ZERO, 200.0);
+        let rapid_tab_len: f64 = traj_nocut
+            .iter()
+            .filter(|s| s.is_rapid && s.path_index_1based == 1)
+            .map(|s| s.length_mm)
+            .sum();
+        assert!((rapid_tab_len - 20.0).abs() < 1e-3);
+
+        // Now assign tabs to "Mark / Engrave" (2% power)
+        doc.microtabs.insert(
+            (0, 0),
+            MicrotabConfig {
+                count: 4,
+                width_mm: 5.0,
+                layer_name: Some("Mark / Engrave".to_string()),
+            },
+        );
+        let traj_engrave = doc.build_motion_trajectory(Point::ZERO, 200.0);
+        let override_len: f64 = traj_engrave
+            .iter()
+            .filter(|s| !s.is_rapid && s.power_pct_override == Some(2.0))
+            .map(|s| s.length_mm)
+            .sum();
+        assert!((override_len - 20.0).abs() < 1e-3);
     }
 }
 

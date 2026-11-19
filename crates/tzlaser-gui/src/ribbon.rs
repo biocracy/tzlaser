@@ -6,8 +6,8 @@ use kurbo::Point;
 use std::net::SocketAddr;
 use tzlaser_core::{
     apply_lead_lines, flip_lead_lines, remove_lead_lines, Color, CoolHeuristicSolver, Document,
-    DxfImporter, Entity, HistoryManager, Layer, LeadConfig, LeadType, PostJobAction, PulseConfig,
-    SortMode,
+    DxfImporter, Entity, HistoryManager, Layer, LeadConfig, LeadType, MicrotabConfig,
+    PostJobAction, PulseConfig, SortMode,
 };
 use tzlaser_protocol::{JogConfig, LaserController, MachineStatus};
 
@@ -51,6 +51,9 @@ pub struct RibbonState {
     pub sensor_cal_aborted: bool,
     pub cal_material_thickness_mm: f64,
     pub show_jog_presets_dialog: bool,
+    pub microtab_count: usize,
+    pub microtab_width_mm: f64,
+    pub microtab_layer_name: Option<String>,
 }
 
 impl Default for RibbonState {
@@ -76,6 +79,9 @@ impl Default for RibbonState {
             sensor_cal_aborted: false,
             cal_material_thickness_mm: 1.0,
             show_jog_presets_dialog: false,
+            microtab_count: 4,
+            microtab_width_mm: 1.5,
+            microtab_layer_name: None,
         }
     }
 }
@@ -891,6 +897,163 @@ fn render_profiles_tab(
 
         ui.add_space(2.0);
 
+        // 2b. Microtabs (Selection Transform)
+        ribbon_group(ui, "Microtabs", |ui| {
+            let has_sel = !selection.is_empty();
+            let sel_has_tabs = selection.iter().any(|k| doc.microtabs.contains_key(k));
+            let selected_layers: std::collections::HashSet<usize> =
+                selection.iter().map(|(l, _)| *l).collect();
+
+            let mut changed_params = false;
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let apply_btn = Button::new(
+                        RichText::new("🔗 Microtabs")
+                            .size(11.0)
+                            .color(Color32::from_rgb(130, 230, 185)),
+                    )
+                    .fill(Color32::from_rgb(28, 48, 42))
+                    .min_size(Vec2::new(76.0, 19.0));
+                    if ui
+                        .add_enabled(has_sel, apply_btn)
+                        .on_hover_text("Distribute n microtabs equally around selected cut profile(s)")
+                        .clicked()
+                    {
+                        history.record(doc, selection, "Apply Microtabs");
+                        let cfg = MicrotabConfig {
+                            count: state.microtab_count.max(1),
+                            width_mm: state.microtab_width_mm.max(0.1),
+                            layer_name: state.microtab_layer_name.clone(),
+                        };
+                        for &key in selection.iter() {
+                            doc.microtabs.insert(key, cfg.clone());
+                        }
+                        *status_message = format!(
+                            "Applied {} microtab(s) ({:.1} mm, {}) to {} profile(s).",
+                            cfg.count,
+                            cfg.width_mm,
+                            cfg.layer_name.as_deref().unwrap_or("No cut"),
+                            selection.len()
+                        );
+                    }
+
+                    ui.label(RichText::new("n:").size(10.5));
+                    if ui
+                        .add(
+                            DragValue::new(&mut state.microtab_count)
+                                .range(1..=64)
+                                .speed(0.1),
+                        )
+                        .on_hover_text("Number of microtabs equally distributed around the profile")
+                        .changed()
+                    {
+                        changed_params = true;
+                    }
+
+                    ui.label(RichText::new("W:").size(10.5));
+                    if ui
+                        .add(
+                            DragValue::new(&mut state.microtab_width_mm)
+                                .range(0.1..=50.0)
+                                .speed(0.1)
+                                .suffix("mm"),
+                        )
+                        .on_hover_text("Width of each microtab along the perimeter (mm)")
+                        .changed()
+                    {
+                        changed_params = true;
+                    }
+
+                    let del_btn = Button::new(
+                        RichText::new("🗑")
+                            .size(11.0)
+                            .color(if sel_has_tabs {
+                                Color32::from_rgb(235, 110, 110)
+                            } else {
+                                Color32::from_rgb(100, 105, 115)
+                            }),
+                    )
+                    .fill(Color32::from_rgb(42, 32, 34))
+                    .min_size(Vec2::new(22.0, 19.0));
+                    if ui
+                        .add_enabled(sel_has_tabs, del_btn)
+                        .on_hover_text("Remove microtabs from selected profile(s)")
+                        .clicked()
+                    {
+                        history.record(doc, selection, "Remove Microtabs");
+                        for key in selection.iter() {
+                            doc.microtabs.remove(key);
+                        }
+                        *status_message = "Removed microtabs from selection.".to_string();
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Tab:").size(10.5));
+                    let current_label = state
+                        .microtab_layer_name
+                        .as_deref()
+                        .unwrap_or("No cut")
+                        .to_string();
+                    egui::ComboBox::from_id_salt("microtab_layer_combo")
+                        .width(126.0)
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut state.microtab_layer_name,
+                                    None,
+                                    "No cut",
+                                )
+                                .changed()
+                            {
+                                changed_params = true;
+                            }
+                            for (l_idx, layer) in doc.layers.iter().enumerate() {
+                                if layer.is_travel || layer.is_obstacle {
+                                    continue;
+                                }
+                                // List all other cutting layers (exclude the layer currently assigned to selection)
+                                if !selected_layers.is_empty() && selected_layers.contains(&l_idx) {
+                                    continue;
+                                }
+                                let col = Color32::from_rgb(layer.color.r, layer.color.g, layer.color.b);
+                                let lbl = RichText::new(format!(
+                                    "{} ({}%)",
+                                    layer.name, layer.params.power_percent
+                                ))
+                                .color(col);
+                                if ui
+                                    .selectable_value(
+                                        &mut state.microtab_layer_name,
+                                        Some(layer.name.clone()),
+                                        lbl,
+                                    )
+                                    .changed()
+                                {
+                                    changed_params = true;
+                                }
+                            }
+                        });
+                });
+            });
+
+            if changed_params && sel_has_tabs {
+                let cfg = MicrotabConfig {
+                    count: state.microtab_count.max(1),
+                    width_mm: state.microtab_width_mm.max(0.1),
+                    layer_name: state.microtab_layer_name.clone(),
+                };
+                for &key in selection.iter() {
+                    if doc.microtabs.contains_key(&key) {
+                        doc.microtabs.insert(key, cfg.clone());
+                    }
+                }
+            }
+        });
+
+        ui.add_space(2.0);
+
         // 3. Layer Auto-Classification (Large prominent button)
         ribbon_group(ui, "Classification", |ui| {
             let classify_btn = Button::new(
@@ -1271,7 +1434,9 @@ fn render_profiles_tab(
                                 }
                             }
                         });
+                });
 
+                ui.horizontal(|ui| {
                     if ui
                         .checkbox(&mut pulse_config.post_job_z_home, "⬆ Z-Home")
                         .on_hover_text("Lift head to Z=0 (upper sensor touch off) after job finishes")

@@ -15,7 +15,7 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
 | **Stop / Emergency Halt** | Working | Both on-screen **Stop / E-STOP** and the wireless remote **Stop** button (`Bit 27` / `Bit 19`) immediately halt XY/Z motion, close gas/shutter/laser outputs, tear down active FIFO streams, and retract Z home. |
 | **Nozzle Touch / Sheet Alarm** | Working | Port `999` capacitive short/sheet-touch detection (`d4 & 0x20`) triggers a UI alarm banner, blocks downward Z jogs and Start, and aborts active cuts with Z retraction. |
 | **XY Dry-Cutting (Curves & Paths)** | Working | Continuous 4-kHz Motion FIFO streaming (`REG_FIFO_DATA`) with S-curve acceleration/deceleration ramps traces circles, arcs, splines, and sharp corners smoothly without step-by-step pauses. |
-| **Offline Simulation & Signal Graph** | Working | Real-time head marker preview, rapid travel path rendering, pause/resume checkpoints, and live velocity/acceleration telemetry plots. |
+| **Offline Simulation & Signal Graph** | Working | Real-time head marker preview, rapid travel path rendering, pause/resume checkpoints, live velocity/acceleration telemetry, plus optional unipolar overlays for Capacitance (pF), Laser Power/Frequency, and Gas Valve state. |
 | **Live Laser Cutting & Capacitive Follower** | In Progress | Z-follow/retract (`cmd = 4` / `3`), continuous FIFO streaming with pierce dwell, and `DO9`/`DO12` setup work; firing `DO10` during FIFO contour cuts is next for hardware validation. |
 
 ---
@@ -26,7 +26,7 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
 - **DXF Importer**: Parses `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `ELLIPSE`, and `SPLINE` entities with full WCS/OCS arbitrary-axis transforms and adaptive arc/bulge tessellation.
 - **Automatic Profile Classification & Grouping**: Classifies geometry into Outer profiles, Interior holes, and Bends; supports compound groups, scaling, rotation, mirroring, and undo/redo history.
 - **Cut Sequence & Obstacle Routing**: Greedy nearest-neighbor TSP ordering prioritizing interior holes before outer contours, plus obstacle exclusion polygon offsetting and rapid-travel detour routing.
-- **Lead-In / Lead-Out & Material Library**: Configurable lead lines/arcs, pierce times, layer cutting speeds, and material/thickness presets.
+- **Lead-In / Lead-Out, Microtabs & Material Library**: Configurable linear/arc lead lines with automatic inside/outside enclosure detection, equally distributed profile **Microtabs** (`No cut` gaps or custom target cutting/engraving layer overrides), pierce times, layer cutting speeds, and material/thickness presets.
 
 ### Hardware Protocol (`tzlaser-protocol`)
 - **Port `502` (XY/W Motion Controller)**:
@@ -40,8 +40,8 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
 ### Desktop GUI (`tzlaser-gui`)
 - Built with `eframe` / `egui` featuring a dark industrial UI, ribbon toolbar, 2D vector canvas with origin/bed axes, directional arrowheads, cut-order badges, rapid travel path display, and right-click **Go here** / **Set starting point here** / **From this point continue** context menus.
 - **Selection Transform HUD**: Precision move/scale/rotate, **Snap Origin to (0,0)**, and **Snap Origin to Head**.
-- **CNC Control Panel**: Connect/disconnect, Home All / Home Z (with configurable Homing Speed), Step & Continuous jogging, **Start**, **Dry-Cut**, **Pause**, **Continue**, **Stop**, **Frame**, **Red Dot**, **Gas**, **Laser** (hold-to-fire), and **Shutter** controls.
-- **Signal Graph & In-App Console**: Real-time axis velocity/acceleration plots and a collapsible diagnostic message console.
+- **CNC Control Panel**: Connect/disconnect, Home All / Home Z (with configurable Homing Speed), Step & Continuous jogging, **Start**, **Dry-Cut**, **Pause**, **Continue**, **Stop**, **Frame** (Rectangle, Convex Hull, or Concave Hull shrink-wrap), **Red Dot**, **Gas**, **Laser** (hold-to-fire), and **Shutter** controls.
+- **Signal Graph & In-App Console**: Real-time axis velocity/acceleration plots, toggleable unipolar (`>= 0`) overlay axes for **Cap** (pF), **Laser** (power % as Y, frequency Hz as color), and **Gas** (OPEN/SHUT), plus a collapsible diagnostic message console.
 
 ---
 

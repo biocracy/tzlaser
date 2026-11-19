@@ -319,7 +319,18 @@ impl eframe::App for TzlaserApp {
             ) {
                 self.status_message = done_msg;
                 if !hw_connected {
-                    self.signal_graph.record_offline(0.0, 0.0, 0.0, 0.0, false, Some("Done"));
+                    self.signal_graph.record_offline_full(
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        false,
+                        0.0,
+                        0.0,
+                        self.status.capacitance_pf,
+                        self.status.gas_valve_open,
+                        Some("Done"),
+                    );
                 }
             } else if !hw_connected {
                 if let Some(seg) = self.panel_state.trajectory.get(self.panel_state.current_seg_idx).copied() {
@@ -348,12 +359,16 @@ impl eframe::App for TzlaserApp {
                     } else {
                         "Cut"
                     };
-                    self.signal_graph.record_offline(
+                    self.signal_graph.record_offline_full(
                         vx_pls,
                         vy_pls,
                         0.0,
                         0.0,
                         self.status.laser_on,
+                        self.status.laser_power_pct,
+                        self.status.laser_freq_hz,
+                        self.status.capacitance_pf,
+                        self.status.gas_valve_open,
                         Some(tag),
                     );
                 }

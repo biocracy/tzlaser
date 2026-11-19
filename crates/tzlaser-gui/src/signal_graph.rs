@@ -15,6 +15,9 @@ pub struct SignalGraphState {
     pub show_ay: bool,
     pub show_az: bool,
     pub show_aw: bool,
+    pub show_cap: bool,
+    pub show_laser: bool,
+    pub show_gas: bool,
     pub offline_telemetry: SignalTelemetry,
     pub frozen_snapshot: Option<(f64, Vec<AxisSignalSample>)>,
     pub last_active_snapshot: Option<(f64, Vec<AxisSignalSample>)>,
@@ -34,6 +37,9 @@ impl Default for SignalGraphState {
             show_ay: true,
             show_az: false,
             show_aw: false,
+            show_cap: false,
+            show_laser: false,
+            show_gas: false,
             offline_telemetry: SignalTelemetry::new(),
             frozen_snapshot: None,
             last_active_snapshot: None,
@@ -55,8 +61,60 @@ impl SignalGraphState {
             .push_command(x_rate, y_rate, z_rate, w_rate, laser_on, tag);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_offline_full(
+        &mut self,
+        x_rate: f32,
+        y_rate: f32,
+        z_rate: f32,
+        w_rate: f32,
+        laser_on: bool,
+        laser_power_pct: f32,
+        laser_freq_hz: f32,
+        capacitance_pf: f32,
+        gas_valve_open: bool,
+        tag: Option<&str>,
+    ) {
+        self.offline_telemetry.push_command_full(
+            x_rate,
+            y_rate,
+            z_rate,
+            w_rate,
+            laser_on,
+            laser_power_pct,
+            laser_freq_hz,
+            capacitance_pf,
+            gas_valve_open,
+            tag,
+        );
+    }
+
     pub fn tick_offline(&mut self) {
         self.offline_telemetry.tick_sample(50);
+    }
+}
+
+/// Map laser pulse frequency (Hz) logarithmically onto a blue -> green -> yellow -> red/magenta ramp.
+fn laser_freq_to_color(freq_hz: f32) -> Color32 {
+    if freq_hz <= 0.0 {
+        // CW / unspecified frequency
+        return Color32::from_rgb(255, 130, 215);
+    }
+    let min_ln = 50.0_f32.ln();
+    let max_ln = 20_000.0_f32.ln();
+    let t = ((freq_hz.clamp(50.0, 20_000.0).ln() - min_ln) / (max_ln - min_ln)).clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8, f: f32| -> u8 {
+        (a as f32 + (b as f32 - a as f32) * f).round().clamp(0.0, 255.0) as u8
+    };
+    if t < 0.333 {
+        let f = t / 0.333;
+        Color32::from_rgb(lerp(70, 75, f), lerp(165, 235, f), lerp(255, 145, f))
+    } else if t < 0.667 {
+        let f = (t - 0.333) / 0.334;
+        Color32::from_rgb(lerp(75, 255, f), lerp(235, 215, f), lerp(145, 65, f))
+    } else {
+        let f = (t - 0.667) / 0.333;
+        Color32::from_rgb(lerp(255, 255, f), lerp(215, 70, f), lerp(65, 115, f))
     }
 }
 
@@ -95,6 +153,10 @@ pub fn render_signal_graph(
         z_rate: 0.0,
         w_rate: 0.0,
         laser_on: false,
+        laser_power_pct: 0.0,
+        laser_freq_hz: 0.0,
+        capacitance_pf: 0.0,
+        gas_valve_open: false,
         tag: None,
     });
 
@@ -140,6 +202,12 @@ pub fn render_signal_graph(
         toggle_pill(ui, "aW", &mut state.show_aw, Color32::from_rgb(245, 225, 130));
 
         ui.separator();
+        ui.label(RichText::new("Aux:").size(10.0).weak());
+        toggle_pill(ui, "Cap", &mut state.show_cap, Color32::from_rgb(70, 220, 235));
+        toggle_pill(ui, "Laser", &mut state.show_laser, Color32::from_rgb(245, 130, 200));
+        toggle_pill(ui, "Gas", &mut state.show_gas, Color32::from_rgb(125, 240, 145));
+
+        ui.separator();
         for w in [5.0_f64, 15.0, 30.0, 60.0] {
             let sel = (state.window_secs - w).abs() < 0.1;
             if ui
@@ -182,14 +250,37 @@ pub fn render_signal_graph(
         }
 
         ui.separator();
+        let cap_str = if state.show_cap {
+            format!("  C:{:.1}pF", latest.capacitance_pf)
+        } else {
+            String::new()
+        };
+        let laser_str = if latest.laser_on {
+            if latest.laser_freq_hz > 0.0 {
+                format!("  [LASER {:.0}%@{:.0}Hz]", latest.laser_power_pct, latest.laser_freq_hz)
+            } else {
+                format!("  [LASER {:.0}%]", latest.laser_power_pct)
+            }
+        } else if state.show_laser {
+            "  [LASER OFF]".to_string()
+        } else {
+            String::new()
+        };
+        let gas_str = if state.show_gas || latest.gas_valve_open {
+            if latest.gas_valve_open { "  [GAS:OPEN]" } else { "  [GAS:SHUT]" }
+        } else {
+            ""
+        };
         ui.label(
             RichText::new(format!(
-                "X:{}  Y:{}  Z:{}  W:{}{}",
+                "X:{}  Y:{}  Z:{}  W:{}{}{}{}",
                 format_rate(latest.x_rate),
                 format_rate(latest.y_rate),
                 format_rate(latest.z_rate),
                 format_rate(latest.w_rate),
-                if latest.laser_on { "  [LASER]" } else { "" }
+                cap_str,
+                laser_str,
+                gas_str,
             ))
             .size(10.5)
             .monospace()
@@ -226,11 +317,27 @@ pub fn render_signal_graph(
         egui::StrokeKind::Inside,
     );
 
+    let any_vel = state.show_x || state.show_y || state.show_z || state.show_w;
     let any_acc = state.show_ax || state.show_ay || state.show_az || state.show_aw;
-    let pad_left = 48.0;
-    let pad_right = if any_acc { 54.0 } else { 8.0 };
+    let any_bipolar = any_vel || any_acc;
+    let any_unipolar = state.show_cap || state.show_laser || state.show_gas;
+
+    let pad_left = if any_vel { 48.0 } else { 14.0 };
+    let mut pad_right = 8.0_f32;
+    if any_acc {
+        pad_right += 50.0;
+    }
+    if state.show_cap {
+        pad_right += 46.0;
+    }
+    if state.show_laser {
+        pad_right += 40.0;
+    }
+    if state.show_gas {
+        pad_right += 36.0;
+    }
     let pad_top = 12.0;
-    let pad_bottom = 16.0;
+    let pad_bottom = 18.0;
     let inner = Rect::from_min_max(
         pos2(rect.left() + pad_left, rect.top() + pad_top),
         pos2(
@@ -314,79 +421,211 @@ pub fn render_signal_graph(
     }
     let a_max = (acc_peak * 1.15).max(1000.0);
 
-    let to_screen = |t: f64, val: f32| -> Pos2 {
+    // Compute unipolar Capacitance scale (pF, >= 0)
+    let mut cap_peak = 15.0_f32;
+    for s in &visible {
+        if s.capacitance_pf.is_finite() && s.capacitance_pf > 0.0 {
+            cap_peak = cap_peak.max(s.capacitance_pf);
+        }
+    }
+    let cap_max = (cap_peak * 1.15).max(20.0);
+
+    let to_x = |t: f64| -> f32 {
         let u = ((t - t_min) / state.window_secs).clamp(0.0, 1.0) as f32;
+        inner.left() + u * inner.width()
+    };
+    let to_screen = |t: f64, val: f32| -> Pos2 {
         let v = (val / y_max).clamp(-1.0, 1.0);
-        let x = inner.left() + u * inner.width();
-        let y = inner.center().y - v * (inner.height() * 0.5);
-        pos2(x, y)
+        pos2(to_x(t), inner.center().y - v * (inner.height() * 0.5))
     };
     let to_screen_acc = |t: f64, val: f32| -> Pos2 {
-        let u = ((t - t_min) / state.window_secs).clamp(0.0, 1.0) as f32;
         let v = (val / a_max).clamp(-1.0, 1.0);
-        let x = inner.left() + u * inner.width();
-        let y = inner.center().y - v * (inner.height() * 0.5);
-        pos2(x, y)
+        pos2(to_x(t), inner.center().y - v * (inner.height() * 0.5))
+    };
+    // Unipolar [0, max] mapping with dedicated X-axis at inner.bottom()
+    let to_screen_unipolar = |t: f64, norm_0_to_1: f32| -> Pos2 {
+        let v = norm_0_to_1.clamp(0.0, 1.0);
+        pos2(to_x(t), inner.bottom() - v * inner.height())
     };
 
     // Grid lines & Y labels
     let zero_y = inner.center().y;
-    painter.line_segment(
-        [pos2(inner.left(), zero_y), pos2(inner.right(), zero_y)],
-        Stroke::new(1.0_f32, Color32::from_rgb(55, 62, 75)),
-    );
-    for frac in [-1.0_f32, -0.5, 0.5, 1.0] {
-        let y = zero_y - frac * (inner.height() * 0.5);
+    if any_bipolar {
         painter.line_segment(
-            [pos2(inner.left(), y), pos2(inner.right(), y)],
-            Stroke::new(0.6_f32, Color32::from_rgb(28, 33, 42)),
+            [pos2(inner.left(), zero_y), pos2(inner.right(), zero_y)],
+            Stroke::new(1.0_f32, Color32::from_rgb(55, 62, 75)),
+        );
+        for frac in [-1.0_f32, -0.5, 0.5, 1.0] {
+            let y = zero_y - frac * (inner.height() * 0.5);
+            painter.line_segment(
+                [pos2(inner.left(), y), pos2(inner.right(), y)],
+                Stroke::new(0.6_f32, Color32::from_rgb(28, 33, 42)),
+            );
+        }
+    } else {
+        for frac in [0.25_f32, 0.5, 0.75, 1.0] {
+            let y = inner.bottom() - frac * inner.height();
+            painter.line_segment(
+                [pos2(inner.left(), y), pos2(inner.right(), y)],
+                Stroke::new(0.6_f32, Color32::from_rgb(28, 33, 42)),
+            );
+        }
+    }
+
+    if any_vel {
+        painter.text(
+            pos2(inner.left() - 4.0, inner.top()),
+            Align2::RIGHT_TOP,
+            format!("+{}", format_rate(y_max).trim_start_matches('+')),
+            FontId::monospace(9.5),
+            Color32::from_rgb(130, 138, 152),
+        );
+        painter.text(
+            pos2(inner.left() - 4.0, zero_y),
+            Align2::RIGHT_CENTER,
+            "0",
+            FontId::monospace(9.5),
+            Color32::from_rgb(130, 138, 152),
+        );
+        painter.text(
+            pos2(inner.left() - 4.0, inner.bottom()),
+            Align2::RIGHT_BOTTOM,
+            format!("-{}", format_rate(y_max).trim_start_matches('+')),
+            FontId::monospace(9.5),
+            Color32::from_rgb(130, 138, 152),
         );
     }
-    painter.text(
-        pos2(inner.left() - 4.0, inner.top()),
-        Align2::RIGHT_TOP,
-        format!("+{}", format_rate(y_max).trim_start_matches('+')),
-        FontId::monospace(9.5),
-        Color32::from_rgb(130, 138, 152),
-    );
-    painter.text(
-        pos2(inner.left() - 4.0, zero_y),
-        Align2::RIGHT_CENTER,
-        "0",
-        FontId::monospace(9.5),
-        Color32::from_rgb(130, 138, 152),
-    );
-    painter.text(
-        pos2(inner.left() - 4.0, inner.bottom()),
-        Align2::RIGHT_BOTTOM,
-        format!("-{}", format_rate(y_max).trim_start_matches('+')),
-        FontId::monospace(9.5),
-        Color32::from_rgb(130, 138, 152),
-    );
 
-    // Secondary Y-axis labels on the right for Acceleration (pls/s^2)
+    // Separate X-axis (0+ baseline at inner.bottom()) for unipolar (>0) overlay traces
+    if any_unipolar {
+        let uni_axis_col = Color32::from_rgb(80, 155, 195);
+        painter.line_segment(
+            [pos2(inner.left(), inner.bottom()), pos2(inner.right(), inner.bottom())],
+            Stroke::new(1.3_f32, uni_axis_col),
+        );
+        if !any_vel {
+            painter.text(
+                pos2(inner.left() - 3.0, inner.bottom()),
+                Align2::RIGHT_BOTTOM,
+                "0+",
+                FontId::monospace(8.5),
+                uni_axis_col,
+            );
+        }
+    }
+
+    // Right-side Y-axes (each active channel gets its own non-overlapping column)
+    let mut right_x = inner.right() + 4.0;
     if any_acc {
         let acc_lbl_col = Color32::from_rgb(175, 165, 210);
+        painter.line_segment(
+            [pos2(right_x - 2.0, inner.top()), pos2(right_x - 2.0, inner.bottom())],
+            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(175, 165, 210, 90)),
+        );
         painter.text(
-            pos2(inner.right() + 4.0, inner.top()),
+            pos2(right_x + 1.0, inner.top()),
             Align2::LEFT_TOP,
             format!("+{}", format_rate(a_max).trim_start_matches('+')),
             FontId::monospace(9.5),
             acc_lbl_col,
         );
         painter.text(
-            pos2(inner.right() + 4.0, zero_y),
+            pos2(right_x + 1.0, zero_y),
             Align2::LEFT_CENTER,
             "pls/s²",
             FontId::monospace(8.5),
             acc_lbl_col,
         );
         painter.text(
-            pos2(inner.right() + 4.0, inner.bottom()),
+            pos2(right_x + 1.0, inner.bottom()),
             Align2::LEFT_BOTTOM,
             format!("-{}", format_rate(a_max).trim_start_matches('+')),
             FontId::monospace(9.5),
             acc_lbl_col,
+        );
+        right_x += 50.0;
+    }
+
+    if state.show_cap {
+        let cap_col = Color32::from_rgb(70, 220, 235);
+        painter.line_segment(
+            [pos2(right_x - 2.0, inner.top()), pos2(right_x - 2.0, inner.bottom())],
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(70, 220, 235, 130)),
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.top()),
+            Align2::LEFT_TOP,
+            format!("{:.1}pF", cap_max),
+            FontId::monospace(9.0),
+            cap_col,
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.center().y),
+            Align2::LEFT_CENTER,
+            format!("{:.1}", cap_max * 0.5),
+            FontId::monospace(8.5),
+            cap_col,
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.bottom()),
+            Align2::LEFT_BOTTOM,
+            "0pF",
+            FontId::monospace(9.0),
+            cap_col,
+        );
+        right_x += 46.0;
+    }
+
+    if state.show_laser {
+        let laser_col = Color32::from_rgb(245, 130, 200);
+        painter.line_segment(
+            [pos2(right_x - 2.0, inner.top()), pos2(right_x - 2.0, inner.bottom())],
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(245, 130, 200, 130)),
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.top()),
+            Align2::LEFT_TOP,
+            "100%",
+            FontId::monospace(9.0),
+            laser_col,
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.center().y),
+            Align2::LEFT_CENTER,
+            "50%",
+            FontId::monospace(8.5),
+            laser_col,
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.bottom()),
+            Align2::LEFT_BOTTOM,
+            "0%",
+            FontId::monospace(9.0),
+            laser_col,
+        );
+        right_x += 40.0;
+    }
+
+    if state.show_gas {
+        let gas_col = Color32::from_rgb(125, 240, 145);
+        let y_open = inner.bottom() - inner.height() * 0.88;
+        painter.line_segment(
+            [pos2(right_x - 2.0, inner.top()), pos2(right_x - 2.0, inner.bottom())],
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(125, 240, 145, 130)),
+        );
+        painter.text(
+            pos2(right_x + 1.0, y_open),
+            Align2::LEFT_CENTER,
+            "OPEN",
+            FontId::monospace(8.5),
+            gas_col,
+        );
+        painter.text(
+            pos2(right_x + 1.0, inner.bottom()),
+            Align2::LEFT_BOTTOM,
+            "SHUT",
+            FontId::monospace(8.5),
+            gas_col,
         );
     }
 
@@ -518,6 +757,144 @@ pub fn render_signal_graph(
     draw_acc_channel(state.show_az, Color32::from_rgba_unmultiplied(165, 145, 255, 200), 2);
     draw_acc_channel(state.show_ay, Color32::from_rgba_unmultiplied(100, 235, 210, 210), 1);
     draw_acc_channel(state.show_ax, Color32::from_rgba_unmultiplied(255, 145, 70, 210), 0);
+
+    // Draw Gas Valve State (unipolar 0 = SHUT, 0.88 = OPEN)
+    if state.show_gas {
+        let gas_col = Color32::from_rgb(125, 240, 145);
+        let gas_fill = Color32::from_rgba_unmultiplied(125, 240, 145, 24);
+        let mut pts: Vec<Pos2> = Vec::with_capacity(visible.len() * 2 + 2);
+        for (i, s) in visible.iter().enumerate() {
+            let t0 = s.timestamp_secs.max(t_min);
+            let t1 = if i + 1 < visible.len() {
+                visible[i + 1].timestamp_secs.min(t_max)
+            } else {
+                t_max
+            };
+            let v = if s.gas_valve_open { 0.88 } else { 0.0 };
+            if s.gas_valve_open && t1 > t0 {
+                let p_tl = to_screen_unipolar(t0, v);
+                let p_br = to_screen_unipolar(t1, 0.0);
+                painter.rect_filled(Rect::from_min_max(p_tl, p_br), 0.0, gas_fill);
+            }
+            if i > 0 {
+                let prev_v = if visible[i - 1].gas_valve_open { 0.88 } else { 0.0 };
+                pts.push(to_screen_unipolar(t0, prev_v));
+            }
+            pts.push(to_screen_unipolar(t0, v));
+        }
+        if let Some(last_s) = visible.last() {
+            let v = if last_s.gas_valve_open { 0.88 } else { 0.0 };
+            pts.push(to_screen_unipolar(t_max, v));
+        }
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, gas_col)));
+        }
+    }
+
+    // Draw Capacitive Height Sensor Capacitance (pF, unipolar 0..cap_max)
+    if state.show_cap {
+        let cap_col = Color32::from_rgb(70, 220, 235);
+        let mut pts: Vec<Pos2> = Vec::with_capacity(visible.len() + 1);
+        for s in &visible {
+            let t_clamped = s.timestamp_secs.max(t_min);
+            let norm = (s.capacitance_pf.max(0.0) / cap_max).clamp(0.0, 1.0);
+            pts.push(to_screen_unipolar(t_clamped, norm));
+        }
+        if let Some(last_s) = visible.last() {
+            let norm = (last_s.capacitance_pf.max(0.0) / cap_max).clamp(0.0, 1.0);
+            pts.push(to_screen_unipolar(t_max, norm));
+        }
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, Stroke::new(1.6_f32, cap_col)));
+        }
+    }
+
+    // Draw Laser Power (%) as Y coordinate and Frequency (Hz) as Color
+    if state.show_laser {
+        for i in 0..visible.len() {
+            let s = visible[i];
+            let t0 = s.timestamp_secs.max(t_min);
+            let t1 = if i + 1 < visible.len() {
+                visible[i + 1].timestamp_secs.min(t_max)
+            } else {
+                t_max
+            };
+            let norm = if s.laser_on {
+                (s.laser_power_pct / 100.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let col = if s.laser_on {
+                laser_freq_to_color(s.laser_freq_hz)
+            } else {
+                Color32::from_rgba_unmultiplied(110, 115, 130, 140)
+            };
+            let width = if s.laser_on { 2.2_f32 } else { 1.0_f32 };
+
+            if i > 0 {
+                let prev = visible[i - 1];
+                let prev_norm = if prev.laser_on {
+                    (prev.laser_power_pct / 100.0).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if (norm - prev_norm).abs() > 1e-4 {
+                    let edge_col = if s.laser_on {
+                        col
+                    } else {
+                        laser_freq_to_color(prev.laser_freq_hz)
+                    };
+                    painter.line_segment(
+                        [to_screen_unipolar(t0, prev_norm), to_screen_unipolar(t0, norm)],
+                        Stroke::new(1.6_f32, edge_col),
+                    );
+                }
+            }
+            if t1 > t0 {
+                painter.line_segment(
+                    [to_screen_unipolar(t0, norm), to_screen_unipolar(t1, norm)],
+                    Stroke::new(width, col),
+                );
+            }
+        }
+
+        // Compact frequency-color legend in top-left of inner plot
+        if inner.width() > 140.0 {
+            let leg_x = inner.left() + 6.0;
+            let leg_y = inner.top() + 4.0;
+            let bar_w = 56.0_f32;
+            let bar_h = 5.0_f32;
+            painter.text(
+                pos2(leg_x, leg_y + bar_h * 0.5),
+                Align2::LEFT_CENTER,
+                "50Hz",
+                FontId::monospace(8.0),
+                Color32::from_rgb(160, 175, 195),
+            );
+            let bar_start = leg_x + 26.0;
+            let steps = 12usize;
+            for k in 0..steps {
+                let f0 = k as f32 / steps as f32;
+                let f1 = (k + 1) as f32 / steps as f32;
+                let freq = (50.0_f32.ln() + f0 * (20_000.0_f32.ln() - 50.0_f32.ln())).exp();
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        pos2(bar_start + f0 * bar_w, leg_y),
+                        pos2(bar_start + f1 * bar_w, leg_y + bar_h),
+                    ),
+                    0.0,
+                    laser_freq_to_color(freq),
+                );
+            }
+            painter.text(
+                pos2(bar_start + bar_w + 3.0, leg_y + bar_h * 0.5),
+                Align2::LEFT_CENTER,
+                "20kHz",
+                FontId::monospace(8.0),
+                Color32::from_rgb(160, 175, 195),
+            );
+        }
+    }
 }
 
 fn fetch_snapshot(

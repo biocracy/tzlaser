@@ -158,7 +158,7 @@ impl Default for JogConfig {
     }
 }
 
-/// Time-stamped snapshot of motion commands sent to each axis (in pulses/sec).
+/// Time-stamped snapshot of motion commands and auxiliary signals.
 #[derive(Debug, Clone)]
 pub struct AxisSignalSample {
     pub timestamp_secs: f64,
@@ -167,14 +167,19 @@ pub struct AxisSignalSample {
     pub z_rate: f32,
     pub w_rate: f32,
     pub laser_on: bool,
+    pub laser_power_pct: f32,
+    pub laser_freq_hz: f32,
+    pub capacitance_pf: f32,
+    pub gas_valve_open: bool,
     pub tag: Option<String>,
 }
 
-/// Ring-buffer of axis command telemetry for real-time time-series plotting.
+/// Ring-buffer of axis command & auxiliary telemetry for real-time time-series plotting.
 pub struct SignalTelemetry {
     start: Instant,
     samples: VecDeque<AxisSignalSample>,
     last_rates: (f32, f32, f32, f32, bool),
+    last_aux: (f32, f32, f32, bool), // (capacitance_pf, laser_power_pct, laser_freq_hz, gas_valve_open)
     last_push: Instant,
 }
 
@@ -195,18 +200,33 @@ impl SignalTelemetry {
             z_rate: 0.0,
             w_rate: 0.0,
             laser_on: false,
+            laser_power_pct: 0.0,
+            laser_freq_hz: 0.0,
+            capacitance_pf: 0.0,
+            gas_valve_open: false,
             tag: None,
         });
         Self {
             start: now,
             samples,
             last_rates: (0.0, 0.0, 0.0, 0.0, false),
+            last_aux: (0.0, 0.0, 0.0, false),
             last_push: now,
         }
     }
 
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
+    }
+
+    pub fn set_aux_state(
+        &mut self,
+        capacitance_pf: f32,
+        laser_power_pct: f32,
+        laser_freq_hz: f32,
+        gas_valve_open: bool,
+    ) {
+        self.last_aux = (capacitance_pf, laser_power_pct, laser_freq_hz, gas_valve_open);
     }
 
     pub fn push_command(
@@ -218,9 +238,30 @@ impl SignalTelemetry {
         laser_on: bool,
         tag: Option<&str>,
     ) {
+        let (cap, pwr, freq, gas) = self.last_aux;
+        self.push_command_full(
+            x_rate, y_rate, z_rate, w_rate, laser_on, pwr, freq, cap, gas, tag,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_command_full(
+        &mut self,
+        x_rate: f32,
+        y_rate: f32,
+        z_rate: f32,
+        w_rate: f32,
+        laser_on: bool,
+        laser_power_pct: f32,
+        laser_freq_hz: f32,
+        capacitance_pf: f32,
+        gas_valve_open: bool,
+        tag: Option<&str>,
+    ) {
         let now = Instant::now();
         let t = (now - self.start).as_secs_f64();
         self.last_rates = (x_rate, y_rate, z_rate, w_rate, laser_on);
+        self.last_aux = (capacitance_pf, laser_power_pct, laser_freq_hz, gas_valve_open);
         self.last_push = now;
         self.samples.push_back(AxisSignalSample {
             timestamp_secs: t,
@@ -229,6 +270,10 @@ impl SignalTelemetry {
             z_rate,
             w_rate,
             laser_on,
+            laser_power_pct,
+            laser_freq_hz,
+            capacitance_pf,
+            gas_valve_open,
             tag: tag.map(|s| s.to_string()),
         });
         while self.samples.len() > 4000 {
@@ -265,6 +310,7 @@ pub struct MachineStatus {
     pub is_connected: bool,
     pub laser_on: bool,
     pub laser_power_pct: f32,
+    pub laser_freq_hz: f32,
     pub laser_temp_c: f32,
     pub red_pointer_on: bool,
     pub shutter_open: bool,
@@ -315,6 +361,7 @@ impl Default for MachineStatus {
             is_connected: false,
             laser_on: false,
             laser_power_pct: 0.0,
+            laser_freq_hz: 0.0,
             laser_temp_c: 23.5,
             red_pointer_on: false,
             shutter_open: false,
@@ -402,6 +449,7 @@ impl MachineStatus {
             is_connected: true,
             laser_on,
             laser_power_pct,
+            laser_freq_hz: 0.0,
             laser_temp_c,
             red_pointer_on,
             shutter_open,

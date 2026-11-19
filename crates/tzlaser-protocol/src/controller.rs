@@ -1602,6 +1602,10 @@ impl LaserController {
                             let prev_z_cal_thick = st.z_calibrated_thickness_mm;
                             let prev_z_mat_thick = st.z_material_thickness_mm;
                             let prev_z_ppm = st.z_pulses_per_mm;
+                            let prev_laser_on = st.laser_on;
+                            let prev_laser_pwr = st.laser_power_pct;
+                            let prev_laser_freq = st.laser_freq_hz;
+                            let prev_gas_open = st.gas_valve_open;
                             *st = new_st;
                             st.pos_z = prev_pos_z;
                             st.capacitive_height_mm = prev_cap_height;
@@ -1621,7 +1625,19 @@ impl LaserController {
                             st.z_calibrated_thickness_mm = prev_z_cal_thick;
                             st.z_material_thickness_mm = prev_z_mat_thick;
                             st.z_pulses_per_mm = prev_z_ppm;
+                            st.laser_freq_hz = prev_laser_freq;
+                            if active_live_cut.is_some() {
+                                st.laser_on = prev_laser_on;
+                                st.laser_power_pct = prev_laser_pwr;
+                                st.gas_valve_open = prev_gas_open;
+                            }
                             st.is_live_cutting = active_live_cut.is_some();
+                            telemetry_clone.lock().unwrap().set_aux_state(
+                                st.capacitance_pf,
+                                st.laser_power_pct,
+                                st.laser_freq_hz,
+                                st.gas_valve_open,
+                            );
                         }
                     }
                 }
@@ -1644,6 +1660,12 @@ impl LaserController {
                                         st.is_connected = true;
                                     }
                                     st.apply_z_telemetry(zt);
+                                    telemetry_clone.lock().unwrap().set_aux_state(
+                                        st.capacitance_pf,
+                                        st.laser_power_pct,
+                                        st.laser_freq_hz,
+                                        st.gas_valve_open,
+                                    );
                                     st.z_clearance_above_material_mm()
                                 };
                                 if zt.state_code == 9
@@ -1865,12 +1887,26 @@ impl LaserController {
                         });
                         let dt_s = (slice.len() as f32) * 0.00025;
                         let tag = if fifo.telemetry_cursor == 0 { Some("FIFO") } else { None };
-                        telemetry_clone.lock().unwrap().push_command(
+                        let (l_on, l_pwr, l_freq, cap_pf, gas_open) = {
+                            let st = status_clone.lock().unwrap();
+                            (
+                                fifo.is_live_cut || st.laser_on,
+                                st.laser_power_pct,
+                                st.laser_freq_hz,
+                                st.capacitance_pf,
+                                st.gas_valve_open,
+                            )
+                        };
+                        telemetry_clone.lock().unwrap().push_command_full(
                             (sum_x as f32) / dt_s,
                             (sum_y as f32) / dt_s,
                             0.0,
                             0.0,
-                            false,
+                            l_on,
+                            l_pwr,
+                            l_freq,
+                            cap_pf,
+                            gas_open,
                             tag,
                         );
                         fifo.telemetry_cursor = target_tel_cursor;
@@ -1994,6 +2030,19 @@ impl LaserController {
                                     let raw_home = build_z_home_packet();
                                     send_z_cmd_with_ack(zs, &raw_home, &mut z_buf, &mut z_status_seen, &mut latest_z);
                                 }
+                                {
+                                    let mut st = status_clone.lock().unwrap();
+                                    st.laser_on = false;
+                                    st.laser_power_pct = 0.0;
+                                    st.laser_freq_hz = 0.0;
+                                    st.gas_valve_open = false;
+                                    telemetry_clone.lock().unwrap().set_aux_state(
+                                        st.capacitance_pf,
+                                        0.0,
+                                        0.0,
+                                        false,
+                                    );
+                                }
                                 telemetry_clone.lock().unwrap().push_command(0.0, 0.0, 0.0, 0.0, false, Some("CutDone"));
                                 eprintln!("[LIVE-CUT] All {} contours completed.", lc.contours.len());
                                 keep_lc = false;
@@ -2090,6 +2139,19 @@ impl LaserController {
                                     }
                                     let base_seq = last_r1022.wrapping_add(1);
                                     let pwm_byte = ((c.power_pct.clamp(0.0, 100.0) / 100.0) * 100.0).round() as i32;
+                                    {
+                                        let mut st = status_clone.lock().unwrap();
+                                        st.laser_on = true;
+                                        st.laser_power_pct = c.power_pct;
+                                        st.laser_freq_hz = c.freq_hz as f32;
+                                        st.gas_valve_open = c.gas_on;
+                                        telemetry_clone.lock().unwrap().set_aux_state(
+                                            st.capacitance_pf,
+                                            st.laser_power_pct,
+                                            st.laser_freq_hz,
+                                            st.gas_valve_open,
+                                        );
+                                    }
                                     let hdr_items = [
                                         InterpItem {
                                             cmd: InterpItemCmd::ContourStart,
