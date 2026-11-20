@@ -15,7 +15,7 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
 | **Stop / Emergency Halt** | Working | Both on-screen **Stop / E-STOP** and the wireless remote **Stop** button (`Bit 27` / `Bit 19`) immediately halt XY/Z motion, close gas/shutter/laser outputs, tear down active FIFO streams, and retract Z home. |
 | **Nozzle Touch / Sheet Alarm** | Working | Port `999` capacitive short/sheet-touch detection (`d4 & 0x20`) triggers a UI alarm banner, blocks downward Z jogs and Start, and aborts active cuts with Z retraction. |
 | **XY Dry-Cutting (Curves & Paths)** | Working | Continuous 4-kHz Motion FIFO streaming (`REG_FIFO_DATA`) with S-curve acceleration/deceleration ramps traces circles, arcs, splines, and sharp corners smoothly without step-by-step pauses. |
-| **Offline Simulation & Signal Graph** | Working | Real-time head marker preview, rapid travel path rendering, pause/resume checkpoints, live velocity/acceleration telemetry, plus optional unipolar overlays for Capacitance (pF), Laser Power/Frequency, and Gas Valve state. |
+| **Offline Simulation & Signal Graph** | Working | Real-time head marker preview, rapid travel path rendering, pause/resume checkpoints, simulated Laser/Gas state during offline Dry-Cut, live velocity/acceleration telemetry (including `|XY|`, `|aXY|` norms and `Abs` mode), window-scaled Capacitance (pF), and Laser/Gas timeline bars. |
 | **Live Laser Cutting & Capacitive Follower** | Working | Full 7-step contour cutting (XY rapid arrival -> Z capacitive follow -> assist gas -> shutter + `DO10` laser gate + per-tick 4-kHz FIFO PWM -> relative Z retract by `up_height_mm`, optional `gas_between_paths`), continuous inline microtab PWM modulation (laser-off or alternate-layer power without Z retract), and 180°-flipped arc lead-ins with configurable overcut. |
 
 ---
@@ -38,10 +38,10 @@ Industrial fiber laser cutting control and CAM software written in Rust, targeti
   - Modbus RTU over UDP for Z jogging, Z homing, Z stop, capacitive height calibration (`cmd = 7`), capacitive follow (`cmd = 4`), retract (`cmd = 3`), and nozzle-touch-sheet alarm detection (`d4 & 0x20`).
 
 ### Desktop GUI (`tzlaser-gui`)
-- Built with `eframe` / `egui` featuring a dark industrial UI, ribbon toolbar, 2D vector canvas with origin/bed axes, directional arrowheads, cut-order badges, rapid travel path display, and right-click **Go here** / **Set starting point here** / **From this point continue** context menus.
+- Built with `eframe` / `egui` featuring a dark industrial UI, exit confirmation dialog, ribbon toolbar, 2D vector canvas with origin/bed axes, directional arrowheads, cut-order badges, rapid travel path display, and right-click **Go here** / **Set starting point here** / **From this point continue** context menus.
 - **Selection Transform HUD**: Precision move/scale/rotate, **Snap Origin to (0,0)**, and **Snap Origin to Head**.
 - **CNC Control Panel**: Connect/disconnect, Home All / Home Z (with configurable Homing Speed), Step & Continuous jogging, **Start**, **Dry-Cut**, **Pause**, **Continue**, **Stop**, **Frame** (Rectangle, Convex Hull, or Concave Hull shrink-wrap), **Red Dot**, **Gas**, **Laser** (hold-to-fire), and **Shutter** controls.
-- **Signal Graph & In-App Console**: Real-time axis velocity/acceleration plots, toggleable unipolar (`>= 0`) overlay axes for **Cap** (pF), **Laser** (power % as Y, frequency Hz as color), and **Gas** (OPEN/SHUT), plus a collapsible diagnostic message console.
+- **Signal Graph & In-App Console**: Real-time axis velocity/acceleration plots (`X/Y/Z/W`, `|XY|`, `aX/aY/aZ/aW`, `|aXY|`, `Abs` toggles), window-scaled **Cap** (pF) overlay, **Laser** (power-quartile fill colored by frequency) and **Gas** timeline rectangles below the X-axis, plus a collapsible diagnostic message console.
 
 ---
 

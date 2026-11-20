@@ -1824,7 +1824,8 @@ impl PanelState {
             status.pos_x = pulses_cfg.mm_to_pulses_x(cur_x - origin_world.x);
             status.pos_y = pulses_cfg.mm_to_pulses_y(cur_y - origin_world.y);
         }
-        let cutting_now = (self.run_mode == RunMode::Cutting) && !seg.is_rapid;
+        let sim_job = !hw_connected && matches!(self.run_mode, RunMode::Cutting | RunMode::DryCut);
+        let cutting_now = ((self.run_mode == RunMode::Cutting) || sim_job) && !seg.is_rapid;
         status.laser_on = cutting_now;
         if !hw_connected {
             if cutting_now {
@@ -1837,7 +1838,7 @@ impl PanelState {
             } else {
                 status.laser_power_pct = 0.0;
                 status.laser_freq_hz = 0.0;
-                status.gas_valve_open = (self.run_mode == RunMode::Cutting) && self.sim_cut_gas_on;
+                status.gas_valve_open = sim_job && self.sim_cut_gas_on;
             }
         }
         status.red_pointer_on = (self.run_mode == RunMode::DryCut) || status.red_pointer_on;

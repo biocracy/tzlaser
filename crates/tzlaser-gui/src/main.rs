@@ -40,6 +40,8 @@ struct TzlaserApp {
     last_logged_connected: bool,
     homing_in_progress: bool,
     home_complete_popup_until: Option<std::time::Instant>,
+    show_close_confirm_dialog: bool,
+    allow_close: bool,
 }
 
 impl Default for TzlaserApp {
@@ -114,6 +116,8 @@ impl Default for TzlaserApp {
             last_logged_connected: false,
             homing_in_progress: false,
             home_complete_popup_until: None,
+            show_close_confirm_dialog: false,
+            allow_close: false,
         }
     }
 }
@@ -258,6 +262,11 @@ fn configure_unix_fonts(ctx: &egui::Context) {
 
 impl eframe::App for TzlaserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_close_confirm_dialog = true;
+        }
+
         #[cfg(target_os = "windows")]
         if !ctx.style().visuals.dark_mode {
             ctx.set_theme(egui::Theme::Dark);
@@ -1137,6 +1146,76 @@ impl eframe::App for TzlaserApp {
             if close_cal_dialog {
                 self.ribbon_state.show_sensor_cal_dialog = false;
             }
+        }
+
+        // 8b. Confirm Exit Dialog (prevents accidental closing)
+        if self.show_close_confirm_dialog {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.show_close_confirm_dialog = false;
+            }
+            let is_connected = self.controller.as_ref().map_or(false, |c| c.is_connected());
+            let is_running = self.panel_state.run_mode != panels::RunMode::Idle || self.status.is_moving;
+            egui::Window::new("Confirm Exit")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(340.0);
+                    ui.label(
+                        RichText::new("Are you sure you want to close Ţlaser?")
+                            .size(13.5)
+                            .strong(),
+                    );
+                    if is_running {
+                        ui.add_space(6.0);
+                        ui.colored_label(
+                            Color32::from_rgb(255, 110, 110),
+                            "⚠ Motion or cutting is currently active. Exiting will stop motion.",
+                        );
+                    } else if is_connected {
+                        ui.add_space(6.0);
+                        ui.colored_label(
+                            Color32::from_rgb(255, 200, 100),
+                            "Controller is currently connected.",
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Cancel").size(12.5))
+                                    .min_size(egui::Vec2::new(90.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            self.show_close_confirm_dialog = false;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Exit")
+                                            .size(12.5)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(185, 52, 52))
+                                    .min_size(egui::Vec2::new(90.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                if is_running {
+                                    self.panel_state.stop_run(&self.controller, &mut self.status);
+                                }
+                                self.show_close_confirm_dialog = false;
+                                self.allow_close = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+                });
         }
 
         // 9. Out-of-Bounds / Cutting Area Limit Alert
